@@ -12,6 +12,7 @@ Trade-Empfehlungen etc. als weitere Panels/Tabs dazu.
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from streamlit_lightweight_charts import renderLightweightCharts
@@ -20,8 +21,11 @@ import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parent))
 
-from black76 import VolSurfaceConfig
-from backtest import IronCondorConfig, LegConfig, FixedRankConfig, run_daily_ladder, summarize_trades
+from black76 import VolSurfaceConfig, strike_from_delta, leg_price
+from backtest import (
+    IronCondorConfig, LegConfig, FixedRankConfig, run_daily_ladder, summarize_trades,
+    compute_hv, compute_rank_target_vol,
+)
 from stats import reliability_summary
 
 DATA_FILE = Path(__file__).resolve().parent.parent / "data" / "spx_daily.parquet"
@@ -249,6 +253,106 @@ else:
         )
 
         run_backtest = st.button("Backtest ausfuehren", type="primary")
+
+    r_free = 0.0  # identisch zum bisherigen Default (Black-76: 0 = korrekt fuer Futures-Optionen)
+
+    # ═════════════════════════════════════════════════════════════════════
+    #  OPTIONS-PREISVORSCHAU: EINZELPREISE JE STRIKE + GESAMTPREIS DER KOMBO
+    #  Zeigt, unabhaengig vom eigentlichen Backtest, was die aktuell links
+    #  konfigurierte 4-Bein-Struktur JETZT kosten wuerde: Strike, Theoriepreis
+    #  je Bein (Black-76, inkl. Skew/Term-Structure falls aktiviert) und den
+    #  Netto-Credit/Debit der gesamten Kombo. Basis: letzter Schlusskurs +
+    #  aktuell gewaehlte IV-Quelle (HV oder - falls aktiviert - der aus dem
+    #  Ziel-IV-Rang zurueckgerechnete Wert), jeweils mit der oben gewaehlten
+    #  Laufzeit T_days. Aktualisiert sich live mit jeder Sidebar-Aenderung,
+    #  unabhaengig davon, ob der Backtest bereits gelaufen ist.
+    # ═════════════════════════════════════════════════════════════════════
+    st.subheader("Options-Preisvorschau (aktuell): Preise je Strike + Kombo gesamt")
+    st.caption(
+        "Theoriepreise (Black-76) der 4 links konfigurierten Beine auf Basis des "
+        "letzten Schlusskurses, der aktuellen IV-Quelle und der eingestellten "
+        "Laufzeit T. Rein informativ - unabhaengig vom Backtest-Ergebnis unten."
+    )
+
+    daily_df = df[df["resolution"] == "daily"] if has_resolution else df
+    daily_df = daily_df.sort_values("date")
+
+    S_last = float(daily_df["close"].iloc[-1])
+    T_years_preview = T_days / 365.0
+
+    hv_series_preview = compute_hv(daily_df, hv_length)
+    current_hv_preview = hv_series_preview.iloc[-1] if len(hv_series_preview) else np.nan
+
+    if use_fixed_rank:
+        rank_series_preview = compute_rank_target_vol(
+            daily_df, int(rank_hv_length), int(rank_lookback_days), target_rank_pct,
+        )
+        iv_preview = rank_series_preview.iloc[-1] if len(rank_series_preview) else np.nan
+        iv_source_label = f"Fixer IV-Rang ({target_rank_pct:.0f}%)"
+    else:
+        iv_preview = current_hv_preview
+        iv_source_label = f"HV ({hv_length}d)"
+
+    if pd.isna(iv_preview) or iv_preview <= 0.0:
+        st.warning(
+            "Aktuelle IV-Quelle liefert keinen gueltigen Wert (z.B. zu wenig "
+            "Historie fuer die gewaehlte HV-/Lookback-Periode) - keine "
+            "Preisvorschau moeglich."
+        )
+    else:
+        vc_preview = VolSurfaceConfig(use_vol_surface=use_vol_surface)
+
+        preview_rows = []
+        short_sum = 0.0
+        long_sum = 0.0
+        for leg in legs:
+            K = strike_from_delta(S_last, leg.delta, iv_preview, T_years_preview, is_put=leg.is_put)
+            premium_per_contract = leg_price(
+                K, leg.is_put, T_years_preview, S_last, iv_preview, r_free, vc_preview,
+            )
+            premium_total = premium_per_contract * leg.qty
+
+            if leg.is_long:
+                long_sum += premium_total
+            else:
+                short_sum += premium_total
+
+            preview_rows.append({
+                "Bein": leg.label,
+                "Typ": "Put" if leg.is_put else "Call",
+                "Richtung": "Long" if leg.is_long else "Short",
+                "Delta": leg.delta,
+                "Menge": leg.qty,
+                "Strike": round(K, 2),
+                "Preis / Kontrakt": round(premium_per_contract, 4),
+                "Preis gesamt": round(premium_total, 4),
+                "Cashflow": ("-" if leg.is_long else "+") + f"{premium_total:.4f}",
+            })
+
+        net_credit = short_sum - long_sum
+
+        preview_df = pd.DataFrame(preview_rows)
+        st.dataframe(
+            preview_df[["Bein", "Typ", "Richtung", "Delta", "Menge", "Strike",
+                        "Preis / Kontrakt", "Preis gesamt", "Cashflow"]],
+            use_container_width=True, hide_index=True,
+        )
+
+        pc1, pc2, pc3, pc4 = st.columns(4)
+        pc1.metric("Spot (letzter Schlusskurs)", f"{S_last:,.2f}")
+        pc2.metric(f"Aktive IV-Quelle: {iv_source_label}", f"{iv_preview * 100:.2f}%")
+        pc3.metric("Short-Praemien (Summe)", f"+{short_sum:.4f}")
+        pc4.metric(
+            "Netto-Credit der Kombo (gesamt)",
+            f"{net_credit:+.4f}",
+            help="Summe der Short-Praemien minus Summe der Long-Praemien "
+                 "(entry_net, gleiche Definition wie im Backtest).",
+        )
+        st.caption(
+            f"Long-Praemien (Summe): -{long_sum:.4f}  |  "
+            f"Datenstand: {daily_df['date'].iloc[-1].date()}  |  "
+            f"Laufzeit T={T_days} Tage ({T_years_preview*365:.0f} Kalendertage)."
+        )
 
     if run_backtest:
         cfg = IronCondorConfig(

@@ -277,6 +277,37 @@ else:
     daily_df = df[df["resolution"] == "daily"] if has_resolution else df
     daily_df = daily_df.sort_values("date")
 
+    # ── Datenqualitaets-Check: laengste Serie exakt identischer Schlusskurse ──
+    #  Echte SPX-Tagesschlusskurse sind praktisch nie ueber mehrere Tage exakt
+    #  bit-identisch. Taucht so eine Serie auf, ist das ein starkes Signal fuer
+    #  fehlerhafte/eingefrorene Daten (z.B. yfinance liefert zuletzt denselben
+    #  Preis mehrfach, oder ein Caching-/Merge-Bug in data_fetch.py dupliziert
+    #  Zeilen) - NICHT fuer einen Fehler in HV-/Backtest-Formeln. Das erklaert
+    #  u.a. auffaellig identische entry_iv/pnl_norm-Werte in der Trade-Tabelle,
+    #  wenn ein rollierendes HV-Fenster (z.B. 7 Tage) vollstaendig innerhalb
+    #  einer solchen Dup-Serie liegt.
+    def _max_consecutive(mask: pd.Series) -> int:
+        if not mask.any():
+            return 0
+        groups = (~mask).cumsum()
+        return int(mask.groupby(groups).sum().max())
+
+    _dup_mask = daily_df["close"].diff().eq(0.0)
+    _max_dup_run = _max_consecutive(_dup_mask)
+    if _max_dup_run >= 3:
+        _last_dup_date = daily_df.loc[_dup_mask[::-1].idxmax() if _dup_mask.any() else daily_df.index[-1], "date"]
+        st.warning(
+            f"⚠️ Datenqualitaet: {_max_dup_run} aufeinanderfolgende Handelstage mit "
+            "EXAKT identischem Schlusskurs in den geladenen Tagesdaten gefunden "
+            f"(zuletzt um den {pd.Timestamp(_last_dup_date).date()}). Fuer echte "
+            "SPX-Kurse ist das extrem unwahrscheinlich und deutet auf einen "
+            "Stale-Cache- oder Datenabruf-Fehler hin. Das verzerrt HV-Berechnung, "
+            "Strike-Auswahl und alle Trade-Kennzahlen (u.a. auffaellig aehnliche "
+            "'entry_iv'/'pnl_norm'-Werte in der Trade-Tabelle unten). Empfehlung: "
+            "`python src/data_fetch.py` mit Internetverbindung erneut ausfuehren, "
+            "um data/spx_daily.parquet frisch zu erzeugen."
+        )
+
     S_last = float(daily_df["close"].iloc[-1])
     T_years_preview = T_days / 365.0
 
@@ -389,12 +420,20 @@ else:
 
         st.caption(f"Letzter Lauf: {st.session_state.get('ic_cfg_label', '')}")
 
-        m1, m2, m3, m4, m5 = st.columns(5)
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Trades", f"{summary['n_trades']:,}")
         m2.metric("Gewinnrate", f"{summary['win_rate_pct']:.1f}%")
         m3.metric("Profit Factor", f"{summary['profit_factor']:.2f}" if pd.notna(summary["profit_factor"]) else "n/a")
-        m4.metric("Ø norm. P&L/Trade", f"{summary['avg_pnl_norm_pct']:+.2f}%")
-        m5.metric("Ø genutzte IV (Entry)", f"{summary['avg_entry_iv_pct']:.1f}%")
+        m4.metric(
+            "Erwartungswert / Trade",
+            f"{summary['avg_pnl']:+.4f}",
+            help="Arithmetisches Mittel des Netto-P&L ueber alle abgeschlossenen "
+                 "Trades (= Gewinnrate x Ø-Gewinn - Verlustrate x Ø-Verlust). "
+                 "Das ist der eigentliche 'Erwartungswert' pro Trade in absoluten "
+                 "Punkten, unabhaengig von der Normierung auf Max-Risiko rechts.",
+        )
+        m5.metric("Ø norm. P&L/Trade", f"{summary['avg_pnl_norm_pct']:+.2f}%")
+        m6.metric("Ø genutzte IV (Entry)", f"{summary['avg_entry_iv_pct']:.1f}%")
 
         if summary.get("n_unlimited_risk", 0) > 0:
             st.warning(
@@ -421,13 +460,30 @@ else:
             st.info("Konfidenzintervall schliesst 0 nicht aus - kein robust nachweisbarer Edge.")
 
         st.subheader("Equity-Kurve (kumulierter P&L)")
-        eq = trades.sort_values("exit_date").copy()
-        eq["cumulative"] = eq["net_pnl"].cumsum()
+
+        # ── Pro Kalendertag aggregieren (WICHTIG) ──────────────────────────
+        #  Im taeglichen Ladder-Modus koennen mehrere Trades AM SELBEN Kalender-
+        #  tag schliessen (z.B. wenn ein Feiertag die T_days-Faelligkeit einer
+        #  frueher eroeffneten Position auf denselben Handelstag verschiebt wie
+        #  eine andere, regulaer faellige Position). streamlit-lightweight-charts
+        #  verlangt PRO SERIE strikt aufsteigende, EINDEUTIGE Zeitstempel - bei
+        #  doppelten 'time'-Werten wird die GESAMTE Serie kommentarlos NICHT
+        #  gezeichnet (kein Python-Fehler, der Chart bleibt einfach leer). Daher
+        #  hier zuerst den Netto-P&L pro Kalendertag aufsummieren, bevor kumuliert
+        #  wird - das ist der wahrscheinlichste Grund, falls die Kurve bisher
+        #  nicht sichtbar war.
+        eq_daily = (
+            trades.assign(exit_day=trades["exit_date"].dt.normalize())
+                  .groupby("exit_day", as_index=False)["net_pnl"].sum()
+                  .sort_values("exit_day")
+                  .reset_index(drop=True)
+        )
+        eq_daily["cumulative"] = eq_daily["net_pnl"].cumsum()
 
         equity_series = [{
-            "time": row.exit_date.strftime("%Y-%m-%d"),
+            "time": row.exit_day.strftime("%Y-%m-%d"),
             "value": float(row.cumulative),
-        } for row in eq.itertuples()]
+        } for row in eq_daily.itertuples()]
 
         eq_chart_options = {
             "height": 350,
@@ -444,7 +500,23 @@ else:
             "data": equity_series,
             "options": {"color": "#26a69a", "lineWidth": 2},
         }]
-        renderLightweightCharts([{"chart": eq_chart_options, "series": eq_series}], key="equity_chart")
+
+        lwc_failed = False
+        try:
+            renderLightweightCharts([{"chart": eq_chart_options, "series": eq_series}], key="equity_chart")
+        except Exception as e:
+            lwc_failed = True
+            st.warning(f"Lightweight-Chart konnte nicht gerendert werden ({e}) - zeige Fallback-Chart.")
+
+        # ── Garantierter Fallback ───────────────────────────────────────────
+        #  Falls die JS-Komponente aus anderen Gruenden generell nicht rendert
+        #  (z.B. Browser-/Frontend-Problem), ist die Kurve hierueber trotzdem
+        #  immer sichtbar - kostet praktisch nichts.
+        if lwc_failed:
+            st.line_chart(eq_daily.set_index("exit_day")["cumulative"])
+        else:
+            with st.expander("Equity-Kurve als einfacher Streamlit-Chart (Fallback)"):
+                st.line_chart(eq_daily.set_index("exit_day")["cumulative"])
 
         with st.expander(f"Alle Trades anzeigen ({len(trades)})"):
             st.dataframe(

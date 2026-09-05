@@ -1,0 +1,8 @@
+streamlit
+streamlit-lightweight-charts
+yfinance
+pandas
+pyarrow
+numpy
+joblib
+scipy

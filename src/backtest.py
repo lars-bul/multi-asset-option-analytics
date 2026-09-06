@@ -7,13 +7,33 @@ Iron-Condor-Default.
 
 Bewusst NICHT uebernommen (siehe auch black76.py):
 - Futures-Terminstruktur / Backwardation-Contango-Regime-Umschaltung.
-- Symbol-Mapping fuer verschiedene Futures-Maerkte: wir handeln immer den
+- Symbol-Mapping fuer verschiedene Futures-Maerkte: wir handeln immer die
   regulaeren SPX-Kassaindex.
 - Trend-Filter (200-Tage-Linie): weggelassen, damit wirklich jeden Tag
   dieselbe Struktur eroeffnet wird (kein bedingtes Gating).
 
 IV-Quelle ist ausschliesslich die historische Volatilitaet (HV) - kein VIX,
 weil das Ziel eine lange, konsistente Trainingshistorie fuers ML-Modell ist.
+
+KORREKTUREN GEGENUEBER DER VORHERIGEN VERSION (siehe Kommentare an den
+jeweiligen Stellen unten fuer Details):
+  1) Strike-Auswahl (strike_from_delta) und Praemien-Bewertung (leg_price)
+     verwendeten bisher UNTERSCHIEDLICHE Vola (flach vs. geskewt) - dadurch
+     traf der gewaehlte Strike nicht das eingestellte Ziel-Delta. Jetzt loest
+     `solve_strike_delta_consistent()` Strike und Skew-Vola simultan per
+     Fixpunkt-Iteration.
+  2) Beim Mark-to-Market offener Positionen (Stop-Loss/Early-Exit) konnte
+     `current_iv` NaN sein (z.B. Rang-Modus mit noch nicht vollem Lookback-
+     Fenster) und wurde ungeprueft an leg_price() durchgereicht -> stiller
+     NaN-P&L ohne Fehlermeldung. Jetzt gibt es einen expliziten Fallback auf
+     die Entry-IV der Position, inkl. Kennzeichnung in der Trade-Ausgabe
+     (Spalte 'iv_fallback_used').
+  3) Bewertung nutzte den KASSAKURS S direkt als Terminkurs F in Black-76
+     (entspricht implizit r=q=0). Jetzt wird ueber `forward_price()` explizit
+     mit einer Dividendenrendite (SPX) umgerechnet - sowohl beim Entry als
+     auch beim Mark-to-Market vor Verfall. Am Verfall selbst bleibt es beim
+     Kassakurs S, da Index-Optionen cash-gegen-Index (nicht gegen Future)
+     abgerechnet werden.
 """
 
 from dataclasses import dataclass, field
@@ -22,7 +42,10 @@ import math
 import numpy as np
 import pandas as pd
 
-from black76 import VolSurfaceConfig, leg_price, leg_intrinsic, strike_from_delta
+from black76 import (
+    VolSurfaceConfig, leg_price, leg_intrinsic, strike_from_delta, skewed_iv,
+    forward_price,
+)
 
 
 @dataclass
@@ -79,6 +102,15 @@ class IronCondorConfig:
     hv_length: int = 30
     r_free: float = 0.0
 
+    # Dividendenrendite fuer die Spot->Forward-Umrechnung (siehe black76.py,
+    # forward_price()). ~1.3-1.5% ist eine grobe, ueber die Zeit gemittelte
+    # Annaeherung an die historische SPX-Dividendenrendite; sie schwankt real
+    # spuerbar (z.B. deutlich hoeher in den 1970ern/80ern, niedriger in
+    # Boomphasen). Fuer kurze Laufzeiten (wenige Wochen) ist der Effekt auf
+    # den Optionspreis klein, aber systematisch (Puts etwas teurer, Calls
+    # etwas guenstiger als bei einer Spot=Forward-Annahme).
+    dividend_yield: float = 0.015
+
     legs: list[LegConfig] = field(default_factory=default_iron_condor_legs)
 
     # Vorzeitiger Ausstieg / Stop-Loss (bezieht sich auf beruehrte SHORT-Beine)
@@ -128,6 +160,39 @@ def compute_rank_target_vol(df: pd.DataFrame, hv_length: int, lookback_days: int
     hv_max = hv_r.rolling(lookback_days, min_periods=lookback_days).max()
     target_vol = hv_min + (target_rank_pct / 100.0) * (hv_max - hv_min)
     return target_vol.where(hv_max > hv_min)
+
+
+def solve_strike_delta_consistent(F: float, target_delta: float, T_y: float, base_iv: float,
+                                   is_put: bool, cfg: VolSurfaceConfig,
+                                   max_iter: int = 6, tol: float = 1e-6) -> tuple[float, float]:
+    """Loest Strike UND Bewertungs-Vola SIMULTAN (Fixpunkt-Iteration).
+
+    Vorher wurde der Strike mit der FLACHEN Basis-Vola (HV) bestimmt
+    (strike_from_delta(..., current_iv, ...)), die Praemie aber mit der
+    GESKEWTEN Vola an genau diesem Strike bewertet (leg_price(...) ruft
+    intern skewed_iv() auf). Das ist inkonsistent: ein 16-Delta-Put im
+    Skew-Modell hat unter der geskewten (hoeheren) Put-Vola ein ANDERES
+    Delta als unter der flachen HV - der real resultierende Strike lag
+    dadurch systematisch naeher am Geld als das eingestellte Ziel-Delta
+    suggerierte, was die eingesammelten Praemien zu hoch ausweist.
+
+    Diese Funktion iteriert stattdessen: Strike mit aktueller Vola-Schaetzung
+    bestimmen -> Skew-Vola an diesem Strike neu berechnen -> Strike erneut
+    bestimmen usw., bis der Strike sich nicht mehr aendert (typischerweise
+    <5 Iterationen, da Skew-Effekt auf realistischen SPX-Parametern klein
+    gegenueber der Grobstruktur ist). Das Ergebnis ist ein Strike, dessen
+    Delta unter der TATSAECHLICH verwendeten (geskewten) Vola korrekt dem
+    Ziel-Delta entspricht."""
+    sigma = base_iv
+    K = strike_from_delta(F, target_delta, sigma, T_y, is_put)
+    for _ in range(max_iter):
+        sigma_new = skewed_iv(K, F, T_y, base_iv, cfg)
+        K_new = strike_from_delta(F, target_delta, sigma_new, T_y, is_put)
+        if abs(K_new - K) < tol:
+            K, sigma = K_new, sigma_new
+            break
+        K, sigma = K_new, sigma_new
+    return K, sigma
 
 
 def _leg_expiry_pnl(K: float, S: float, is_put: bool, is_long: bool, qty: float, entry_premium: float) -> float:
@@ -207,10 +272,21 @@ def run_daily_ladder(df: pd.DataFrame, cfg: IronCondorConfig) -> pd.DataFrame:
 
         # ── neue Position eroeffnen ──
         if not np.isnan(current_iv) and current_iv > 0.0:
+            # KORREKTUR (Spot vs. Forward): Black-76 erwartet den Terminkurs F,
+            # nicht den Kassakurs S. F liegt bei positiver Dividendenrendite
+            # unter S - siehe forward_price()/black76.py.
+            F_entry = forward_price(S, cfg.r_free, cfg.dividend_yield, T_years)
+
             pos_legs = []
             for leg_cfg in cfg.legs:
-                K = strike_from_delta(S, leg_cfg.delta, current_iv, T_years, is_put=leg_cfg.is_put)
-                premium = leg_price(K, leg_cfg.is_put, T_years, S, current_iv, cfg.r_free, vc) * leg_cfg.qty
+                # KORREKTUR (Delta/Skew-Konsistenz): Strike und Bewertungs-Vola
+                # werden jetzt simultan geloest statt Strike mit flacher und
+                # Praemie mit geskewter Vola zu berechnen (siehe Docstring von
+                # solve_strike_delta_consistent).
+                K, _sigma_entry = solve_strike_delta_consistent(
+                    F_entry, leg_cfg.delta, T_years, current_iv, leg_cfg.is_put, vc,
+                )
+                premium = leg_price(K, leg_cfg.is_put, T_years, F_entry, current_iv, cfg.r_free, vc) * leg_cfg.qty
                 pos_legs.append(_PositionLeg(
                     label=leg_cfg.label, K=K, entry_premium=premium,
                     is_put=leg_cfg.is_put, is_long=leg_cfg.is_long, qty=leg_cfg.qty,
@@ -249,13 +325,36 @@ def run_daily_ladder(df: pd.DataFrame, cfg: IronCondorConfig) -> pd.DataFrame:
                 still_open.append(pos)
                 continue
 
+            # KORREKTUR (NaN-Vola-Guard): Bei Stop-Loss/Early-Exit VOR Verfall
+            # muss current_iv gueltig sein, um die Restlaufzeit zu bewerten
+            # (leg_price braucht eine Vola). Im Rang-Modus kann current_iv an
+            # manchen Bars NaN sein (Lookback-Fenster noch nicht voll) - das
+            # wurde bisher ungeprueft durchgereicht und erzeugte einen
+            # stillen NaN-P&L. Jetzt: Fallback auf die Entry-IV der Position
+            # (beste verfuegbare Naeherung), transparent markiert per
+            # 'iv_fallback_used' in der Trade-Ausgabe. Am Verfall selbst wird
+            # ohnehin nur ueber den inneren Wert (Kassakurs S) abgerechnet -
+            # dort wird gar keine Vola benoetigt.
+            iv_fallback_used = False
             net_pnl = 0.0
-            for leg in pos.legs:
-                if expiry_close:
+
+            if expiry_close or T_rem <= 0.0:
+                for leg in pos.legs:
                     settle = leg_intrinsic(leg.K, S, leg.is_put) * leg.qty
-                else:
-                    settle = leg_price(leg.K, leg.is_put, T_rem, S, current_iv, cfg.r_free, vc) * leg.qty
-                net_pnl += (settle - leg.entry_premium) if leg.is_long else (leg.entry_premium - settle)
+                    net_pnl += (settle - leg.entry_premium) if leg.is_long else (leg.entry_premium - settle)
+            else:
+                iv_for_mark = current_iv
+                if np.isnan(iv_for_mark) or iv_for_mark <= 0.0:
+                    iv_for_mark = pos.entry_iv
+                    iv_fallback_used = True
+
+                # KORREKTUR (Spot vs. Forward): auch beim Mark-to-Market vor
+                # Verfall mit dem Terminkurs zur Restlaufzeit T_rem bewerten,
+                # nicht mit dem Kassakurs S.
+                F_rem = forward_price(S, cfg.r_free, cfg.dividend_yield, T_rem)
+                for leg in pos.legs:
+                    settle = leg_price(leg.K, leg.is_put, T_rem, F_rem, iv_for_mark, cfg.r_free, vc) * leg.qty
+                    net_pnl += (settle - leg.entry_premium) if leg.is_long else (leg.entry_premium - settle)
 
             exit_reason = "expiry" if expiry_close else ("stop_loss" if stop_close else "early_exit")
 
@@ -273,6 +372,7 @@ def run_daily_ladder(df: pd.DataFrame, cfg: IronCondorConfig) -> pd.DataFrame:
                 "unlimited_risk": max_risk == math.inf,
                 "touched": pos.touched,
                 "hold_days": days_since,
+                "iv_fallback_used": iv_fallback_used,
             })
 
         open_positions = still_open
@@ -290,6 +390,8 @@ def summarize_trades(trades: pd.DataFrame) -> dict:
     gross_profit = trades.loc[trades["net_pnl"] >= 0, "net_pnl"].sum()
     gross_loss = -trades.loc[trades["net_pnl"] < 0, "net_pnl"].sum()
 
+    n_fallback = int(trades["iv_fallback_used"].sum()) if "iv_fallback_used" in trades.columns else 0
+
     return {
         "n_trades": n_total,
         "win_rate_pct": n_wins / n_total * 100.0,
@@ -302,5 +404,5 @@ def summarize_trades(trades: pd.DataFrame) -> dict:
         "worst_trade": trades["net_pnl"].min(),
         "n_unlimited_risk": int(trades["unlimited_risk"].sum()),
         "avg_entry_iv_pct": trades["entry_iv"].mean() * 100.0 if "entry_iv" in trades.columns else np.nan,
+        "n_iv_fallback": n_fallback,
     }
-

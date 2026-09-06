@@ -17,6 +17,17 @@ Terminstruktur" heissen, aber nichts miteinander zu tun haben:
    EINZELNEN Struktur variiert (kurze Laufzeiten folgen enger der aktuellen
    HV, lange Laufzeiten konvergieren zu einem langfristigen Anker-Niveau).
    Das ist Teil des Bewertungsmodells und bleibt erhalten (siehe unten).
+
+KORREKTUR (Spot vs. Forward): Black-76 ist ein Modell auf den TERMINKURS F,
+nicht auf den Kassakurs S. Fruehere Version hat S direkt als F durchgereicht
+(entspricht implizit r=q=0). Das ist bei Futures-Optionen exakt richtig
+(daher der Kommentar in black76_call/put unten), bei SPX als Kassaindex mit
+Dividendenrendite q>0 aber leicht falsch: der faire Terminkurs liegt unter
+dem Spot (F = S*exp((r-q)*T)), was Puts tendenziell verteuert und Calls
+verguenstigt gegenueber einer Spot-Bewertung. Bei kurzen Laufzeiten (T_days
+im Bereich weniger Wochen) ist der Effekt klein, aber systematisch und daher
+nicht zu vernachlaessigen. `forward_price()` unten macht diese Umrechnung
+explizit; alle Aufrufer (siehe backtest.py) uebergeben jetzt F statt S.
 """
 
 from dataclasses import dataclass
@@ -33,6 +44,17 @@ def norm_ppf(p: float) -> float:
     """Inverse Normalverteilung (exakt, via scipy - praeziser als die
     Acklam-Approximation im Pine-Script)."""
     return norm.ppf(p)
+
+
+def forward_price(S: float, r: float, q: float, T: float) -> float:
+    """Terminkurs aus Spot S, risikolosem Zins r, Dividendenrendite q und
+    Restlaufzeit T (Jahre). Bei r=q=0 identisch zu F=S (Rueckwaertskompatibel
+    zur bisherigen vereinfachten Annahme). Fuer T<=0 (z.B. Restlaufzeit nach
+    Verfall) wird S direkt zurueckgegeben, da kein Termingeschaeft mehr
+    aussteht."""
+    if T <= 0.0:
+        return S
+    return S * math.exp((r - q) * T)
 
 
 def black76_call(F: float, K: float, sigma: float, T: float, r: float) -> float:
@@ -56,12 +78,16 @@ def black76_put(F: float, K: float, sigma: float, T: float, r: float) -> float:
 
 
 def leg_intrinsic(K: float, S: float, is_put: bool) -> float:
+    """Verfall-Innerer-Wert - bewusst auf Basis des KASSAKURSES S, nicht des
+    Terminkurses: Cash-Settlement eines Index-Optionsverfalls (SPX) erfolgt
+    gegen den Indexstand, nicht gegen einen Future/Forward."""
     return max(K - S, 0.0) if is_put else max(S - K, 0.0)
 
 
 def strike_from_delta(F: float, delta: float, sigma: float, T: float, is_put: bool) -> float:
     """Strike aus einem Ziel-Delta (Normal-Approximation, identisch zur
-    Pine-Logik: z aus 1-delta, Strike = F * exp(drift -/+ z*sigma*sqrt(T)))."""
+    Pine-Logik: z aus 1-delta, Strike = F * exp(drift -/+ z*sigma*sqrt(T))).
+    Erwartet den TERMINKURS F (siehe forward_price)."""
     z = norm_ppf(1.0 - delta)
     drift = 0.5 * sigma * sigma * T
     sigma_sqrtT = sigma * math.sqrt(T)
@@ -94,7 +120,8 @@ def atm_iv_term(T_y: float, base_iv: float, cfg: VolSurfaceConfig) -> float:
 
 def skewed_iv(K: float, F: float, T_y: float, base_iv: float, cfg: VolSurfaceConfig) -> float:
     """Skew-adjustierte IV fuer einen konkreten Strike (Put-Seite teurer,
-    Call-Seite guenstiger/flacher - typischer SPX Volatility Smirk)."""
+    Call-Seite guenstiger/flacher - typischer SPX Volatility Smirk).
+    Erwartet den TERMINKURS F als Referenzpunkt fuer die Moneyness."""
     base = atm_iv_term(T_y, base_iv, cfg)
     if not (cfg.use_vol_surface and K > 0.0 and F > 0.0 and base > 0.0):
         return base
@@ -113,7 +140,8 @@ def leg_price(K: float, is_put: bool, T_y: float, F: float, base_iv: float,
               r_free: float, cfg: VolSurfaceConfig) -> float:
     """Vollstaendige Beinbewertung: Skew/Term-Structure-IV -> Black-76.
     Wird sowohl fuer Entry-Praemien als auch fuer jede spaetere
-    Mark-to-Market-Bewertung (mit T_y = Restlaufzeit) verwendet."""
+    Mark-to-Market-Bewertung (mit T_y = Restlaufzeit) verwendet.
+    F muss der TERMINKURS sein (siehe forward_price), nicht der Kassakurs."""
     sigma = skewed_iv(K, F, T_y, base_iv, cfg)
     if is_put:
         return black76_put(F, K, sigma, T_y, r_free)

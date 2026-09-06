@@ -29,7 +29,13 @@ Dieses Skript kombiniert daher zwei Quellen zu EINER durchgehenden Reihe:
 Jede Zeile bekommt eine Spalte "resolution" ("daily" oder
 "monthly_interpolated"), damit nachgelagerter Code (z.B. Realized-Vol-
 Berechnung fuers ML-Modell) weiss, welche Tage echte Tagesbewegungen sind
-und welche nur grob interpolierte Platzhalter aus einem Monatswert.
+und welche nur grob interpoliert Platzhalter aus einem Monatswert.
+
+KORREKTUR: die Funktion make_synthetic_fallback() war zuvor ZWEIMAL
+definiert (identischer Name, leicht unterschiedlicher Koerper) - die zweite
+Definition hat die erste stillschweigend ueberschrieben (reiner Totcode ohne
+funktionale Auswirkung, aber Verwirrungspotenzial). Jetzt gibt es nur noch
+eine Version.
 """
 
 from pathlib import Path
@@ -118,30 +124,6 @@ def make_synthetic_fallback(n_days: int = 3000) -> pd.DataFrame:
     return pd.DataFrame({
         "date": dates, "open": open_, "high": high, "low": low,
         "close": close, "volume": volume, "resolution": "synthetic",
-    })
-
-
-def make_synthetic_fallback(n_days: int = 3000) -> pd.DataFrame:
-    """
-    Erzeugt einen plausiblen synthetischen Kursverlauf, falls (noch) keine
-    Internetverbindung / kein yfinance-Zugriff moeglich ist. Nur dafuer da,
-    damit das Dashboard beim allerersten Start sofort etwas anzeigt - sobald
-    ein echter Fetch klappt, wird diese Datei automatisch ueberschrieben.
-    """
-    rng = np.random.default_rng(42)
-    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n_days)
-
-    daily_ret = rng.normal(loc=0.0003, scale=0.011, size=n_days)
-    close = 100 * np.exp(np.cumsum(daily_ret))
-
-    high = close * (1 + np.abs(rng.normal(0, 0.004, n_days)))
-    low = close * (1 - np.abs(rng.normal(0, 0.004, n_days)))
-    open_ = low + (high - low) * rng.random(n_days)
-    volume = rng.integers(1_000_000, 5_000_000, n_days)
-
-    return pd.DataFrame({
-        "date": dates, "open": open_, "high": high,
-        "low": low, "close": close, "volume": volume,
     })
 
 

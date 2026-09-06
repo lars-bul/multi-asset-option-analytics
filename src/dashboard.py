@@ -33,6 +33,48 @@ DATA_FILE = Path(__file__).resolve().parent.parent / "data" / "spx_daily.parquet
 st.set_page_config(page_title="SPX Options Dashboard", layout="wide")
 
 
+def metric_box(label: str, value: str, status: str = "neutral", help_text: str | None = None):
+    """Rendert eine Kennzahl als farbig hinterlegte Box statt st.metric.
+
+    status:
+      - "good"    -> gruen hinterlegt (Kennzahl spricht fuer die Strategie)
+      - "bad"     -> rot hinterlegt (Kennzahl spricht gegen die Strategie)
+      - "neutral" -> neutrale Standardfarbe (kein klares Werturteil moeglich/
+                     sinnvoll, z.B. reine Anzahl oder Info-Kennzahl)
+    """
+    colors = {
+        "good": ("rgba(38, 166, 90, 0.16)", "rgba(38, 166, 90, 0.65)"),
+        "bad": ("rgba(239, 83, 80, 0.16)", "rgba(239, 83, 80, 0.65)"),
+        "neutral": ("rgba(255, 255, 255, 0.04)", "rgba(197, 203, 206, 0.25)"),
+    }
+    bg, border = colors.get(status, colors["neutral"])
+    help_html = (
+        f'<div style="font-size:0.72rem;color:#444;margin-top:4px;line-height:1.3;">{help_text}</div>'
+        if help_text else ""
+    )
+    # WICHTIG: das HTML muss als EINE Zeile ohne fuehrende Einrueckung gebaut
+    # werden. Streamlit/CommonMark interpretiert 4+ Leerzeichen am Zeilenanfang
+    # als eingerueckten Code-Block - das passiert VOR der HTML-Verarbeitung
+    # (auch mit unsafe_allow_html=True) und hat vorher dazu gefuehrt, dass das
+    # schliessende </div> als literaler Text in einer eigenen grauen Box
+    # angezeigt wurde, statt den div-Block sauber zu schliessen.
+    #
+    # Textfarben bewusst DUNKEL (statt hellgrau/weiss): die Box selbst ist
+    # immer ein helles, transluzentes Gruen/Rot/Grau-Tint - das funktioniert
+    # sowohl im hellen als auch im dunklen Streamlit-Theme. Helle Schrift war
+    # nur im dunklen Theme lesbar und ist im hellen Theme (weisser Hintergrund)
+    # praktisch unsichtbar.
+    html = (
+        f'<div style="background:{bg};border:1px solid {border};border-radius:10px;'
+        f'padding:10px 14px 12px 14px;margin-bottom:6px;height:100%;">'
+        f'<div style="font-size:0.8rem;color:#555;margin-bottom:2px;">{label}</div>'
+        f'<div style="font-size:1.55rem;font-weight:700;color:#111;line-height:1.2;">{value}</div>'
+        f'{help_html}'
+        f'</div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
 @st.cache_data
 def load_data() -> pd.DataFrame:
     if not DATA_FILE.exists():
@@ -176,23 +218,31 @@ if n_daily_total < 60:
         "mit Internetverbindung aus, um echte yfinance-Daten zu laden."
     )
 else:
+    # Grober Referenz-Spot NUR fuer sinnvolle Default-Werte bei der Eingabe
+    # eines fixen Strikes in der Sidebar unten (Delta-Modus braucht das nicht).
+    _default_spot = float(df["close"].iloc[-1])
+
     with st.sidebar:
         st.divider()
         st.header("Iron Condor Parameter")
         T_days = st.slider("Laufzeit T (Tage)", 2, 60, 7)
         hv_length = st.slider("HV-Periode (Tage)", 5, 90, 30)
 
-        st.subheader("4 Beine (je Put/Call, Long/Short, Delta)")
+        st.subheader("4 Beine (je Put/Call, Long/Short, Delta ODER fixer Strike)")
         st.caption(
             "Default entspricht dem klassischen Iron Condor "
             "(Put long / Put short / Call short / Call long). Beliebig "
-            "aenderbar - z.B. Menge=0 setzen, um ein Bein zu deaktivieren."
+            "aenderbar - z.B. Menge=0 setzen, um ein Bein zu deaktivieren. "
+            "Je Bein kann statt eines Ziel-Deltas (Strike wird dann taeglich "
+            "neu berechnet) auch ein FESTER Strike-Preis eingegeben werden "
+            "(bleibt an jedem Entry-Tag unveraendert)."
         )
-        hc1, hc2, hc3, hc4 = st.columns(4)
+        hc1, hc2, hc3, hc4, hc5 = st.columns([1, 1, 1.1, 1, 1])
         hc1.caption("Typ")
         hc2.caption("Richtung")
-        hc3.caption("Delta")
-        hc4.caption("Menge")
+        hc3.caption("Basis")
+        hc4.caption("Delta / Strike")
+        hc5.caption("Menge")
         default_legs = [
             ("Bein 1", "put", "long", 0.05),
             ("Bein 2", "put", "short", 0.16),
@@ -202,7 +252,7 @@ else:
         legs = []
         for label, def_type, def_side, def_delta in default_legs:
             st.markdown(f"**{label}**")
-            lc1, lc2, lc3, lc4 = st.columns(4)
+            lc1, lc2, lc3, lc4, lc5 = st.columns([1, 1, 1.1, 1, 1])
             option_type = lc1.selectbox(
                 "Typ", ["put", "call"], index=["put", "call"].index(def_type),
                 key=f"type_{label}", label_visibility="collapsed",
@@ -211,15 +261,32 @@ else:
                 "Richtung", ["long", "short"], index=["long", "short"].index(def_side),
                 key=f"side_{label}", label_visibility="collapsed",
             )
-            delta = lc3.number_input(
-                "Delta", 0.01, 0.99, def_delta, 0.01,
-                key=f"delta_{label}", label_visibility="collapsed",
+            basis = lc3.selectbox(
+                "Basis", ["Delta", "Fixer Strike"],
+                key=f"basis_{label}", label_visibility="collapsed",
             )
-            qty = lc4.number_input(
+            if basis == "Fixer Strike":
+                fixed_strike = lc4.number_input(
+                    "Strike", min_value=0.0, value=round(_default_spot, 0), step=1.0,
+                    key=f"strike_{label}", label_visibility="collapsed",
+                )
+                delta = def_delta  # bleibt im LegConfig belegt, wird aber ignoriert
+                strike_mode = "fixed"
+            else:
+                delta = lc4.number_input(
+                    "Delta", 0.01, 0.99, def_delta, 0.01,
+                    key=f"delta_{label}", label_visibility="collapsed",
+                )
+                fixed_strike = None
+                strike_mode = "delta"
+            qty = lc5.number_input(
                 "Menge", 0.0, 50.0, 1.0, 1.0,
                 key=f"qty_{label}", label_visibility="collapsed",
             )
-            legs.append(LegConfig(label=label, option_type=option_type, side=side, delta=delta, qty=qty))
+            legs.append(LegConfig(
+                label=label, option_type=option_type, side=side, delta=delta, qty=qty,
+                strike_mode=strike_mode, fixed_strike=fixed_strike,
+            ))
 
         st.subheader("Vorzeitiger Ausstieg")
         close_on_touch = st.checkbox("Bei Short-Strike-Beruehrung schliessen", value=False)
@@ -265,7 +332,9 @@ else:
     #  aktuell gewaehlte IV-Quelle (HV oder - falls aktiviert - der aus dem
     #  Ziel-IV-Rang zurueckgerechnete Wert), jeweils mit der oben gewaehlten
     #  Laufzeit T_days. Aktualisiert sich live mit jeder Sidebar-Aenderung,
-    #  unabhaengig davon, ob der Backtest bereits gelaufen ist.
+    #  unabhaengig davon, ob der Backtest bereits gelaufen ist. Beine mit
+    #  fixem Strike (statt Delta) verwenden hier direkt den eingegebenen
+    #  Strike-Preis, ohne Delta->Strike-Umrechnung.
     # ═════════════════════════════════════════════════════════════════════
     st.subheader("Options-Preisvorschau (aktuell): Preise je Strike + Kombo gesamt")
     st.caption(
@@ -337,7 +406,12 @@ else:
         short_sum = 0.0
         long_sum = 0.0
         for leg in legs:
-            K = strike_from_delta(S_last, leg.delta, iv_preview, T_years_preview, is_put=leg.is_put)
+            if leg.uses_fixed_strike:
+                K = leg.fixed_strike
+                basis_label = "Fix"
+            else:
+                K = strike_from_delta(S_last, leg.delta, iv_preview, T_years_preview, is_put=leg.is_put)
+                basis_label = f"Δ{leg.delta:.2f}"
             premium_per_contract = leg_price(
                 K, leg.is_put, T_years_preview, S_last, iv_preview, r_free, vc_preview,
             )
@@ -352,7 +426,7 @@ else:
                 "Bein": leg.label,
                 "Typ": "Put" if leg.is_put else "Call",
                 "Richtung": "Long" if leg.is_long else "Short",
-                "Delta": leg.delta,
+                "Basis": basis_label,
                 "Menge": leg.qty,
                 "Strike": round(K, 2),
                 "Preis / Kontrakt": round(premium_per_contract, 4),
@@ -364,7 +438,7 @@ else:
 
         preview_df = pd.DataFrame(preview_rows)
         st.dataframe(
-            preview_df[["Bein", "Typ", "Richtung", "Delta", "Menge", "Strike",
+            preview_df[["Bein", "Typ", "Richtung", "Basis", "Menge", "Strike",
                         "Preis / Kontrakt", "Preis gesamt", "Cashflow"]],
             use_container_width=True, hide_index=True,
         )
@@ -409,7 +483,11 @@ else:
             )
         else:
             st.session_state["ic_trades"] = trades
-            leg_summary = " / ".join(f"{l.option_type[0].upper()}{'+' if l.is_long else '-'}{l.delta}" for l in legs)
+            leg_summary = " / ".join(
+                f"{l.option_type[0].upper()}{'+' if l.is_long else '-'}"
+                + (f"K{l.fixed_strike:.0f}" if l.uses_fixed_strike else f"{l.delta}")
+                for l in legs
+            )
             rank_label = f", Fixer Rang={target_rank_pct:.0f}%" if use_fixed_rank else ""
             st.session_state["ic_cfg_label"] = f"T={T_days}d, HV={hv_length}d, Beine: {leg_summary}{rank_label}"
 
@@ -420,20 +498,39 @@ else:
 
         st.caption(f"Letzter Lauf: {st.session_state.get('ic_cfg_label', '')}")
 
+        # ── Kennzahlen, farbig hinterlegt je nachdem ob gut/schlecht ──
+        #  Faerbung ist bewusst nur dort binaer gruen/rot, wo eine Kennzahl
+        #  ein klares Werturteil zulaesst (>0, >1, statistische Signifikanz
+        #  etc.). Reine Mengen-/Info-Kennzahlen (Anzahl Trades, genutzte IV)
+        #  bleiben neutral, da es dafuer kein 'gut' oder 'schlecht' gibt.
         m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Trades", f"{summary['n_trades']:,}")
-        m2.metric("Gewinnrate", f"{summary['win_rate_pct']:.1f}%")
-        m3.metric("Profit Factor", f"{summary['profit_factor']:.2f}" if pd.notna(summary["profit_factor"]) else "n/a")
-        m4.metric(
-            "Erwartungswert / Trade",
-            f"{summary['avg_pnl']:+.4f}",
-            help="Arithmetisches Mittel des Netto-P&L ueber alle abgeschlossenen "
-                 "Trades (= Gewinnrate x Ø-Gewinn - Verlustrate x Ø-Verlust). "
-                 "Das ist der eigentliche 'Erwartungswert' pro Trade in absoluten "
-                 "Punkten, unabhaengig von der Normierung auf Max-Risiko rechts.",
-        )
-        m5.metric("Ø norm. P&L/Trade", f"{summary['avg_pnl_norm_pct']:+.2f}%")
-        m6.metric("Ø genutzte IV (Entry)", f"{summary['avg_entry_iv_pct']:.1f}%")
+        with m1:
+            metric_box("Trades", f"{summary['n_trades']:,}", "neutral")
+        with m2:
+            win_rate = summary["win_rate_pct"]
+            metric_box("Gewinnrate", f"{win_rate:.1f}%", "good" if win_rate >= 50.0 else "bad")
+        with m3:
+            pf = summary["profit_factor"]
+            if pd.isna(pf):
+                metric_box("Profit Factor", "n/a", "neutral")
+            else:
+                metric_box("Profit Factor", f"{pf:.2f}", "good" if pf > 1.0 else "bad")
+        with m4:
+            avg_pnl = summary["avg_pnl"]
+            metric_box(
+                "Erwartungswert / Trade", f"{avg_pnl:+.4f}",
+                "good" if avg_pnl > 0.0 else "bad",
+                help_text="Arithmetisches Mittel des Netto-P&L ueber alle "
+                          "abgeschlossenen Trades, in absoluten Punkten.",
+            )
+        with m5:
+            avg_pnl_norm = summary["avg_pnl_norm_pct"]
+            metric_box(
+                "Ø norm. P&L/Trade", f"{avg_pnl_norm:+.2f}%",
+                "good" if avg_pnl_norm > 0.0 else "bad",
+            )
+        with m6:
+            metric_box("Ø genutzte IV (Entry)", f"{summary['avg_entry_iv_pct']:.1f}%", "neutral")
 
         if summary.get("n_unlimited_risk", 0) > 0:
             st.warning(
@@ -444,79 +541,40 @@ else:
             )
 
         st.subheader("Reliability (Newey-West, autokorrelationsrobust)")
+        # Signifikanz-Status (t-Stat und Konfidenzintervall sind zwei
+        # Ausdrucksformen desselben Tests -> selbe Faerbung).
+        sig_status = "good" if rel["ci_excludes_zero"] else "bad"
         r1, r2, r3 = st.columns(3)
-        r1.metric("t-Statistik", f"{rel['tstat']:.2f}" if pd.notna(rel["tstat"]) else "n/a")
-        ci_text = (f"{rel['ci_low']*100:+.2f}% bis {rel['ci_high']*100:+.2f}%"
-                   if pd.notna(rel["ci_low"]) else "n/a")
-        r2.metric("95%-Konfidenzintervall", ci_text)
-        r3.metric(
-            "Perioden-Konsistenz",
-            f"{rel['subperiod_matching']}/{rel['subperiod_nonempty']}",
-            help="Anzahl Teilperioden mit gleichem Vorzeichen wie der Gesamt-Mittelwert.",
-        )
+        with r1:
+            tstat_status = sig_status if pd.notna(rel["tstat"]) else "neutral"
+            metric_box(
+                "t-Statistik", f"{rel['tstat']:.2f}" if pd.notna(rel["tstat"]) else "n/a",
+                tstat_status,
+            )
+        with r2:
+            ci_text = (f"{rel['ci_low']*100:+.2f}% bis {rel['ci_high']*100:+.2f}%"
+                       if pd.notna(rel["ci_low"]) else "n/a")
+            ci_status = sig_status if pd.notna(rel["ci_low"]) else "neutral"
+            metric_box("95%-Konfidenzintervall", ci_text, ci_status)
+        with r3:
+            if rel["subperiod_nonempty"] > 0:
+                ratio = rel["subperiod_matching"] / rel["subperiod_nonempty"]
+                consistency_status = "good" if ratio >= 0.5 else "bad"
+            else:
+                consistency_status = "neutral"
+            metric_box(
+                "Perioden-Konsistenz",
+                f"{rel['subperiod_matching']}/{rel['subperiod_nonempty']}",
+                consistency_status,
+                help_text="Anzahl Teilperioden mit gleichem Vorzeichen wie der "
+                          "Gesamt-Mittelwert.",
+            )
         if rel["ci_excludes_zero"]:
             st.success("Konfidenzintervall schliesst 0 aus - statistisch robuster Edge in dieser Konfiguration.")
         else:
             st.info("Konfidenzintervall schliesst 0 nicht aus - kein robust nachweisbarer Edge.")
 
-        st.subheader("Equity-Kurve (kumulierter P&L)")
-
-        # ── Pro Kalendertag aggregieren (WICHTIG) ──────────────────────────
-        #  Im taeglichen Ladder-Modus koennen mehrere Trades AM SELBEN Kalender-
-        #  tag schliessen (z.B. wenn ein Feiertag die T_days-Faelligkeit einer
-        #  frueher eroeffneten Position auf denselben Handelstag verschiebt wie
-        #  eine andere, regulaer faellige Position). streamlit-lightweight-charts
-        #  verlangt PRO SERIE strikt aufsteigende, EINDEUTIGE Zeitstempel - bei
-        #  doppelten 'time'-Werten wird die GESAMTE Serie kommentarlos NICHT
-        #  gezeichnet (kein Python-Fehler, der Chart bleibt einfach leer). Daher
-        #  hier zuerst den Netto-P&L pro Kalendertag aufsummieren, bevor kumuliert
-        #  wird - das ist der wahrscheinlichste Grund, falls die Kurve bisher
-        #  nicht sichtbar war.
-        eq_daily = (
-            trades.assign(exit_day=trades["exit_date"].dt.normalize())
-                  .groupby("exit_day", as_index=False)["net_pnl"].sum()
-                  .sort_values("exit_day")
-                  .reset_index(drop=True)
-        )
-        eq_daily["cumulative"] = eq_daily["net_pnl"].cumsum()
-
-        equity_series = [{
-            "time": row.exit_day.strftime("%Y-%m-%d"),
-            "value": float(row.cumulative),
-        } for row in eq_daily.itertuples()]
-
-        eq_chart_options = {
-            "height": 350,
-            "layout": {"background": {"type": "solid", "color": "#0e1117"}, "textColor": "#d1d4dc"},
-            "grid": {
-                "vertLines": {"color": "rgba(42, 46, 57, 0.5)"},
-                "horzLines": {"color": "rgba(42, 46, 57, 0.5)"},
-            },
-            "timeScale": {"borderColor": "rgba(197, 203, 206, 0.4)"},
-            "rightPriceScale": {"borderColor": "rgba(197, 203, 206, 0.4)"},
-        }
-        eq_series = [{
-            "type": "Line",
-            "data": equity_series,
-            "options": {"color": "#26a69a", "lineWidth": 2},
-        }]
-
-        lwc_failed = False
-        try:
-            renderLightweightCharts([{"chart": eq_chart_options, "series": eq_series}], key="equity_chart")
-        except Exception as e:
-            lwc_failed = True
-            st.warning(f"Lightweight-Chart konnte nicht gerendert werden ({e}) - zeige Fallback-Chart.")
-
-        # ── Garantierter Fallback ───────────────────────────────────────────
-        #  Falls die JS-Komponente aus anderen Gruenden generell nicht rendert
-        #  (z.B. Browser-/Frontend-Problem), ist die Kurve hierueber trotzdem
-        #  immer sichtbar - kostet praktisch nichts.
-        if lwc_failed:
-            st.line_chart(eq_daily.set_index("exit_day")["cumulative"])
-        else:
-            with st.expander("Equity-Kurve als einfacher Streamlit-Chart (Fallback)"):
-                st.line_chart(eq_daily.set_index("exit_day")["cumulative"])
+  
 
         with st.expander(f"Alle Trades anzeigen ({len(trades)})"):
             st.dataframe(

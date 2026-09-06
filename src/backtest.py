@@ -34,6 +34,13 @@ jeweiligen Stellen unten fuer Details):
      auch beim Mark-to-Market vor Verfall. Am Verfall selbst bleibt es beim
      Kassakurs S, da Index-Optionen cash-gegen-Index (nicht gegen Future)
      abgerechnet werden.
+  4) NEU - Fixer Strike je Bein: bisher war ein Bein immer ueber ein
+     Ziel-Delta definiert (Strike wurde daraus taeglich neu bestimmt). Jetzt
+     kann pro Bein optional stattdessen ein FESTER Strike-Preis vorgegeben
+     werden (LegConfig.strike_mode == "fixed"). In dem Fall entfaellt die
+     Delta->Strike-Umrechnung komplett; der angegebene Strike wird an jedem
+     Entry-Tag unveraendert verwendet (nur die Praemie wird taeglich neu,
+     mit der jeweils aktuellen IV, bewertet).
 """
 
 from dataclasses import dataclass, field
@@ -50,12 +57,19 @@ from black76 import (
 
 @dataclass
 class LegConfig:
-    """Ein einzelnes Options-Bein: frei waehlbar Put/Call, Long/Short."""
+    """Ein einzelnes Options-Bein: frei waehlbar Put/Call, Long/Short.
+
+    strike_mode == "delta" (Default): Strike wird taeglich neu aus `delta`
+    hergeleitet (siehe solve_strike_delta_consistent).
+    strike_mode == "fixed": `fixed_strike` wird direkt als Strike verwendet,
+    `delta` wird in diesem Fall ignoriert."""
     label: str
     option_type: str   # "put" oder "call"
     side: str          # "long" oder "short"
     delta: float
     qty: float = 1.0
+    strike_mode: str = "delta"       # "delta" oder "fixed"
+    fixed_strike: float | None = None
 
     @property
     def is_put(self) -> bool:
@@ -64,6 +78,10 @@ class LegConfig:
     @property
     def is_long(self) -> bool:
         return self.side == "long"
+
+    @property
+    def uses_fixed_strike(self) -> bool:
+        return self.strike_mode == "fixed" and self.fixed_strike is not None and self.fixed_strike > 0.0
 
 
 def default_iron_condor_legs() -> list[LegConfig]:
@@ -234,7 +252,7 @@ def run_daily_ladder(df: pd.DataFrame, cfg: IronCondorConfig) -> pd.DataFrame:
         Tagesdaten (siehe data_fetch.py - Spalte 'resolution'=='daily'; wird
         hier zur Sicherheit nochmal gefiltert, falls vorhanden).
     cfg: IronCondorConfig mit cfg.legs (Liste von LegConfig, je Put/Call,
-        Long/Short, Delta, Menge frei waehlbar).
+        Long/Short, Delta oder fixer Strike, Menge frei waehlbar).
 
     Rueckgabe: DataFrame, eine Zeile je abgeschlossenem Trade.
     """
@@ -279,13 +297,20 @@ def run_daily_ladder(df: pd.DataFrame, cfg: IronCondorConfig) -> pd.DataFrame:
 
             pos_legs = []
             for leg_cfg in cfg.legs:
-                # KORREKTUR (Delta/Skew-Konsistenz): Strike und Bewertungs-Vola
-                # werden jetzt simultan geloest statt Strike mit flacher und
-                # Praemie mit geskewter Vola zu berechnen (siehe Docstring von
-                # solve_strike_delta_consistent).
-                K, _sigma_entry = solve_strike_delta_consistent(
-                    F_entry, leg_cfg.delta, T_years, current_iv, leg_cfg.is_put, vc,
-                )
+                if leg_cfg.uses_fixed_strike:
+                    # NEU (fixer Strike): kein Delta->Strike-Solve noetig -
+                    # der vorgegebene Strike wird direkt uebernommen. Die
+                    # Praemie wird trotzdem taeglich neu bewertet (mit der
+                    # jeweils aktuellen IV inkl. Skew an genau diesem Strike).
+                    K = leg_cfg.fixed_strike
+                else:
+                    # KORREKTUR (Delta/Skew-Konsistenz): Strike und
+                    # Bewertungs-Vola werden simultan geloest statt Strike
+                    # mit flacher und Praemie mit geskewter Vola zu berechnen
+                    # (siehe Docstring von solve_strike_delta_consistent).
+                    K, _sigma_entry = solve_strike_delta_consistent(
+                        F_entry, leg_cfg.delta, T_years, current_iv, leg_cfg.is_put, vc,
+                    )
                 premium = leg_price(K, leg_cfg.is_put, T_years, F_entry, current_iv, cfg.r_free, vc) * leg_cfg.qty
                 pos_legs.append(_PositionLeg(
                     label=leg_cfg.label, K=K, entry_premium=premium,

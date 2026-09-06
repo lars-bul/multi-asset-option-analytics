@@ -98,6 +98,34 @@ def to_candles(df: pd.DataFrame) -> list[dict]:
     return out
 
 
+def to_equity_points(trades: pd.DataFrame) -> tuple[list[dict], pd.Series]:
+    """Baut die Datenpunkte fuer die Equity-Kurve (kumulierter P&L).
+
+    WICHTIG - Tagesaggregation statt Punkt-je-Trade:
+    lightweight-charts erwartet pro Serie STRIKT aufsteigende, EINDEUTIGE
+    Zeitpunkte. Bei der taeglichen Ladder-Strategie koennen an einem
+    Kalendertag aber mehrere Positionen gleichzeitig schliessen (z.B. eine
+    per Stop-Loss und eine andere per regulaerem Verfall, beide mit
+    unterschiedlichem Entry-Datum) - das wuerde zu doppelten Zeitstempeln
+    fuehren. Deshalb wird der Netto-P&L zuerst pro Kalendertag summiert und
+    erst danach kumuliert.
+
+    Das reduziert nebenbei auch die Punktzahl deutlich (ein Punkt pro
+    Handelstag statt einer pro Trade) - zusammen mit der Umstellung von
+    st.line_chart (Vega-Lite, wird bei vielen tausend Punkten spuerbar
+    langsam und laesst sich nur eingeschraenkt zoomen) auf die bereits fuer
+    den Candlestick-Chart genutzte, Canvas-basierte TradingView-Lightweight-
+    Charts-Bibliothek ist die Kurve so ueber die GESAMTE Backtest-Historie
+    fluessig zoom- und pannbar, nicht nur ueber ein Fenster von ~10 Jahren."""
+    daily_pnl = trades.groupby(trades["exit_date"].dt.normalize())["net_pnl"].sum().sort_index()
+    equity = daily_pnl.cumsum()
+    points = [
+        {"time": ts.strftime("%Y-%m-%d"), "value": float(val)}
+        for ts, val in equity.items()
+    ]
+    return points, equity
+
+
 st.title("SPX Options Dashboard")
 st.caption("Lokales Analyse-Tool - laeuft nur bei dir auf localhost")
 
@@ -539,6 +567,59 @@ else:
                 "ist 'normierter P&L' nicht definiert (NaN) und wird bei den obigen "
                 "Kennzahlen automatisch ausgeschlossen."
             )
+
+        # ─────────────────────────────────────────────────────────────────
+        #  EQUITY-KURVE (kumulierter P&L)
+        #  Siehe Docstring von to_equity_points() fuer Details/Begruendung:
+        #  Tagesaggregation (statt Punkt-je-Trade) + TradingView Lightweight
+        #  Charts (statt st.line_chart) - dadurch ueber die GESAMTE Historie
+        #  fluessig zoom-/pannbar statt nur ueber ein Fenster von ~10 Jahren.
+        # ─────────────────────────────────────────────────────────────────
+        st.subheader("Equity-Kurve (kumulierter P&L)")
+
+        equity_points, equity_series_vals = to_equity_points(trades)
+
+        equity_chart_options = {
+            "height": 400,
+            "layout": {
+                "background": {"type": "solid", "color": "#0e1117"},
+                "textColor": "#d1d4dc",
+            },
+            "grid": {
+                "vertLines": {"color": "rgba(42, 46, 57, 0.5)"},
+                "horzLines": {"color": "rgba(42, 46, 57, 0.5)"},
+            },
+            "timeScale": {"borderColor": "rgba(197, 203, 206, 0.4)"},
+            "rightPriceScale": {"borderColor": "rgba(197, 203, 206, 0.4)"},
+            # explizit aktiviert (sind zwar Default bei lightweight-charts,
+            # aber so ist unmissverstaendlich klar, dass Zoom/Pan ueber die
+            # komplette geladene Reihe gewuenscht sind, nicht nur ein
+            # eingeschraenktes Fenster):
+            "handleScroll": True,
+            "handleScale": True,
+        }
+
+        equity_chart_series = [{
+            "type": "Area",
+            "data": equity_points,
+            "options": {
+                "lineColor": "#2962FF",
+                "topColor": "rgba(41, 98, 255, 0.28)",
+                "bottomColor": "rgba(41, 98, 255, 0.0)",
+                "lineWidth": 2,
+            },
+        }]
+
+        renderLightweightCharts(
+            [{"chart": equity_chart_options, "series": equity_chart_series}],
+            key="equity_chart",
+        )
+        st.caption(
+            f"{len(equity_points)} Tages-Datenpunkte "
+            f"({equity_series_vals.index.min().date()} bis {equity_series_vals.index.max().date()}) - "
+            "frei zoom-/pannbar ueber die gesamte Backtest-Historie "
+            "(Mausrad = Zoom, Ziehen = Pan, Doppelklick auf die Zeitachse = volle Ansicht)."
+        )
 
         st.subheader("Reliability (Newey-West, autokorrelationsrobust)")
         # Signifikanz-Status (t-Stat und Konfidenzintervall sind zwei

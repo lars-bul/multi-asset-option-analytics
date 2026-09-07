@@ -8,3 +8,4 @@ joblib
 scipy
 scikit-learn
 lightgbm
+shap

@@ -29,6 +29,7 @@ from backtest import (
 from stats import reliability_summary
 from analog_matching import (
     AnalogConfig, SimilaritySpaceConfig, recommend_for_today, available_t_days,
+    evaluate_analog_set, summarize_analog_trades,
 )
 
 DATA_FILE = Path(__file__).resolve().parent.parent / "data" / "spx_daily.parquet"
@@ -684,24 +685,31 @@ else:
         st.info("Parameter links einstellen und 'Backtest ausfuehren' klicken.")
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ANALOG-TAGE-MATCHING (Grundlage: dieselbe Rang-Skalierung wie oben bei
-#  "Fixer IV-Rang", nur nicht auf die GESAMTE Historie angewendet, sondern
-#  gezielt auf die K Handelstage, die einem gewaehlten Tag ("heute") in
-#  Bezug auf Vola-Regime/Momentum/Tail-Risiko am aehnlichsten waren - siehe
-#  src/analog_matching.py fuer die Details/Docstrings.)
+#  ANALOG-TAGE-MATCHING
+#
+#  Erweiterte Gesamtversion:
+#  - PCA-basierte Aehnlichkeitssuche
+#  - kausales Analog-Tage-Matching
+#  - direkte Uebertragung des heutigen IV-Niveaus ODER theoretische Rang-Skalierung
+#  - optionale manuelle IV
+#  - Grid-Search fuer Put-/Call-Delta-Paare
+#  - Train/Validierungs-Split gegen Mehrfachvergleich-Zufallstreffer
+#  - Clustering-/Abhaengigkeitswarnung
+#  - Detailauswertung einer ausgewaehlten Kombination auf dem kompletten Analog-Set
+#  - Newey-West-Reliability
+#  - kumulierter normierter P&L als Konsistenz-Check (keine reale Equity-Kurve)
 # ═══════════════════════════════════════════════════════════════════════════
 st.divider()
 st.header("Analog-Tage-Matching")
 st.caption(
     "Findet die K historisch aehnlichsten Handelstage zu einem gewaehlten Tag "
     "(PCA-Distanz ueber die taeglichen Features aus features.py) und wertet "
-    "auf genau diesen Tagen einen Short- und Long-Strangle aus - rang-skaliert "
-    "auf den heutigen HV-Rang (dieselbe Grundidee wie beim 'Fixer IV-Rang'-"
-    "Backtest oben, hier aber nicht auf jeden Handelstag angewendet, sondern "
-    "gezielt nur auf die K aehnlichsten Analog-Tage). Per Grid-Search wird "
-    "daraus das robusteste Put-/Call-Delta-Paar fuer die SHORT-Beine (Bein 2 "
-    "'Short Put' / Bein 3 'Short Call') des Iron Condor gesucht - inkl. "
-    "Train/Validierungs-Split gegen Mehrfachvergleichs-Zufallstreffer."
+    "auf genau diesen Tagen einen Short- und Long-Strangle aus. Die IV kann "
+    "entweder direkt auf das heutige Markt-Niveau gesetzt oder theoretisch "
+    "rang-skaliert werden. Per Grid-Search wird daraus das robusteste "
+    "Put-/Call-Delta-Paar fuer die Short-Beine (Bein 2 'Short Put' / Bein 3 "
+    "'Short Call') des Iron Condor gesucht - inkl. Train/Validierungs-Split "
+    "gegen Mehrfachvergleich-Zufallstreffer."
 )
 
 training_table = load_training_table()
@@ -751,16 +759,80 @@ else:
                  "T_days_list) - unabhaengig von der Laufzeit T oben beim "
                  "Iron-Condor-Backtest.",
         )
-        analog_hv_length = st.number_input("HV-Periode fuer den Rang (Tage)", 2, 365, 30)
-        analog_rank_lookback = st.number_input("Lookback fuer den Rang (Tage)", 10, 5000, 252)
+
+        st.subheader("Bewertungsniveau (IV)")
+        analog_iv_mode_label = st.radio(
+            "Wie soll die Vola auf die Analog-Tage uebertragen werden?",
+            ["Direkt (heutiges Markt-Niveau)", "Rang-skaliert (theoretisch)"],
+            index=0,
+            help="'Direkt' (empfohlen): dieselbe absolute IV wie heute wird "
+                 "unveraendert fuer JEDEN Analog-Tag verwendet - beantwortet "
+                 "'wie haette sich HEUTIGE Bewertung an aehnlichen Tagen "
+                 "verhalten'. 'Rang-skaliert': die alte, rein theoretische "
+                 "Perzentil-Umrechnung auf die jeweilige Historie des "
+                 "Analog-Tages - ein '65%-Rang-Tag' ist KEINE Aussage ueber "
+                 "ein reales Bewertungsniveau.",
+        )
+        analog_vol_mode = "direct" if analog_iv_mode_label.startswith("Direkt") else "rank"
+
+        analog_hv_length = st.number_input(
+            "HV-Periode fuer die Berechnung (Tage)", 2, 365, 30,
+            help="Historische Volatilitaetsperiode fuer die heutige IV und den "
+                 "Rang-Modus.",
+        )
+        analog_rank_lookback = st.number_input(
+            "Lookback fuer den Rang (Tage)", 10, 5000, 252,
+            help="Nur fuer die Rang-Anzeige/den Rang-Modus relevant - bestimmt "
+                 "das rollierende Fenster, in dem die verwendete IV historisch "
+                 "eingeordnet wird.",
+        )
+
+        # Vorschau der aus der Kurshistorie berechneten IV am gewaehlten Tag.
+        _daily_for_preview = df[df["resolution"] == "daily"] if has_resolution else df
+        _daily_for_preview = _daily_for_preview.sort_values("date")
+        _hv_preview_series = compute_hv(_daily_for_preview, int(analog_hv_length))
+        _hv_preview_rows = _hv_preview_series[
+            _daily_for_preview["date"] == pd.Timestamp(query_date_input)
+        ]
+        _computed_iv_preview = (
+            float(_hv_preview_rows.iloc[0])
+            if len(_hv_preview_rows) and pd.notna(_hv_preview_rows.iloc[0])
+            else np.nan
+        )
+
+        override_iv = st.checkbox(
+            "IV manuell eingeben (z.B. aus der eigenen Optionskette)", value=False,
+            help="Ueberschreibt die aus der Kurshistorie berechnete HV mit "
+                 "einer selbst eingegebenen Zahl - sinnvoll, wenn die reale "
+                 "Markt-IV vom historischen HV-Modell abweicht.",
+        )
+        if override_iv:
+            analog_iv_pct = st.number_input(
+                "Heutige IV (%)", 0.1, 300.0,
+                float(round(_computed_iv_preview * 100, 2))
+                if pd.notna(_computed_iv_preview) else 15.0,
+                0.1,
+            )
+            analog_today_iv_override = analog_iv_pct / 100.0
+        else:
+            analog_today_iv_override = None
+            if pd.notna(_computed_iv_preview):
+                st.caption(
+                    f"Berechnete HV({int(analog_hv_length)}d) am {query_date_input}: "
+                    f"**{_computed_iv_preview*100:.2f}%**"
+                )
+            else:
+                st.caption("Berechnete HV am gewaehlten Tag: n/a (zu wenig Historie)")
 
         st.caption("Delta-Raster fuer die Grid-Search (Put x Call):")
         delta_grid_options = [0.05, 0.10, 0.16, 0.20, 0.25, 0.30, 0.35, 0.40]
         put_delta_grid = st.multiselect(
-            "Put-Deltas", delta_grid_options, default=[0.10, 0.16, 0.20, 0.25, 0.30],
+            "Put-Deltas", delta_grid_options,
+            default=[0.10, 0.16, 0.20, 0.25, 0.30],
         )
         call_delta_grid = st.multiselect(
-            "Call-Deltas", delta_grid_options, default=[0.10, 0.16, 0.20, 0.25, 0.30],
+            "Call-Deltas", delta_grid_options,
+            default=[0.10, 0.16, 0.20, 0.25, 0.30],
         )
 
         run_analog = st.button("Analog-Matching ausfuehren", type="primary")
@@ -770,19 +842,26 @@ else:
             st.error("Bitte mindestens ein Put-Delta und ein Call-Delta im Raster auswaehlen.")
         else:
             try:
-                with st.spinner(f"Suche {analog_k} Analog-Tage und werte "
-                                 f"{len(put_delta_grid) * len(call_delta_grid)} Delta-Kombinationen aus..."):
+                with st.spinner(
+                    f"Suche {analog_k} Analog-Tage und werte "
+                    f"{len(put_delta_grid) * len(call_delta_grid)} Delta-Kombinationen aus..."
+                ):
                     result = recommend_for_today(
-                        daily_df, training_table,
+                        daily_df,
+                        training_table,
                         query_date=pd.Timestamp(query_date_input),
                         T_days=int(analog_T_days),
                         put_delta_grid=put_delta_grid,
                         call_delta_grid=call_delta_grid,
-                        analog_cfg=AnalogConfig(k=int(analog_k), min_gap_days=int(analog_min_gap)),
+                        analog_cfg=AnalogConfig(
+                            k=int(analog_k), min_gap_days=int(analog_min_gap)
+                        ),
                         space_cfg=SimilaritySpaceConfig(),
                         hv_length=int(analog_hv_length),
                         rank_lookback_days=int(analog_rank_lookback),
                         vol_surface=VolSurfaceConfig(),
+                        vol_mode=analog_vol_mode,
+                        today_iv_override=analog_today_iv_override,
                     )
                 st.session_state["analog_result"] = result
             except ValueError as e:
@@ -791,31 +870,60 @@ else:
     if "analog_result" in st.session_state:
         result = st.session_state["analog_result"]
 
-        a1, a2, a3, a4 = st.columns(4)
+        mode_label = (
+            "Direkt (heutiges Markt-Niveau)"
+            if result["vol_mode"] == "direct"
+            else "Rang-skaliert (theoretisch)"
+        )
+        iv_source_label = (
+            "manuell eingegeben" if result["today_iv_overridden"] else "aus HV berechnet"
+        )
+
+        a1, a2, a3, a4, a5, a6 = st.columns(6)
         with a1:
             metric_box("Gewaehlter Tag", f"{result['query_date'].date()}", "neutral")
         with a2:
-            metric_box("Heutiger HV-Rang", f"{result['today_rank']*100:.1f}%", "neutral",
-                       help_text="Position der aktuellen HV im rollierenden Min/Max-Fenster - "
-                                 "identische Definition wie beim 'Fixer IV-Rang'-Backtest oben.")
+            metric_box("IV-Modus", mode_label, "neutral")
         with a3:
-            metric_box("Gefundene Analog-Tage", f"{result['n_analogs']:,}", "neutral")
+            metric_box(
+                "Verwendete IV (heute)", f"{result['today_iv']*100:.2f}%", "neutral",
+                help_text=f"{iv_source_label}" + (
+                    f" (berechnete HV: {result['computed_today_iv']*100:.2f}%)"
+                    if result["today_iv_overridden"] else ""
+                ),
+            )
         with a4:
-            metric_box("PCA-Komponenten", f"{result['n_pca_components']}", "neutral",
-                       help_text="Anzahl Hauptkomponenten, die den Aehnlichkeits-Raum aufspannen "
-                                 "(so viele wie fuer 80% erklaerte Varianz noetig).")
+            rank_txt = (
+                f"{result['today_rank']*100:.1f}%"
+                if pd.notna(result["today_rank"]) else "n/a"
+            )
+            metric_box(
+                "Historischer Rang dieser IV", rank_txt, "neutral",
+                help_text="Rein informativ im Direkt-Modus: Position der verwendeten IV "
+                          "im rollierenden Min/Max-Fenster der letzten Jahre.",
+            )
+        with a5:
+            metric_box("Gefundene Analog-Tage", f"{result['n_analogs']:,}", "neutral")
+        with a6:
+            metric_box(
+                "PCA-Komponenten", f"{result['n_pca_components']}", "neutral",
+                help_text="Anzahl Hauptkomponenten, die den Aehnlichkeits-Raum aufspannen "
+                          "(so viele wie fuer 80% erklaerte Varianz noetig).",
+            )
 
         clustering = result["clustering"]
         frac = clustering["frac_within_gap"]
         if frac >= 0.30:
             st.warning(
-                f"⚠️ Clustering-Hinweis: {frac*100:.0f}% der Analog-Tage liegen (chronologisch "
-                f"sortiert) hoechstens {clustering['gap_days_threshold']} Kalendertage auseinander "
-                f"(Median-Abstand: {clustering['median_gap_days']:.0f} Tage). Vola-Regime dauern "
-                "typischerweise mehrere Tage bis Wochen an - ein grosser Teil der 'unabhaengigen' "
-                "Analog-Tage kann daher aus wenigen historischen Ereignissen stammen. Die "
-                "Newey-West-Korrektur unten beruecksichtigt Autokorrelation, ersetzt bei starkem "
-                "Clustering aber keine gesunde Skepsis gegenueber der Trade-Anzahl."
+                f"⚠️ Clustering-Hinweis: {frac*100:.0f}% der Analog-Tage liegen "
+                f"(chronologisch sortiert) hoechstens {clustering['gap_days_threshold']} "
+                f"Kalendertage auseinander (Median-Abstand: "
+                f"{clustering['median_gap_days']:.0f} Tage). Vola-Regime dauern "
+                "typischerweise mehrere Tage bis Wochen an - ein grosser Teil der "
+                "'unabhaengigen' Analog-Tage kann daher aus wenigen historischen "
+                "Ereignissen stammen. Die Newey-West-Korrektur unten beruecksichtigt "
+                "Autokorrelation, ersetzt bei starkem Clustering aber keine gesunde "
+                "Skepsis gegenueber der Trade-Anzahl."
             )
 
         grid_result = result["grid_result"]
@@ -829,19 +937,30 @@ else:
             st.caption(
                 "'robust' = Konfidenzintervall schliesst 0 aus UND gleiches (positives) "
                 "Vorzeichen in BEIDEN chronologischen Haelften des Analog-Sets (Train/Val) - "
-                "sortiert nach Validierungs-t-Statistik."
+                "sortiert nach Validierungs-t-Statistik. Die Tabelle dient dem Screening; "
+                "darunter kann eine Kombination vollstaendig auf dem kompletten Analog-Set "
+                "ausgewertet werden."
             )
 
             display_cols = {
-                "put_delta": "Put-Δ", "call_delta": "Call-Δ", "side": "Richtung",
-                "n_val": "n (Val)", "val_mean_pnl_norm": "Ø norm. P&L (Val)",
-                "val_tstat": "t-Stat (Val)", "val_ci_excludes_zero": "CI ≠ 0",
-                "val_subperiod_matching": "Perioden-Match", "val_subperiod_nonempty": "Perioden gesamt",
+                "put_delta": "Put-Δ",
+                "call_delta": "Call-Δ",
+                "side": "Richtung",
+                "n_val": "n (Val)",
+                "val_mean_pnl_norm": "Ø norm. P&L (Val)",
+                "val_tstat": "t-Stat (Val)",
+                "val_ci_excludes_zero": "CI ≠ 0",
+                "val_subperiod_matching": "Perioden-Match",
+                "val_subperiod_nonempty": "Perioden gesamt",
                 "robust_both_halves": "Robust (Train+Val)",
             }
             show_df = grid_result[list(display_cols.keys())].rename(columns=display_cols).copy()
-            show_df["Ø norm. P&L (Val)"] = (show_df["Ø norm. P&L (Val)"] * 100).round(2).astype(str) + "%"
-            show_df["Richtung"] = show_df["Richtung"].map({"short": "Short Strangle", "long": "Long Strangle"})
+            show_df["Ø norm. P&L (Val)"] = (
+                show_df["Ø norm. P&L (Val)"].mul(100).round(2).astype(str) + "%"
+            )
+            show_df["Richtung"] = show_df["Richtung"].map(
+                {"short": "Short Strangle", "long": "Long Strangle"}
+            )
             st.dataframe(show_df, use_container_width=True, hide_index=True)
 
             robust_rows = grid_result[grid_result["robust_both_halves"]]
@@ -854,30 +973,212 @@ else:
                 best = robust_rows.iloc[0]
                 side_label = "Short Strangle" if best["side"] == "short" else "Long Strangle"
                 st.success(
-                    f"Bestes robustes Leg-Paar: **{side_label}**, Put-Δ={best['put_delta']:.2f} / "
-                    f"Call-Δ={best['call_delta']:.2f} (Validierung: Ø norm. P&L "
+                    f"Bestes robustes Leg-Paar: **{side_label}**, "
+                    f"Put-Δ={best['put_delta']:.2f} / Call-Δ={best['call_delta']:.2f} "
+                    f"(Validierung: Ø norm. P&L "
                     f"{best['val_mean_pnl_norm']*100:+.2f}%, t={best['val_tstat']:.2f})."
                 )
-                if best["side"] == "short":
-                    st.caption(
-                        f"Uebertragen auf den Iron-Condor-Backtest oben: Bein 2 (Short Put) mit "
-                        f"Delta={best['put_delta']:.2f} und Bein 3 (Short Call) mit "
-                        f"Delta={best['call_delta']:.2f} einstellen - die Wings (Bein 1/4) sind "
-                        "hiervon unabhaengig und muessen separat gewaehlt werden, da das "
-                        "Analog-Matching nur den ungehedgten 2-Bein-Strangle-Kern bewertet."
+
+            # ── Detailansicht: volle Kennzahlen fuer EINE ausgewaehlte Kombination.
+            #    Wichtig: Screening und Detailauswertung bleiben getrennt. Das
+            #    Screening nutzt Train/Val, die Detailansicht nutzt das komplette
+            #    Analog-Set. So werden Auswahl und finale Kennzahlen nicht vermischt.
+            st.subheader("Detailansicht: volle Kennzahlen fuer eine Kombination")
+
+            combo_labels = [
+                f"{row.put_delta:.2f} / {row.call_delta:.2f} - "
+                f"{'Short' if row.side == 'short' else 'Long'} Strangle"
+                + (" ✅" if row.robust_both_halves else "")
+                for row in grid_result.itertuples()
+            ]
+            default_pos = 0
+            robust_positions = [
+                pos for pos, row in enumerate(grid_result.itertuples())
+                if row.robust_both_halves
+            ]
+            if robust_positions:
+                default_pos = robust_positions[0]
+
+            chosen_label = st.selectbox(
+                "Delta-Kombination fuer die Detailansicht",
+                combo_labels,
+                index=default_pos,
+            )
+            chosen_pos = combo_labels.index(chosen_label)
+            chosen_row = grid_result.iloc[chosen_pos]
+
+            with st.spinner("Berechne volle Kennzahlen auf dem kompletten Analog-Set..."):
+                full_eval = evaluate_analog_set(
+                    result["analogs"],
+                    result["training_table"],
+                    result["bounds"],
+                    result["T_days"],
+                    float(chosen_row["put_delta"]),
+                    float(chosen_row["call_delta"]),
+                    result["r_free"],
+                    result["dividend_yield"],
+                    result["vol_surface"],
+                    vol_mode=result["vol_mode"],
+                    today_iv=result["today_iv"],
+                    today_rank=result["today_rank"],
+                )
+
+            side = chosen_row["side"]
+            if full_eval.empty:
+                st.info(
+                    "Keine gueltigen Trades fuer diese Kombination auf dem kompletten "
+                    "Analog-Set."
+                )
+            else:
+                trade_summary = summarize_analog_trades(full_eval, side)
+                sub = full_eval.rename(
+                    columns={
+                        f"net_pnl_{side}": "net_pnl",
+                        f"pnl_norm_{side}": "pnl_norm",
+                    }
+                )
+                rel_full = reliability_summary(sub, nw_lags=None, n_subperiods=6)
+
+                st.caption(
+                    f"{'Short' if side == 'short' else 'Long'} Strangle, "
+                    f"Put-Δ={chosen_row['put_delta']:.2f} / "
+                    f"Call-Δ={chosen_row['call_delta']:.2f}, T={result['T_days']}d, "
+                    f"IV-Modus: {mode_label} ({result['today_iv']*100:.2f}%), "
+                    f"n={trade_summary['n_trades']} Analog-Tage (komplettes Set)."
+                )
+
+                d1, d2, d3, d4, d5, d6 = st.columns(6)
+                with d1:
+                    metric_box("Trades", f"{trade_summary['n_trades']:,}", "neutral")
+                with d2:
+                    wr = trade_summary["win_rate_pct"]
+                    metric_box("Gewinnrate", f"{wr:.1f}%", "good" if wr >= 50.0 else "bad")
+                with d3:
+                    pf = trade_summary["profit_factor"]
+                    metric_box(
+                        "Profit Factor",
+                        "n/a" if pd.isna(pf) else f"{pf:.2f}",
+                        "neutral" if pd.isna(pf) else ("good" if pf > 1.0 else "bad"),
                     )
-                else:
-                    st.caption(
-                        "Die Long-Richtung war hier robuster als Short - das entspraeche eher "
-                        "einem 'Long Strangle' (Bein 2/3 auf 'long' statt 'short' stellen) statt "
-                        "eines klassischen Iron Condor, der auf kassierten Praemien basiert."
+                with d4:
+                    avg_pnl = trade_summary["avg_pnl"]
+                    metric_box(
+                        "Erwartungswert / Trade",
+                        f"{avg_pnl:+.4f}",
+                        "good" if avg_pnl > 0.0 else "bad",
+                    )
+                with d5:
+                    avg_pnl_norm = trade_summary["avg_pnl_norm_pct"]
+                    metric_box(
+                        "Ø norm. P&L/Trade",
+                        f"{avg_pnl_norm:+.2f}%",
+                        "good" if avg_pnl_norm > 0.0 else "bad",
+                    )
+                with d6:
+                    metric_box(
+                        "Beste / Schlechteste Trade",
+                        f"{trade_summary['best_trade']:+.2f} / "
+                        f"{trade_summary['worst_trade']:+.2f}",
+                        "neutral",
                     )
 
-        with st.expander(f"Alle gefundenen Analog-Tage anzeigen ({len(result['analogs'])})"):
+                st.markdown(
+                    "**Reliability (Newey-West, autokorrelationsrobust) - "
+                    "komplettes Analog-Set**"
+                )
+                sig_status = "good" if rel_full["ci_excludes_zero"] else "bad"
+                r1c, r2c, r3c = st.columns(3)
+                with r1c:
+                    metric_box(
+                        "t-Statistik",
+                        f"{rel_full['tstat']:.2f}"
+                        if pd.notna(rel_full["tstat"]) else "n/a",
+                        sig_status if pd.notna(rel_full["tstat"]) else "neutral",
+                    )
+                with r2c:
+                    ci_text = (
+                        f"{rel_full['ci_low']*100:+.2f}% bis "
+                        f"{rel_full['ci_high']*100:+.2f}%"
+                        if pd.notna(rel_full["ci_low"]) else "n/a"
+                    )
+                    metric_box(
+                        "95%-Konfidenzintervall",
+                        ci_text,
+                        sig_status if pd.notna(rel_full["ci_low"]) else "neutral",
+                    )
+                with r3c:
+                    if rel_full["subperiod_nonempty"] > 0:
+                        ratio = rel_full["subperiod_matching"] / rel_full["subperiod_nonempty"]
+                        consistency_status = "good" if ratio >= 0.5 else "bad"
+                    else:
+                        consistency_status = "neutral"
+                    metric_box(
+                        "Perioden-Konsistenz",
+                        f"{rel_full['subperiod_matching']}/"
+                        f"{rel_full['subperiod_nonempty']}",
+                        consistency_status,
+                    )
+
+                st.markdown(
+                    "**Kumulierter norm. P&L ueber die chronologisch sortierten "
+                    "Analog-Tage**"
+                )
+                st.caption(
+                    "Konsistenz-Check ueber die Handelsgeschichte hinweg - KEINE reale "
+                    "Equity-Kurve (die Analog-Tage stammen aus unterschiedlichen, "
+                    "nicht-aufeinanderfolgenden Epochen, siehe Clustering-Hinweis oben)."
+                )
+                cum_series = (
+                    full_eval.sort_values("entry_date")
+                    .set_index("entry_date")[f"pnl_norm_{side}"]
+                    .cumsum()
+                )
+                st.line_chart(cum_series)
+
+                with st.expander(
+                    f"Alle Trades dieser Kombination anzeigen ({len(full_eval)})"
+                ):
+                    show_trades = full_eval[[
+                        "entry_date", "hold_days", "distance", "target_vol", "K_put", "K_call",
+                        "entry_premium", f"net_pnl_{side}", f"pnl_norm_{side}",
+                    ]].rename(
+                        columns={
+                            f"net_pnl_{side}": "net_pnl",
+                            f"pnl_norm_{side}": "pnl_norm",
+                        }
+                    )
+                    st.dataframe(
+                        show_trades.assign(entry_date=show_trades["entry_date"].dt.date)
+                        .sort_values("entry_date", ascending=False),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            if chosen_row["side"] == "short":
+                st.caption(
+                    f"Uebertragen auf den Iron-Condor-Backtest oben: Bein 2 (Short Put) "
+                    f"mit Delta={chosen_row['put_delta']:.2f} und Bein 3 (Short Call) "
+                    f"mit Delta={chosen_row['call_delta']:.2f} einstellen - die Wings "
+                    "(Bein 1/4) sind hiervon unabhaengig und muessen separat gewaehlt "
+                    "werden, da das Analog-Matching nur den ungehedgten 2-Bein-Strangle-"
+                    "Kern bewertet."
+                )
+            else:
+                st.caption(
+                    "Die Long-Richtung war hier gewaehlt - das entspraeche eher einem "
+                    "'Long Strangle' (Bein 2/3 auf 'long' statt 'short' stellen) statt "
+                    "eines klassischen Iron Condor, der auf kassierten Praemien basiert."
+                )
+
+        with st.expander(
+            f"Alle gefundenen Analog-Tage anzeigen ({len(result['analogs'])})"
+        ):
             st.dataframe(
-                result["analogs"].assign(analog_date=result["analogs"]["analog_date"].dt.date)
-                .sort_values("distance"),
-                use_container_width=True, hide_index=True,
+                result["analogs"].assign(
+                    analog_date=result["analogs"]["analog_date"].dt.date
+                ).sort_values("distance"),
+                use_container_width=True,
+                hide_index=True,
             )
     else:
         st.info("Parameter links einstellen und 'Analog-Matching ausfuehren' klicken.")

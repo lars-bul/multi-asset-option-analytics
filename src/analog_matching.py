@@ -89,6 +89,41 @@ Dashboard - siehe Kommentare an den jeweiligen Stellen fuer Details):
      14]). Ein T_days ausserhalb dieser Liste fuehrte bisher STILLSCHWEIGEND
      zu einem leeren Ergebnis (0 Zeilen ueberall, kein Fehler). Jetzt wird
      das explizit geprueft und mit einer klaren Fehlermeldung abgebrochen.
+
+  6) WICHTIGE ERGAENZUNG (kein Bugfix, sondern eine bewusste methodische
+     Ueberarbeitung nach Nutzer-Feedback) - zwei IV-Modi statt nur Rang:
+     der urspruengliche Ansatz (Punkt 2 der Grundidee oben) rechnet den
+     PERZENTIL-RANG von heute auf die HV-Bandbreite jedes Analog-Tages um.
+     Das ist ein rein theoretisches Konstrukt (ein "65%-Rang-Tag" ist keine
+     Aussage ueber ein reales Marktbewertungsniveau, sondern eine relative
+     Position in einer 90+ Jahre alten Verteilung) und spiegelt NICHT wider,
+     wie sich das TATSAECHLICHE heutige Bewertungsniveau (die IV, zu der
+     man heute wirklich handeln wuerde) an den Analog-Tagen verhalten haette.
+     Es gibt jetzt zwei explizite Modi (siehe evaluate_analog_set(),
+     Parameter `vol_mode`):
+       - "direct" (jetzt Standard): verwendet auf JEDEM Analog-Tag exakt
+         dieselbe absolute Vola `today_iv` - das heutige Bewertungsniveau,
+         entweder aus HV(hv_length) berechnet ODER vom Nutzer manuell
+         eingegeben (z.B. aus der eigenen Optionskette, wenn die reale
+         Markt-IV vom HV-Modell abweicht). Beantwortet: "Haette ich HEUTE zu
+         HEUTIGEN Konditionen gehandelt - wie waere die Struktur gelaufen,
+         waeren die tatsaechlichen Kursbewegungen der historisch
+         aehnlichsten Tage eingetreten?"
+       - "rank": das bisherige Verhalten (s.o.), weiterhin verfuegbar, aber
+         jetzt explizit als "theoretisch" gekennzeichnet.
+     `today_rank` wird in BEIDEN Modi weiterhin berechnet (jetzt aus
+     today_iv statt zwingend aus der rohen HV-Formel, siehe
+     recommend_for_today) - im "direct"-Modus rein informativ (zeigt an, wie
+     ungewoehnlich das heutige Niveau historisch einzuordnen ist), im
+     "rank"-Modus weiterhin die eigentliche Rechengrundlage.
+
+  7) NEU - summarize_analog_trades(): dieselben Kennzahlen (Gewinnrate,
+     Profit Factor, Erwartungswert/Trade, beste/schlechteste Trade) wie
+     backtest.summarize_trades() bei der Ladder-Simulation, hier fuer die
+     Analog-Tage EINER Delta-Kombination/Richtung - fehlten in der
+     urspruenglichen Fassung komplett (dort gab es nur die
+     Newey-West-Kennzahlen aus reliability_summary(), aber keine der
+     "einfachen" Handelskennzahlen).
 """
 
 from __future__ import annotations
@@ -351,24 +386,37 @@ def reprice_leg_pair(entry_S: float, exit_S: float, T_days: int, target_vol: flo
 
 
 def evaluate_analog_set(analogs: pd.DataFrame, training_table: pd.DataFrame, bounds: pd.DataFrame,
-                         today_rank: float, T_days: int, put_delta: float, call_delta: float,
-                         r_free: float, dividend_yield: float, vol_surface: VolSurfaceConfig) -> pd.DataFrame:
+                         T_days: int, put_delta: float, call_delta: float,
+                         r_free: float, dividend_yield: float, vol_surface: VolSurfaceConfig,
+                         vol_mode: str = "direct", today_iv: float | None = None,
+                         today_rank: float | None = None) -> pd.DataFrame:
     """Fuer jeden Analog-Tag: entry_S/exit_S aus der Trainings-Tabelle holen
     (dort bereits korrekt mit der Kalendertage-Suchlogik aus labels.py
-    bestimmt - wird hier NICHT neu berechnet), hv_min/hv_max aus `bounds`,
-    dann per reprice_leg_pair() ranggerecht neu bewerten (Short UND Long,
-    siehe dort).
+    bestimmt - wird hier NICHT neu berechnet), dann per reprice_leg_pair()
+    neu bewerten (Short UND Long, siehe dort) - mit welcher Vola, haengt vom
+    `vol_mode` ab (siehe Punkt 6 im Moduldokstring):
+
+      vol_mode="direct" (Standard): JEDER Analog-Tag wird mit derselben
+        absoluten Vola `today_iv` bewertet (das heutige, tatsaechliche
+        Bewertungsniveau) - `bounds`/`today_rank` werden dabei NICHT zur
+        Bewertung herangezogen.
+      vol_mode="rank": klassische Perzentil-Umrechnung (frueheres
+        Standardverhalten, siehe target_vol_for_rank) - `today_rank` ist in
+        diesem Modus Pflicht, `bounds` liefert hv_min/hv_max je Analog-Tag.
 
     KORREKTUR (siehe Punkt 1 im Moduldokstring, KRITISCH): das Ergebnis wird
-    jetzt vor der Rueckgabe explizit nach 'entry_date' (chronologisch)
-    sortiert. `analogs` kommt aus find_analogs() nach DISTANZ sortiert - in
-    dieser Reihenfolge waere die spaeter in reliability_summary()
-    aufgerufene Newey-West-Korrektur wirkungslos (sie korrigiert
-    Autokorrelation zwischen Zeile i und i+j, was nur bei chronologischer
-    Reihenfolge dem tatsaechlichen Kalender-Ueberlapp benachbarter
-    Analog-Tage entspricht - siehe Beleg im Moduldokstring: bei einer
-    getesteten Konfiguration kippte dadurch nachweislich die
+    vor der Rueckgabe explizit nach 'entry_date' (chronologisch) sortiert.
+    `analogs` kommt aus find_analogs() nach DISTANZ sortiert - in dieser
+    Reihenfolge waere die spaeter in reliability_summary() aufgerufene
+    Newey-West-Korrektur wirkungslos (siehe Beleg im Moduldokstring: bei
+    einer getesteten Konfiguration kippte dadurch nachweislich die
     Signifikanz-Aussage)."""
+    if vol_mode not in ("direct", "rank"):
+        raise ValueError(f"Unbekannter vol_mode={vol_mode!r} - erwartet 'direct' oder 'rank'.")
+    if vol_mode == "direct" and (today_iv is None or np.isnan(today_iv) or today_iv <= 0.0):
+        raise ValueError("vol_mode='direct' braucht ein gueltiges today_iv (>0).")
+    if vol_mode == "rank" and (today_rank is None or np.isnan(today_rank)):
+        raise ValueError("vol_mode='rank' braucht ein gueltiges today_rank.")
     if T_days not in training_table["T_days"].unique():
         raise ValueError(
             f"T_days={T_days} ist nicht in der training_table vorhanden. "
@@ -383,14 +431,20 @@ def evaluate_analog_set(analogs: pd.DataFrame, training_table: pd.DataFrame, bou
     rows = []
     for _, arow in analogs.iterrows():
         d = arow["analog_date"]
-        if d not in tt.index or d not in bounds_idx.index:
+        if d not in tt.index:
             continue
         trow = tt.loc[d]
         if isinstance(trow, pd.DataFrame):   # falls doppelte Zeitstempel - Sicherheitsnetz
             trow = trow.iloc[0]
-        brow = bounds_idx.loc[d]
 
-        target_vol = target_vol_for_rank(brow["hv_min"], brow["hv_max"], today_rank)
+        if vol_mode == "direct":
+            target_vol = today_iv
+        else:
+            if d not in bounds_idx.index:
+                continue
+            brow = bounds_idx.loc[d]
+            target_vol = target_vol_for_rank(brow["hv_min"], brow["hv_max"], today_rank)
+
         result = reprice_leg_pair(
             trow["entry_S"], trow["exit_S"], T_days, target_vol,
             put_delta, call_delta, r_free, dividend_yield, vol_surface,
@@ -408,6 +462,42 @@ def evaluate_analog_set(analogs: pd.DataFrame, training_table: pd.DataFrame, bou
     if not out.empty:
         out = out.sort_values("entry_date").reset_index(drop=True)
     return out
+
+
+def summarize_analog_trades(evaluated: pd.DataFrame, side: str) -> dict:
+    """NEU (siehe Punkt 7 im Moduldokstring): dieselben "einfachen"
+    Handelskennzahlen wie backtest.summarize_trades() beim Ladder-Backtest
+    (Gewinnrate, Profit Factor, Erwartungswert/Trade, beste/schlechteste
+    Trade), hier fuer das evaluate_analog_set()-Ergebnis EINER
+    Delta-Kombination, side='short' oder 'long'.
+
+    BEWUSST NICHT ENTHALTEN (anders als beim Ladder-Backtest): 'touch_rate'
+    (kein Stop-Loss/Touch-Tracking - der Analog-Strangle wird wie das
+    Referenzinstrument in labels.py immer bis Verfall gehalten),
+    'n_unlimited_risk' (der ungehedgte Strangle hat IMMER unbegrenztes
+    Risiko auf der Short-Seite - das waere hier keine Fallunterscheidung,
+    sondern der Normalfall) und 'n_iv_fallback' (target_vol ist hier per
+    Konstruktion nie NaN, siehe evaluate_analog_set - ungueltige Zeilen
+    werden dort bereits ausgefiltert)."""
+    if evaluated.empty:
+        return {"n_trades": 0}
+
+    net_col, norm_col = f"net_pnl_{side}", f"pnl_norm_{side}"
+    n_total = len(evaluated)
+    n_wins = int((evaluated[net_col] >= 0).sum())
+    gross_profit = evaluated.loc[evaluated[net_col] >= 0, net_col].sum()
+    gross_loss = -evaluated.loc[evaluated[net_col] < 0, net_col].sum()
+
+    return {
+        "n_trades": n_total,
+        "win_rate_pct": n_wins / n_total * 100.0,
+        "net_pnl_sum": evaluated[net_col].sum(),
+        "avg_pnl": evaluated[net_col].mean(),
+        "avg_pnl_norm_pct": evaluated[norm_col].mean() * 100.0,
+        "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else np.nan,
+        "best_trade": evaluated[net_col].max(),
+        "worst_trade": evaluated[net_col].min(),
+    }
 
 
 def _reliability_for_side(evaluated: pd.DataFrame, side: str, n_subperiods: int) -> dict:
@@ -428,12 +518,18 @@ def _reliability_for_side(evaluated: pd.DataFrame, side: str, n_subperiods: int)
 # ═══════════════════════════════════════════════════════════════════════
 
 def leg_pair_grid_search(analogs: pd.DataFrame, training_table: pd.DataFrame, bounds: pd.DataFrame,
-                          today_rank: float, T_days: int, put_delta_grid: list[float],
+                          T_days: int, put_delta_grid: list[float],
                           call_delta_grid: list[float], r_free: float, dividend_yield: float,
-                          vol_surface: VolSurfaceConfig, n_subperiods: int = 4) -> pd.DataFrame:
+                          vol_surface: VolSurfaceConfig, vol_mode: str = "direct",
+                          today_iv: float | None = None, today_rank: float | None = None,
+                          n_subperiods: int = 4) -> pd.DataFrame:
     """Testet ALLE Kombinationen aus put_delta_grid x call_delta_grid auf dem
     Analog-Set, JEWEILS fuer Short UND Long (siehe KORREKTUR 3 - ein
-    Repricing-Durchgang liefert beide Richtungen).
+    Repricing-Durchgang liefert beide Richtungen). `vol_mode`/`today_iv`/
+    `today_rank` werden 1:1 an evaluate_analog_set() durchgereicht (siehe
+    dort) - sie beschreiben das heutige Bewertungsniveau und sind fuer
+    Train- und Validierungshaelfte identisch (nur die Analog-TAGE selbst
+    unterscheiden sich zwischen den Haelften, nicht die heutige Referenz).
 
     WICHTIG - Mehrfachvergleichs-Falle (siehe Moduldokstring der Diskussion):
     bei z.B. 5x5=25 Kombinationen findet sich durch reinen Zufall fast immer
@@ -460,12 +556,14 @@ def leg_pair_grid_search(analogs: pd.DataFrame, training_table: pd.DataFrame, bo
     for pd_ in put_delta_grid:
         for cd_ in call_delta_grid:
             train_eval = evaluate_analog_set(
-                train_analogs, training_table, bounds, today_rank, T_days, pd_, cd_,
+                train_analogs, training_table, bounds, T_days, pd_, cd_,
                 r_free, dividend_yield, vol_surface,
+                vol_mode=vol_mode, today_iv=today_iv, today_rank=today_rank,
             )
             val_eval = evaluate_analog_set(
-                val_analogs, training_table, bounds, today_rank, T_days, pd_, cd_,
+                val_analogs, training_table, bounds, T_days, pd_, cd_,
                 r_free, dividend_yield, vol_surface,
+                vol_mode=vol_mode, today_iv=today_iv, today_rank=today_rank,
             )
             if train_eval.empty or val_eval.empty:
                 continue
@@ -514,7 +612,9 @@ def recommend_for_today(daily_df: pd.DataFrame, training_table: pd.DataFrame,
                          space_cfg: SimilaritySpaceConfig | None = None,
                          hv_length: int = 30, rank_lookback_days: int = 252,
                          r_free: float = 0.0, dividend_yield: float = 0.015,
-                         vol_surface: VolSurfaceConfig | None = None) -> dict:
+                         vol_surface: VolSurfaceConfig | None = None,
+                         vol_mode: str = "direct",
+                         today_iv_override: float | None = None) -> dict:
     """Kompletter Ablauf: Aehnlichkeits-Raum fitten -> Query-Tag einordnen ->
     Analog-Tage finden -> Leg-Paar-Grid-Search (Short + Long) auf dem
     Analog-Set.
@@ -522,13 +622,25 @@ def recommend_for_today(daily_df: pd.DataFrame, training_table: pd.DataFrame,
     query_date=None (Default): der spaeteste Tag in feature_df wird
     verwendet ('heute'). Ein explizites frueheres Datum erlaubt, das
     Verfahren selbst rueckblickend zu pruefen (siehe Moduldokstring zur
-    Kausalitaet)."""
+    Kausalitaet).
+
+    vol_mode / today_iv_override (siehe Punkt 6 im Moduldokstring): mit
+    vol_mode="direct" (Standard) wird `today_iv` als Bewertungs-Vola fuer
+    ALLE Analog-Tage verwendet - berechnet als HV(hv_length) am Query-Tag,
+    oder falls today_iv_override gesetzt ist (z.B. eine reale, vom Nutzer
+    abgelesene Options-IV), wird STATTDESSEN genau dieser Wert verwendet.
+    Mit vol_mode="rank" wird weiterhin die (rein theoretische) Perzentil-
+    Umrechnung von frueher verwendet; today_iv_override bestimmt in diesem
+    Fall nur, WELCHE IV als Ausgangspunkt fuer den Perzentil-Rang dient
+    (Default weiterhin die berechnete HV)."""
     if put_delta_grid is None:
         put_delta_grid = [0.10, 0.16, 0.20, 0.25, 0.30]
     if call_delta_grid is None:
         call_delta_grid = [0.10, 0.16, 0.20, 0.25, 0.30]
     if vol_surface is None:
         vol_surface = VolSurfaceConfig()
+    if vol_mode not in ("direct", "rank"):
+        raise ValueError(f"Unbekannter vol_mode={vol_mode!r} - erwartet 'direct' oder 'rank'.")
 
     if T_days not in available_t_days(training_table):
         raise ValueError(
@@ -556,25 +668,62 @@ def recommend_for_today(daily_df: pd.DataFrame, training_table: pd.DataFrame,
     bounds = hv_rank_bounds(daily_df, hv_length, rank_lookback_days)
     today_bounds_rows = bounds.loc[bounds["date"] == query_date]
     if today_bounds_rows.empty:
-        raise ValueError(f"Keine HV-Rang-Daten fuer {query_date.date()} verfuegbar.")
+        raise ValueError(f"Keine HV-Daten fuer {query_date.date()} verfuegbar.")
     today_bounds = today_bounds_rows.iloc[0]
-    today_rank = (today_bounds["hv"] - today_bounds["hv_min"]) / (today_bounds["hv_max"] - today_bounds["hv_min"])
-    if np.isnan(today_rank):
-        raise ValueError(f"HV-Rang fuer {query_date.date()} nicht bestimmbar (zu wenig Historie im Lookback-Fenster?).")
+
+    computed_today_iv = float(today_bounds["hv"])
+    if today_iv_override is not None:
+        today_iv = float(today_iv_override)
+    else:
+        today_iv = computed_today_iv
+    if np.isnan(today_iv) or today_iv <= 0.0:
+        raise ValueError(
+            f"Keine gueltige heutige IV/HV fuer {query_date.date()} bestimmbar "
+            "(zu wenig Historie fuer die gewaehlte HV-Periode?) - entweder "
+            "spaeteres Datum waehlen oder today_iv_override manuell setzen."
+        )
+
+    # today_rank wird IMMER berechnet (auch im "direct"-Modus) - dort rein
+    # informativ: zeigt, wie ungewoehnlich today_iv historisch einzuordnen
+    # ist (siehe Punkt 6 im Moduldokstring). Im "rank"-Modus ist es
+    # zusaetzlich die eigentliche Rechengrundlage fuer jeden Analog-Tag.
+    if today_bounds["hv_max"] > today_bounds["hv_min"]:
+        today_rank = (today_iv - today_bounds["hv_min"]) / (today_bounds["hv_max"] - today_bounds["hv_min"])
+    else:
+        today_rank = np.nan
+    if vol_mode == "rank" and np.isnan(today_rank):
+        raise ValueError(
+            f"HV-Rang fuer {query_date.date()} nicht bestimmbar (zu wenig Historie im "
+            "Lookback-Fenster?) - vol_mode='rank' braucht einen gueltigen Rang. "
+            "Entweder Lookback verkuerzen/Datum aendern oder vol_mode='direct' verwenden."
+        )
 
     grid_result = leg_pair_grid_search(
-        analogs, training_table, bounds, today_rank, T_days,
+        analogs, training_table, bounds, T_days,
         put_delta_grid, call_delta_grid, r_free, dividend_yield, vol_surface,
+        vol_mode=vol_mode, today_iv=today_iv, today_rank=today_rank,
     )
 
     clustering = analog_clustering_diagnostic(analogs)
 
     return {
         "query_date": query_date,
+        "vol_mode": vol_mode,
+        "today_iv": today_iv,
+        "computed_today_iv": computed_today_iv,
+        "today_iv_overridden": today_iv_override is not None,
         "today_rank": today_rank,
         "n_analogs": len(analogs),
         "analogs": analogs,
         "grid_result": grid_result,
         "n_pca_components": space.pca.n_components_,
         "clustering": clustering,
+        # Fuer die Detailansicht im Dashboard (volle Kennzahlen zu EINER
+        # gewaehlten Delta-Kombination, siehe summarize_analog_trades()) -
+        # damit muss recommend_for_today() dafuer nicht nochmal komplett
+        # neu ausgefuehrt werden (Aehnlichkeits-Raum + Analog-Suche sind der
+        # teure Teil, nicht die einzelne Neubewertung).
+        "bounds": bounds, "T_days": T_days, "r_free": r_free,
+        "dividend_yield": dividend_yield, "vol_surface": vol_surface,
+        "training_table": training_table,
     }

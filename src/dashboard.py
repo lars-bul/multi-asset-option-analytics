@@ -27,6 +27,9 @@ from backtest import (
     compute_hv, compute_rank_target_vol,
 )
 from stats import reliability_summary
+from analog_matching import (
+    AnalogConfig, SimilaritySpaceConfig, recommend_for_today, available_t_days,
+)
 
 DATA_FILE = Path(__file__).resolve().parent.parent / "data" / "spx_daily.parquet"
 
@@ -82,6 +85,20 @@ def load_data() -> pd.DataFrame:
     df = pd.read_parquet(DATA_FILE)
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values("date")
+
+
+TRAINING_TABLE_FILE = Path(__file__).resolve().parent.parent / "data" / "training_table.parquet"
+
+
+@st.cache_data
+def load_training_table() -> pd.DataFrame:
+    """Laedt data/training_table.parquet fuer das Analog-Tage-Matching."""
+    if not TRAINING_TABLE_FILE.exists():
+        return pd.DataFrame()
+    tt = pd.read_parquet(TRAINING_TABLE_FILE)
+    tt["entry_date"] = pd.to_datetime(tt["entry_date"])
+    tt["exit_date"] = pd.to_datetime(tt["exit_date"])
+    return tt
 
 
 def to_candles(df: pd.DataFrame) -> list[dict]:
@@ -665,3 +682,202 @@ else:
             )
     else:
         st.info("Parameter links einstellen und 'Backtest ausfuehren' klicken.")
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ANALOG-TAGE-MATCHING (Grundlage: dieselbe Rang-Skalierung wie oben bei
+#  "Fixer IV-Rang", nur nicht auf die GESAMTE Historie angewendet, sondern
+#  gezielt auf die K Handelstage, die einem gewaehlten Tag ("heute") in
+#  Bezug auf Vola-Regime/Momentum/Tail-Risiko am aehnlichsten waren - siehe
+#  src/analog_matching.py fuer die Details/Docstrings.)
+# ═══════════════════════════════════════════════════════════════════════════
+st.divider()
+st.header("Analog-Tage-Matching")
+st.caption(
+    "Findet die K historisch aehnlichsten Handelstage zu einem gewaehlten Tag "
+    "(PCA-Distanz ueber die taeglichen Features aus features.py) und wertet "
+    "auf genau diesen Tagen einen Short- und Long-Strangle aus - rang-skaliert "
+    "auf den heutigen HV-Rang (dieselbe Grundidee wie beim 'Fixer IV-Rang'-"
+    "Backtest oben, hier aber nicht auf jeden Handelstag angewendet, sondern "
+    "gezielt nur auf die K aehnlichsten Analog-Tage). Per Grid-Search wird "
+    "daraus das robusteste Put-/Call-Delta-Paar fuer die SHORT-Beine (Bein 2 "
+    "'Short Put' / Bein 3 'Short Call') des Iron Condor gesucht - inkl. "
+    "Train/Validierungs-Split gegen Mehrfachvergleichs-Zufallstreffer."
+)
+
+training_table = load_training_table()
+
+if training_table.empty:
+    st.warning(
+        "Noch keine Trainingstabelle gefunden. Einmal im Terminal ausfuehren:\n\n"
+        "`python src/build_dataset.py`\n\n"
+        "und diese Seite danach neu laden. Das baut die Feature-Matrix + "
+        "Strangle-Labels, die das Analog-Matching als Grundlage braucht "
+        "(siehe build_dataset.py, labels.py)."
+    )
+else:
+    valid_t_days = available_t_days(training_table)
+
+    with st.sidebar:
+        st.divider()
+        st.header("Analog-Tage-Matching")
+        query_date_input = st.date_input(
+            "Tag, fuer den Analog-Tage gesucht werden ('heute')",
+            value=daily_df["date"].max().date(),
+            min_value=daily_df["date"].min().date(),
+            max_value=daily_df["date"].max().date(),
+            help="Standardmaessig der letzte verfuegbare Handelstag. Ein "
+                 "frueheres Datum erlaubt, das Verfahren selbst rueckblickend "
+                 "zu pruefen - es werden dabei garantiert nur Analog-Tage VOR "
+                 "diesem Datum verwendet (siehe analog_matching.py, Kausalitaet).",
+        )
+        analog_k = st.slider(
+            "Anzahl Analog-Tage (k)", 50, 3000, 1000, 50,
+            help="Wie viele der historisch aehnlichsten Handelstage verwendet "
+                 "werden. Mehr Tage -> stabilere Statistik, aber steigendes "
+                 "Risiko, dass sich die Analog-Tage in wenigen historischen "
+                 "Ereignissen (z.B. einer einzelnen Krise) haeufen - siehe "
+                 "Clustering-Warnung unten im Ergebnis.",
+        )
+        analog_min_gap = st.number_input(
+            "Mindestabstand zum gewaehlten Tag (Handelstage)", 0, 60, 5,
+            help="Vermeidet triviale, fast identische Nachbartage direkt vor "
+                 "dem gewaehlten Tag als 'Analog'.",
+        )
+        analog_T_days = st.selectbox(
+            "Laufzeit T fuer die Analog-Bewertung (Tage)", valid_t_days,
+            index=valid_t_days.index(7) if 7 in valid_t_days else 0,
+            help="Nur Laufzeiten verfuegbar, fuer die build_dataset.py "
+                 "Strangle-Labels erzeugt hat (labels.StrangleLabelConfig."
+                 "T_days_list) - unabhaengig von der Laufzeit T oben beim "
+                 "Iron-Condor-Backtest.",
+        )
+        analog_hv_length = st.number_input("HV-Periode fuer den Rang (Tage)", 2, 365, 30)
+        analog_rank_lookback = st.number_input("Lookback fuer den Rang (Tage)", 10, 5000, 252)
+
+        st.caption("Delta-Raster fuer die Grid-Search (Put x Call):")
+        delta_grid_options = [0.05, 0.10, 0.16, 0.20, 0.25, 0.30, 0.35, 0.40]
+        put_delta_grid = st.multiselect(
+            "Put-Deltas", delta_grid_options, default=[0.10, 0.16, 0.20, 0.25, 0.30],
+        )
+        call_delta_grid = st.multiselect(
+            "Call-Deltas", delta_grid_options, default=[0.10, 0.16, 0.20, 0.25, 0.30],
+        )
+
+        run_analog = st.button("Analog-Matching ausfuehren", type="primary")
+
+    if run_analog:
+        if not put_delta_grid or not call_delta_grid:
+            st.error("Bitte mindestens ein Put-Delta und ein Call-Delta im Raster auswaehlen.")
+        else:
+            try:
+                with st.spinner(f"Suche {analog_k} Analog-Tage und werte "
+                                 f"{len(put_delta_grid) * len(call_delta_grid)} Delta-Kombinationen aus..."):
+                    result = recommend_for_today(
+                        daily_df, training_table,
+                        query_date=pd.Timestamp(query_date_input),
+                        T_days=int(analog_T_days),
+                        put_delta_grid=put_delta_grid,
+                        call_delta_grid=call_delta_grid,
+                        analog_cfg=AnalogConfig(k=int(analog_k), min_gap_days=int(analog_min_gap)),
+                        space_cfg=SimilaritySpaceConfig(),
+                        hv_length=int(analog_hv_length),
+                        rank_lookback_days=int(analog_rank_lookback),
+                        vol_surface=VolSurfaceConfig(),
+                    )
+                st.session_state["analog_result"] = result
+            except ValueError as e:
+                st.error(f"Analog-Matching konnte nicht ausgefuehrt werden: {e}")
+
+    if "analog_result" in st.session_state:
+        result = st.session_state["analog_result"]
+
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            metric_box("Gewaehlter Tag", f"{result['query_date'].date()}", "neutral")
+        with a2:
+            metric_box("Heutiger HV-Rang", f"{result['today_rank']*100:.1f}%", "neutral",
+                       help_text="Position der aktuellen HV im rollierenden Min/Max-Fenster - "
+                                 "identische Definition wie beim 'Fixer IV-Rang'-Backtest oben.")
+        with a3:
+            metric_box("Gefundene Analog-Tage", f"{result['n_analogs']:,}", "neutral")
+        with a4:
+            metric_box("PCA-Komponenten", f"{result['n_pca_components']}", "neutral",
+                       help_text="Anzahl Hauptkomponenten, die den Aehnlichkeits-Raum aufspannen "
+                                 "(so viele wie fuer 80% erklaerte Varianz noetig).")
+
+        clustering = result["clustering"]
+        frac = clustering["frac_within_gap"]
+        if frac >= 0.30:
+            st.warning(
+                f"⚠️ Clustering-Hinweis: {frac*100:.0f}% der Analog-Tage liegen (chronologisch "
+                f"sortiert) hoechstens {clustering['gap_days_threshold']} Kalendertage auseinander "
+                f"(Median-Abstand: {clustering['median_gap_days']:.0f} Tage). Vola-Regime dauern "
+                "typischerweise mehrere Tage bis Wochen an - ein grosser Teil der 'unabhaengigen' "
+                "Analog-Tage kann daher aus wenigen historischen Ereignissen stammen. Die "
+                "Newey-West-Korrektur unten beruecksichtigt Autokorrelation, ersetzt bei starkem "
+                "Clustering aber keine gesunde Skepsis gegenueber der Trade-Anzahl."
+            )
+
+        grid_result = result["grid_result"]
+        if grid_result.empty:
+            st.info(
+                "Keine gueltige Delta-Kombination auf dem Analog-Set bewertbar "
+                "(z.B. weil target_vol durchgehend ungueltig war). Parameter pruefen."
+            )
+        else:
+            st.subheader("Robusteste Leg-Paare (Short- und Long-Strangle)")
+            st.caption(
+                "'robust' = Konfidenzintervall schliesst 0 aus UND gleiches (positives) "
+                "Vorzeichen in BEIDEN chronologischen Haelften des Analog-Sets (Train/Val) - "
+                "sortiert nach Validierungs-t-Statistik."
+            )
+
+            display_cols = {
+                "put_delta": "Put-Δ", "call_delta": "Call-Δ", "side": "Richtung",
+                "n_val": "n (Val)", "val_mean_pnl_norm": "Ø norm. P&L (Val)",
+                "val_tstat": "t-Stat (Val)", "val_ci_excludes_zero": "CI ≠ 0",
+                "val_subperiod_matching": "Perioden-Match", "val_subperiod_nonempty": "Perioden gesamt",
+                "robust_both_halves": "Robust (Train+Val)",
+            }
+            show_df = grid_result[list(display_cols.keys())].rename(columns=display_cols).copy()
+            show_df["Ø norm. P&L (Val)"] = (show_df["Ø norm. P&L (Val)"] * 100).round(2).astype(str) + "%"
+            show_df["Richtung"] = show_df["Richtung"].map({"short": "Short Strangle", "long": "Long Strangle"})
+            st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+            robust_rows = grid_result[grid_result["robust_both_halves"]]
+            if robust_rows.empty:
+                st.info(
+                    "Keine Delta-Kombination war in BEIDEN Haelften des Analog-Sets robust "
+                    "signifikant - kein belastbarer Edge fuer diese Konfiguration erkennbar."
+                )
+            else:
+                best = robust_rows.iloc[0]
+                side_label = "Short Strangle" if best["side"] == "short" else "Long Strangle"
+                st.success(
+                    f"Bestes robustes Leg-Paar: **{side_label}**, Put-Δ={best['put_delta']:.2f} / "
+                    f"Call-Δ={best['call_delta']:.2f} (Validierung: Ø norm. P&L "
+                    f"{best['val_mean_pnl_norm']*100:+.2f}%, t={best['val_tstat']:.2f})."
+                )
+                if best["side"] == "short":
+                    st.caption(
+                        f"Uebertragen auf den Iron-Condor-Backtest oben: Bein 2 (Short Put) mit "
+                        f"Delta={best['put_delta']:.2f} und Bein 3 (Short Call) mit "
+                        f"Delta={best['call_delta']:.2f} einstellen - die Wings (Bein 1/4) sind "
+                        "hiervon unabhaengig und muessen separat gewaehlt werden, da das "
+                        "Analog-Matching nur den ungehedgten 2-Bein-Strangle-Kern bewertet."
+                    )
+                else:
+                    st.caption(
+                        "Die Long-Richtung war hier robuster als Short - das entspraeche eher "
+                        "einem 'Long Strangle' (Bein 2/3 auf 'long' statt 'short' stellen) statt "
+                        "eines klassischen Iron Condor, der auf kassierten Praemien basiert."
+                    )
+
+        with st.expander(f"Alle gefundenen Analog-Tage anzeigen ({len(result['analogs'])})"):
+            st.dataframe(
+                result["analogs"].assign(analog_date=result["analogs"]["analog_date"].dt.date)
+                .sort_values("distance"),
+                use_container_width=True, hide_index=True,
+            )
+    else:
+        st.info("Parameter links einstellen und 'Analog-Matching ausfuehren' klicken.")

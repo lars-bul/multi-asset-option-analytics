@@ -99,23 +99,16 @@ Dashboard - siehe Kommentare an den jeweiligen Stellen fuer Details):
      Position in einer 90+ Jahre alten Verteilung) und spiegelt NICHT wider,
      wie sich das TATSAECHLICHE heutige Bewertungsniveau (die IV, zu der
      man heute wirklich handeln wuerde) an den Analog-Tagen verhalten haette.
-     Es gibt jetzt zwei explizite Modi (siehe evaluate_analog_set(),
-     Parameter `vol_mode`):
-       - "direct" (jetzt Standard): verwendet auf JEDEM Analog-Tag exakt
-         dieselbe absolute Vola `today_iv` - das heutige Bewertungsniveau,
-         entweder aus HV(hv_length) berechnet ODER vom Nutzer manuell
-         eingegeben (z.B. aus der eigenen Optionskette, wenn die reale
-         Markt-IV vom HV-Modell abweicht). Beantwortet: "Haette ich HEUTE zu
-         HEUTIGEN Konditionen gehandelt - wie waere die Struktur gelaufen,
-         waeren die tatsaechlichen Kursbewegungen der historisch
-         aehnlichsten Tage eingetreten?"
-       - "rank": das bisherige Verhalten (s.o.), weiterhin verfuegbar, aber
-         jetzt explizit als "theoretisch" gekennzeichnet.
-     `today_rank` wird in BEIDEN Modi weiterhin berechnet (jetzt aus
-     today_iv statt zwingend aus der rohen HV-Formel, siehe
-     recommend_for_today) - im "direct"-Modus rein informativ (zeigt an, wie
-     ungewoehnlich das heutige Niveau historisch einzuordnen ist), im
-     "rank"-Modus weiterhin die eigentliche Rechengrundlage.
+     evaluate_analog_set()/leg_pair_grid_search() unterstuetzen daher WEITER
+     zwei explizite Modi (Parameter `vol_mode`):
+       - "direct": verwendet auf JEDEM Analog-Tag exakt dieselbe absolute
+         Vola `today_iv` - das heutige Bewertungsniveau. Beantwortet:
+         "Haette ich HEUTE zu HEUTIGEN Konditionen gehandelt - wie waere
+         die Struktur gelaufen, waeren die tatsaechlichen Kursbewegungen
+         der historisch aehnlichsten Tage eingetreten?"
+       - "rank": die Perzentil-Umrechnung (s.o., siehe target_vol_for_rank).
+     (Siehe Punkt 8 fuer den seit dem Nutzer-Feedback ausschliesslich
+     verwendeten Modus im High-Level-Einstiegspunkt recommend_for_today().)
 
   7) NEU - summarize_analog_trades(): dieselben Kennzahlen (Gewinnrate,
      Profit Factor, Erwartungswert/Trade, beste/schlechteste Trade) wie
@@ -124,6 +117,32 @@ Dashboard - siehe Kommentare an den jeweiligen Stellen fuer Details):
      urspruenglichen Fassung komplett (dort gab es nur die
      Newey-West-Kennzahlen aus reliability_summary(), aber keine der
      "einfachen" Handelskennzahlen).
+
+  8) NEU (Vereinfachung nach Nutzer-Feedback) - recommend_for_today() nutzt
+     jetzt AUSSCHLIESSLICH den rang-basierten Modus (vol_mode="rank") und
+     erwartet dafuer direkt einen vom Nutzer eingegebenen Ziel-HV-Rang
+     (`target_rank_pct`, in Prozent, 0-100 - Werte ausserhalb extrapolieren
+     bewusst ueber das historische Fenster hinaus, identisch zu
+     backtest.FixedRankConfig.target_rank_pct). Der fruehere `vol_mode`-/
+     `today_iv_override`-Parameter dieser Funktion (Punkt 6, "direct"-Modus
+     bzw. ein manuell eingegebener/aus HV berechneter absoluter IV-Wert, aus
+     dem der Rang ERST rueckgerechnet wurde) entfaellt dadurch.
+
+     Der eigentliche Rechenkern ist UNVERAENDERT: fuer JEDEN Analog-Tag wird
+     weiterhin per target_vol_for_rank() rollierend zurueckgerechnet, welche
+     IV an GENAU DIESEM Tag noetig gewesen waere, um exakt den eingegebenen
+     Rang in seinem eigenen HV-Min/Max-Fenster (hv_length/rank_lookback_days)
+     zu erreichen - z.B. bedeutet Rang 40% an einem ruhigen Markttag eine
+     niedrige IV, in einer Vola-Krise (z.B. Finanzkrise 2008) bei DEMSELBEN
+     Rang 40% dagegen eine deutlich hoehere IV, weil sich dort das gesamte
+     HV-Min/Max-Fenster auf hoeherem Niveau befindet. Identisches Prinzip zum
+     'Fixer IV-Rang'-Modus im Iron-Condor-Ladder-Backtest
+     (backtest.FixedRankConfig/compute_rank_target_vol) - nur eben auf die K
+     Analog-Tage statt auf JEDEN Handelstag angewendet.
+
+     evaluate_analog_set()/leg_pair_grid_search() bleiben UNVERAENDERT und
+     unterstuetzen weiterhin beide Modi (siehe Punkt 6) fuer direkten
+     Gebrauch ausserhalb von recommend_for_today().
 """
 
 from __future__ import annotations
@@ -396,13 +415,13 @@ def evaluate_analog_set(analogs: pd.DataFrame, training_table: pd.DataFrame, bou
     neu bewerten (Short UND Long, siehe dort) - mit welcher Vola, haengt vom
     `vol_mode` ab (siehe Punkt 6 im Moduldokstring):
 
-      vol_mode="direct" (Standard): JEDER Analog-Tag wird mit derselben
-        absoluten Vola `today_iv` bewertet (das heutige, tatsaechliche
-        Bewertungsniveau) - `bounds`/`today_rank` werden dabei NICHT zur
-        Bewertung herangezogen.
-      vol_mode="rank": klassische Perzentil-Umrechnung (frueheres
-        Standardverhalten, siehe target_vol_for_rank) - `today_rank` ist in
-        diesem Modus Pflicht, `bounds` liefert hv_min/hv_max je Analog-Tag.
+      vol_mode="direct": JEDER Analog-Tag wird mit derselben absoluten Vola
+        `today_iv` bewertet (das heutige, tatsaechliche Bewertungsniveau) -
+        `bounds`/`today_rank` werden dabei NICHT zur Bewertung herangezogen.
+      vol_mode="rank": klassische Perzentil-Umrechnung (siehe
+        target_vol_for_rank) - `today_rank` ist in diesem Modus Pflicht,
+        `bounds` liefert hv_min/hv_max je Analog-Tag. Das ist der Modus, den
+        recommend_for_today() verwendet (siehe Punkt 8 im Moduldokstring).
 
     KORREKTUR (siehe Punkt 1 im Moduldokstring, KRITISCH): das Ergebnis wird
     vor der Rueckgabe explizit nach 'entry_date' (chronologisch) sortiert.
@@ -613,8 +632,7 @@ def recommend_for_today(daily_df: pd.DataFrame, training_table: pd.DataFrame,
                          hv_length: int = 30, rank_lookback_days: int = 252,
                          r_free: float = 0.0, dividend_yield: float = 0.015,
                          vol_surface: VolSurfaceConfig | None = None,
-                         vol_mode: str = "direct",
-                         today_iv_override: float | None = None) -> dict:
+                         target_rank_pct: float = 50.0) -> dict:
     """Kompletter Ablauf: Aehnlichkeits-Raum fitten -> Query-Tag einordnen ->
     Analog-Tage finden -> Leg-Paar-Grid-Search (Short + Long) auf dem
     Analog-Set.
@@ -624,23 +642,27 @@ def recommend_for_today(daily_df: pd.DataFrame, training_table: pd.DataFrame,
     Verfahren selbst rueckblickend zu pruefen (siehe Moduldokstring zur
     Kausalitaet).
 
-    vol_mode / today_iv_override (siehe Punkt 6 im Moduldokstring): mit
-    vol_mode="direct" (Standard) wird `today_iv` als Bewertungs-Vola fuer
-    ALLE Analog-Tage verwendet - berechnet als HV(hv_length) am Query-Tag,
-    oder falls today_iv_override gesetzt ist (z.B. eine reale, vom Nutzer
-    abgelesene Options-IV), wird STATTDESSEN genau dieser Wert verwendet.
-    Mit vol_mode="rank" wird weiterhin die (rein theoretische) Perzentil-
-    Umrechnung von frueher verwendet; today_iv_override bestimmt in diesem
-    Fall nur, WELCHE IV als Ausgangspunkt fuer den Perzentil-Rang dient
-    (Default weiterhin die berechnete HV)."""
+    IV-Bewertung ist HIER IMMER rang-basiert (siehe Punkt 8 im
+    Moduldokstring, vol_mode="rank"): `target_rank_pct` ist ein HV-Rang in
+    Prozent (0-100 ueblich, Werte ausserhalb extrapolieren bewusst ueber das
+    historische Fenster hinaus - identisch zu
+    backtest.FixedRankConfig.target_rank_pct), KEIN absoluter IV-Wert. Fuer
+    JEDEN Analog-Tag wird rollierend zurueckgerechnet, welche IV an GENAU
+    DIESEM Tag noetig gewesen waere, um exakt diesen Rang in seinem eigenen
+    HV-Min/Max-Fenster (hv_length/rank_lookback_days) zu erreichen (siehe
+    target_vol_for_rank) - z.B. bedeutet Rang 40% an einem ruhigen Markttag
+    eine niedrige IV, in einer Vola-Krise bei DEMSELBEN Rang 40% dagegen
+    eine deutlich hoehere IV.
+
+    Fuer direkten Zugriff auf den frueheren 'direct'-Modus (feste absolute
+    Vola statt Rang) evaluate_analog_set()/leg_pair_grid_search() direkt
+    aufrufen (siehe Punkt 6 im Moduldokstring)."""
     if put_delta_grid is None:
         put_delta_grid = [0.10, 0.16, 0.20, 0.25, 0.30]
     if call_delta_grid is None:
         call_delta_grid = [0.10, 0.16, 0.20, 0.25, 0.30]
     if vol_surface is None:
         vol_surface = VolSurfaceConfig()
-    if vol_mode not in ("direct", "rank"):
-        raise ValueError(f"Unbekannter vol_mode={vol_mode!r} - erwartet 'direct' oder 'rank'.")
 
     if T_days not in available_t_days(training_table):
         raise ValueError(
@@ -665,53 +687,27 @@ def recommend_for_today(daily_df: pd.DataFrame, training_table: pd.DataFrame,
 
     analogs = find_analogs(query_date, query_score, space, analog_cfg)
 
+    # hv_rank_bounds() liefert das rollierende hv_min/hv_max-Fenster JEDES
+    # Handelstages (kausal) - wird unten pro Analog-Tag einzeln nachgeschlagen
+    # (siehe evaluate_analog_set). Der Query-Tag selbst braucht hier KEINE
+    # eigene Sonderbehandlung mehr: der Ziel-Rang kommt direkt von aussen
+    # (target_rank_pct), nicht mehr aus einer am Query-Tag beobachteten/
+    # eingegebenen absoluten IV (siehe Punkt 8 im Moduldokstring).
     bounds = hv_rank_bounds(daily_df, hv_length, rank_lookback_days)
-    today_bounds_rows = bounds.loc[bounds["date"] == query_date]
-    if today_bounds_rows.empty:
-        raise ValueError(f"Keine HV-Daten fuer {query_date.date()} verfuegbar.")
-    today_bounds = today_bounds_rows.iloc[0]
 
-    computed_today_iv = float(today_bounds["hv"])
-    if today_iv_override is not None:
-        today_iv = float(today_iv_override)
-    else:
-        today_iv = computed_today_iv
-    if np.isnan(today_iv) or today_iv <= 0.0:
-        raise ValueError(
-            f"Keine gueltige heutige IV/HV fuer {query_date.date()} bestimmbar "
-            "(zu wenig Historie fuer die gewaehlte HV-Periode?) - entweder "
-            "spaeteres Datum waehlen oder today_iv_override manuell setzen."
-        )
-
-    # today_rank wird IMMER berechnet (auch im "direct"-Modus) - dort rein
-    # informativ: zeigt, wie ungewoehnlich today_iv historisch einzuordnen
-    # ist (siehe Punkt 6 im Moduldokstring). Im "rank"-Modus ist es
-    # zusaetzlich die eigentliche Rechengrundlage fuer jeden Analog-Tag.
-    if today_bounds["hv_max"] > today_bounds["hv_min"]:
-        today_rank = (today_iv - today_bounds["hv_min"]) / (today_bounds["hv_max"] - today_bounds["hv_min"])
-    else:
-        today_rank = np.nan
-    if vol_mode == "rank" and np.isnan(today_rank):
-        raise ValueError(
-            f"HV-Rang fuer {query_date.date()} nicht bestimmbar (zu wenig Historie im "
-            "Lookback-Fenster?) - vol_mode='rank' braucht einen gueltigen Rang. "
-            "Entweder Lookback verkuerzen/Datum aendern oder vol_mode='direct' verwenden."
-        )
+    today_rank = target_rank_pct / 100.0
 
     grid_result = leg_pair_grid_search(
         analogs, training_table, bounds, T_days,
         put_delta_grid, call_delta_grid, r_free, dividend_yield, vol_surface,
-        vol_mode=vol_mode, today_iv=today_iv, today_rank=today_rank,
+        vol_mode="rank", today_rank=today_rank,
     )
 
     clustering = analog_clustering_diagnostic(analogs)
 
     return {
         "query_date": query_date,
-        "vol_mode": vol_mode,
-        "today_iv": today_iv,
-        "computed_today_iv": computed_today_iv,
-        "today_iv_overridden": today_iv_override is not None,
+        "target_rank_pct": target_rank_pct,
         "today_rank": today_rank,
         "n_analogs": len(analogs),
         "analogs": analogs,

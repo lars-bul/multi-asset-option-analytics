@@ -4,8 +4,9 @@ Analog-Matching fuer die IC-Leg-Auswahl.
 GRUNDIDEE: statt eines global trainierten Klassifikators (train.py) wird
 direkt mit historischen "Analog-Tagen" gearbeitet:
 
-  1. Finde die K historisch aehnlichsten Handelstage zu einem Query-Tag
-     (Distanz im PCA-Raum der Tages-Features - siehe fit_similarity_space()).
+  1. Finde alle Handelstage innerhalb einer Distanz-Schwelle im PCA-Raum zu
+     einem Query-Tag (Distanz im PCA-Raum der Tages-Features - siehe
+     fit_similarity_space()).
   2. Rechne die Vola jedes Analog-Tags auf den HV-Rang des Query-Tags um
      (siehe target_vol_for_rank() - direkte Erweiterung von
      backtest.compute_rank_target_vol(), nur mit variablem statt festem
@@ -14,8 +15,9 @@ direkt mit historischen "Analog-Tagen" gearbeitet:
      Dashboard bereits vorhandene "Fixer IV-Rang"-Simulation
      (backtest.FixedRankConfig/compute_rank_target_vol) - nur wird dort JEDER
      Handelstag der gesamten Historie auf einen festen Rang umgerechnet,
-     hier NUR die K Analog-Tage, und der Ziel-Rang ist nicht fest eingestellt,
-     sondern der TATSAECHLICHE heutige Rang.
+     hier NUR die Analog-Tage innerhalb der Distanz-Schwelle, und der
+     Ziel-Rang ist nicht fest eingestellt, sondern der TATSAECHLICHE heutige
+     Rang.
   3. Bewerte auf diesen ranggerechten Analog-Tagen einen Short- UND Long-
      Strangle (siehe reprice_leg_pair() - Long ist exakt das Spiegelbild des
      Short, da keine Transaktionskosten modelliert werden: pnl_norm_long =
@@ -80,7 +82,7 @@ Dashboard - siehe Kommentare an den jeweiligen Stellen fuer Details):
      Ereignissen (z.B. einer einzelnen Krise) stammt - das kann die
      Newey-West-Korrektur zwar entschaerfen, aber nicht vollstaendig
      kompensieren, wenn die effektive Anzahl unabhaengiger Beobachtungen
-     sehr viel kleiner als k ist.
+     sehr viel kleiner als die Anzahl gefundener Analog-Tage ist.
 
   5) NEU - T_days-Kompatibilitaetspruefung (available_t_days()): die
      Analog-Bewertung nutzt entry_S/exit_S aus der vorab gebauten
@@ -137,12 +139,40 @@ Dashboard - siehe Kommentare an den jeweiligen Stellen fuer Details):
      Rang 40% dagegen eine deutlich hoehere IV, weil sich dort das gesamte
      HV-Min/Max-Fenster auf hoeherem Niveau befindet. Identisches Prinzip zum
      'Fixer IV-Rang'-Modus im Iron-Condor-Ladder-Backtest
-     (backtest.FixedRankConfig/compute_rank_target_vol) - nur eben auf die K
-     Analog-Tage statt auf JEDEN Handelstag angewendet.
+     (backtest.FixedRankConfig/compute_rank_target_vol) - nur eben auf die
+     Analog-Tage innerhalb der Distanz-Schwelle statt auf JEDEN Handelstag
+     angewendet.
 
      evaluate_analog_set()/leg_pair_grid_search() bleiben UNVERAENDERT und
      unterstuetzen weiterhin beide Modi (siehe Punkt 6) fuer direkten
      Gebrauch ausserhalb von recommend_for_today().
+
+  9) NEU (Umstellung nach Nutzer-Feedback) - Distanz-Schwelle statt fester
+     Anzahl (k): find_analogs() verwendet jetzt AnalogConfig.max_distance
+     statt AnalogConfig.k - es werden ALLE Kandidaten-Tage mit Distanz
+     <= max_distance verwendet, unabhaengig von ihrer Anzahl (frueher: die
+     k naechsten Tage, unabhaengig von ihrer absoluten Distanz). n_analogs
+     kann dadurch stark schwanken, je nachdem wie 'ungewoehnlich' der
+     Query-Tag im Aehnlichkeits-Raum liegt. analog_distance_distribution()
+     liefert eine Kalibrierungs-Vorschau (Perzentile der tatsaechlichen
+     Distanzen aller zulaessigen Kandidaten), damit sich im Dashboard eine
+     sinnvolle Schwelle ablesen laesst, OHNE dafuer schon den vollen
+     Grid-Search auszufuehren.
+
+  10) NEU - Delta-Eingabe per Strike (delta_for_strike()): das Dashboard
+      erlaubt jetzt, Put-/Call-Bein wahlweise per Strike statt per Delta
+      einzugeben. delta_for_strike() berechnet dafuer das zu einem
+      gegebenen Strike gehoerige Delta NUMERISCH per Bump-and-Reprice auf
+      dem Forward-Preis (zentrale Differenz), unter Verwendung von
+      forward_price()/leg_price() - also GENAU der Bewertungslogik (inkl.
+      Vol-Surface/Smile ueber `vol_surface`), die auch reprice_leg_pair()/
+      solve_strike_delta_consistent() verwenden. Es gibt bewusst KEINE
+      zweite, eigene Delta-Formel - dadurch bleibt das Ergebnis auch dann
+      konsistent, wenn sich die Bewertungslogik in black76.py spaeter
+      aendert. Delta wird als POSITIVE Groesse (Betrag) zurueckgegeben,
+      identisch zur sonst im Modul verwendeten Konvention (Put-Deltas
+      werden ebenfalls als positive Zahlen wie 0.10, 0.16 angegeben, nicht
+      mit oekonomischem Vorzeichen).
 """
 
 from __future__ import annotations
@@ -259,15 +289,28 @@ def transform_query(space: SimilaritySpace, feature_row: pd.Series) -> np.ndarra
 
 @dataclass
 class AnalogConfig:
-    k: int = 100
-    min_gap_days: int = 5   # Mindestabstand in HANDELSTAGEN zum Query-Tag (siehe KORREKTUR 2)
+    max_distance: float = 3.0   # Alle Kandidaten-Tage MIT DISTANZ <= max_distance werden
+                                 # verwendet, unabhaengig von ihrer Anzahl (ersetzt die
+                                 # fruehere feste Anzahl k der naechsten Tage - siehe Punkt 9
+                                 # im Moduldokstring). Skala haengt vom gewhitenten PCA-Raum
+                                 # ab (siehe SimilaritySpaceConfig) - zur Kalibrierung siehe
+                                 # analog_distance_distribution().
+    min_gap_days: int = 5       # Mindestabstand in HANDELSTAGEN zum Query-Tag (siehe KORREKTUR 2)
 
 
 def find_analogs(query_date: pd.Timestamp, query_score: np.ndarray, space: SimilaritySpace,
                   cfg: AnalogConfig | None = None) -> pd.DataFrame:
-    """Findet die cfg.k naehesten Analog-Tage zu query_score (euklidische
-    Distanz im gewhitenten PCA-Raum), beschraenkt auf Kandidaten VOR
-    query_date (Kausalitaet - siehe Modul-Docstring).
+    """Findet ALLE Handelstage mit Distanz <= cfg.max_distance zu query_score
+    (euklidische Distanz im gewhitenten PCA-Raum), beschraenkt auf Kandidaten
+    VOR query_date (Kausalitaet - siehe Modul-Docstring).
+
+    GEAENDERT (siehe Punkt 9 im Moduldokstring): frueher wurden die cfg.k
+    NAEHESTEN Tage verwendet (feste Anzahl, variable Distanz). Jetzt gilt es
+    umgekehrt: eine feste Distanz-Schwelle, variable (und a priori unbekannte)
+    Anzahl an Tagen. Das bedeutet auch, dass n_analogs stark schwanken kann -
+    je nachdem, wie 'ungewoehnlich' der Query-Tag im Aehnlichkeits-Raum liegt
+    (siehe analog_clustering_diagnostic() und die Warnung im Dashboard bei
+    sehr wenigen gefundenen Tagen).
 
     KORREKTUR (siehe Punkt 2 im Moduldokstring): min_gap_days war zuvor ueber
     Kalendertage (np.timedelta64) implementiert, obwohl als "Handelstage"
@@ -290,14 +333,61 @@ def find_analogs(query_date: pd.Timestamp, query_score: np.ndarray, space: Simil
 
     cand_idx = np.arange(max_allowed_pos)
     dist = np.linalg.norm(space.scores[cand_idx] - query_score[None, :], axis=1)
-    k = min(cfg.k, len(cand_idx))
-    order = np.argsort(dist)[:k]
-    chosen = cand_idx[order]
+
+    within = dist <= cfg.max_distance
+    if not within.any():
+        raise ValueError(
+            f"Keine Analog-Tage innerhalb der Distanz-Schwelle {cfg.max_distance:.4f} "
+            f"gefunden (kleinste verfuegbare Distanz: {dist.min():.4f}). "
+            "max_distance erhoehen."
+        )
+
+    chosen = cand_idx[within]
 
     return pd.DataFrame({
         "analog_date": dates[chosen],
-        "distance": dist[order],
+        "distance": dist[within],
     }).sort_values("distance").reset_index(drop=True)
+
+
+def analog_distance_distribution(daily_df: pd.DataFrame, query_date: pd.Timestamp,
+                                  min_gap_days: int = 5,
+                                  space_cfg: SimilaritySpaceConfig | None = None) -> np.ndarray:
+    """NEU (siehe Punkt 9 im Moduldokstring) - reine Kalibrierungs-Hilfe fuers
+    Dashboard: fittet den Aehnlichkeits-Raum wie recommend_for_today() und
+    liefert die (aufsteigend sortierten) Distanzen ALLER zulaessigen
+    Kandidaten-Tage zum Query-Tag - VOR Anwendung einer max_distance-
+    Schwelle. Damit laesst sich z.B. ueber Perzentile ablesen, welche
+    Schwelle etwa 'die aehnlichsten 5% aller Tage' bedeutet, ohne dafuer
+    schon den vollen Grid-Search auszufuehren.
+
+    Bewusst unabhaengig von find_analogs()/recommend_for_today() gehalten
+    (etwas Code-Duplikation beim Fitten des Raums), damit diese leichte
+    Vorschau-Funktion nicht an die schwerere Pipeline (Grid-Search etc.)
+    gekoppelt ist - ein Aufruf dieser Funktion soll im Dashboard bei jeder
+    Aenderung von query_date/min_gap_days guenstig moeglich sein, ohne dass
+    dafuer bereits Delta-Grids o.ae. feststehen muessten."""
+    feature_df = build_feature_matrix(daily_df, FeatureConfig())
+    query_date = pd.Timestamp(query_date)
+    if query_date not in set(feature_df["date"]):
+        raise ValueError(f"{query_date.date()} ist kein Handelstag in den geladenen Kursdaten.")
+
+    space = fit_similarity_space(feature_df, space_cfg, max_date=query_date + pd.Timedelta(days=1))
+    query_row = feature_df.loc[feature_df["date"] == query_date].iloc[0]
+    query_score = transform_query(space, query_row)
+
+    dates = space.dates.to_numpy()
+    query_pos = int(np.searchsorted(dates, np.datetime64(query_date), side="left"))
+    max_allowed_pos = query_pos - max(min_gap_days, 0)
+    if max_allowed_pos <= 0:
+        raise ValueError(
+            f"Keine Analog-Kandidaten vor {query_date.date()} mit "
+            f"min_gap_days={min_gap_days} Handelstagen Abstand gefunden."
+        )
+
+    cand_idx = np.arange(max_allowed_pos)
+    dist = np.linalg.norm(space.scores[cand_idx] - query_score[None, :], axis=1)
+    return np.sort(dist)
 
 
 def analog_clustering_diagnostic(analogs: pd.DataFrame, gap_days: int = 3) -> dict:
@@ -402,6 +492,37 @@ def reprice_leg_pair(entry_S: float, exit_S: float, T_days: int, target_vol: flo
         "net_pnl_short": net_pnl_short, "pnl_norm_short": pnl_norm_short,
         "net_pnl_long": -net_pnl_short, "pnl_norm_long": -pnl_norm_short,
     }
+
+
+def delta_for_strike(K: float, is_put: bool, spot: float, T_days: int, vol: float,
+                      r_free: float, dividend_yield: float,
+                      vol_surface: VolSurfaceConfig, bump_frac: float = 1e-4) -> float:
+    """NEU (siehe Punkt 10 im Moduldokstring) - numerisches (zentrales) Delta
+    fuer einen GEGEBENEN Strike K, per Bump-and-Reprice auf dem
+    Forward-Preis F. Bewusst OHNE eigene/zweite Black-76-Delta-Formel
+    implementiert - nutzt ausschliesslich die bereits vorhandenen,
+    oeffentlichen Bewertungsfunktionen (forward_price, leg_price), damit das
+    Ergebnis automatisch zu JEDER Vol-Surface-/Smile-Logik konsistent ist,
+    die leg_price() ueber `vol_surface` intern anwendet (dieselbe Logik, die
+    auch reprice_leg_pair()/solve_strike_delta_consistent() verwenden) -
+    auch falls sich diese Logik spaeter aendert, muss hier nichts angepasst
+    werden.
+
+    bump_frac: relative Bump-Groesse auf F (Default 0.01% von F) - klein
+    genug fuer eine gute Naeherung der Ableitung, gross genug, um nicht in
+    numerische Rundungsprobleme zu laufen.
+
+    Rueckgabe als POSITIVE Groesse (Betrag), konsistent zur Delta-Konvention
+    im Rest des Moduls, wo Put-Deltas ebenfalls als positive Zahlen (z.B.
+    0.10, 0.16) angegeben werden statt mit dem oekonomischen Vorzeichen."""
+    T_years = T_days / 365.0
+    F = forward_price(spot, r_free, dividend_yield, T_years)
+    h = max(abs(F) * bump_frac, 1e-6)
+
+    price_up = leg_price(K, is_put, T_years, F + h, vol, r_free, vol_surface)
+    price_down = leg_price(K, is_put, T_years, F - h, vol, r_free, vol_surface)
+
+    return abs((price_up - price_down) / (2.0 * h))
 
 
 def evaluate_analog_set(analogs: pd.DataFrame, training_table: pd.DataFrame, bounds: pd.DataFrame,
@@ -634,7 +755,8 @@ def recommend_for_today(daily_df: pd.DataFrame, training_table: pd.DataFrame,
                          vol_surface: VolSurfaceConfig | None = None,
                          target_rank_pct: float = 50.0) -> dict:
     """Kompletter Ablauf: Aehnlichkeits-Raum fitten -> Query-Tag einordnen ->
-    Analog-Tage finden -> Leg-Paar-Grid-Search (Short + Long) auf dem
+    Analog-Tage finden (alle innerhalb einer Distanz-Schwelle, siehe Punkt 9
+    im Moduldokstring) -> Leg-Paar-Grid-Search (Short + Long) auf dem
     Analog-Set.
 
     query_date=None (Default): der spaeteste Tag in feature_df wird

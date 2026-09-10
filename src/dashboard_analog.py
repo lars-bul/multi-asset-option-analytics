@@ -7,6 +7,15 @@ Hauptbereich - dashboard.py ruft diese Funktion NUR auf, wenn dieser Modus
 oben in der Reiterleiste aktiv ist, es entsteht also keine Ueberschneidung
 mit der Sidebar von dashboard_ladder.py.
 
+ANALOG-TAGE-AUSWAHL: statt einer festen Anzahl (k) werden jetzt ALLE
+Handelstage bis zu einer einstellbaren Ähnlichkeits-Distanz verwendet (siehe
+analog_matching.py, Punkt 9 im Moduldokstring) - unabhaengig davon, wie viele
+das im Einzelfall sind. Da die Distanz-Skala vom (gewhitenten) PCA-Raum
+abhaengt und daher nicht ohne Weiteres "aus dem Bauch heraus" einschaetzbar
+ist, gibt es optional eine Kalibrierungs-Vorschau (Perzentile der
+tatsaechlichen Distanzen aller zulaessigen Kandidaten-Tage), siehe
+_sidebar_params().
+
 IV-Bewertungsniveau: IMMER rang-basiert (siehe analog_matching.py, Punkt 8
 im Moduldokstring) - identisches Prinzip zum "Fixer IV-Rang"-Modus im Iron
 Condor Backtest (dashboard_ladder.py/backtest.FixedRankConfig): man gibt
@@ -28,6 +37,7 @@ import sys
 from pathlib import Path
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -38,8 +48,96 @@ from stats import reliability_summary
 from analog_matching import (
     AnalogConfig, SimilaritySpaceConfig, recommend_for_today, available_t_days,
     evaluate_analog_set, summarize_analog_trades, hv_rank_bounds, target_vol_for_rank,
+    analog_distance_distribution, delta_for_strike,
 )
 from dashboard_common import metric_box, load_training_table
+
+
+# Kandidaten-Spaltennamen fuer den Schlusskurs in daily_df - wird fuer die
+# Strike->Delta-Umrechnung in _leg_input() benoetigt (delta_for_strike()
+# braucht einen Spot-Preis). ANPASSEN, falls keiner davon passt - siehe die
+# Fehlermeldung in _get_spot() bei Bedarf (zeigt die tatsaechlich
+# vorhandenen Spalten von daily_df an).
+_SPOT_COLUMN_CANDIDATES = ["close", "Close", "S", "spot", "last"]
+
+# Defaults fuer risikolosen Zins/Dividendenrendite bei der Strike->Delta-
+# Umrechnung - identisch zu den Defaults, die recommend_for_today() an
+# anderer Stelle verwendet, damit die angezeigte Delta-Vorschau zum
+# tatsaechlich gelaufenen Backtest passt.
+_R_FREE_DEFAULT = 0.0
+_DIVIDEND_YIELD_DEFAULT = 0.015
+
+
+def _get_spot(daily_df: pd.DataFrame, date) -> float | None:
+    """Spot-Preis (Schlusskurs) an einem gegebenen Handelstag - fuer die
+    Strike->Delta-Umrechnung in _leg_input() benoetigt. Probiert mehrere
+    gaengige Spaltennamen durch, da der genaue Name der Schlusskurs-Spalte
+    in daily_df hier nicht mit Sicherheit bekannt ist."""
+    row = daily_df.loc[daily_df["date"] == pd.Timestamp(date)]
+    if row.empty:
+        return None
+    for col in _SPOT_COLUMN_CANDIDATES:
+        if col in row.columns:
+            return float(row[col].iloc[0])
+    return None
+
+
+def _leg_input(label: str, is_put: bool, spot_today: float | None, T_days: int,
+               vol_today: float, daily_df: pd.DataFrame, default_delta: float = 0.16) -> float | None:
+    """Eingabe fuer EIN Bein (Put oder Call): entweder direkt per Delta, oder
+    per Strike - im Strike-Fall wird das zugehoerige Delta (am gewaehlten
+    Tag, mit der oben berechneten Ziel-IV) per delta_for_strike() bestimmt
+    und angezeigt. Ersetzt das fruehere feste Delta-Raster (Multiselect) -
+    es wird jetzt GENAU EIN Delta pro Bein zurueckgegeben, kein Raster mehr.
+
+    Gibt None zurueck, falls kein gueltiges Delta bestimmt werden kann (z.B.
+    Strike-Modus ohne verfuegbaren Spot-Preis oder ohne gueltige Ziel-IV)."""
+    st.markdown(f"**{label}-Bein**")
+    mode = st.radio(
+        f"{label}: Eingabe per", ["Delta", "Strike"], horizontal=True, key=f"{label}_leg_mode",
+    )
+
+    if mode == "Delta":
+        delta = st.number_input(
+            f"{label}-Delta", min_value=0.01, max_value=0.49, value=default_delta, step=0.01,
+            key=f"{label}_delta_input",
+            help="Wird direkt als das zu testende Delta verwendet.",
+        )
+        return float(delta)
+
+    # mode == "Strike"
+    if spot_today is None:
+        st.caption(
+            "⚠️ Spot-Preis am gewaehlten Tag nicht gefunden (erwartete Spalten: "
+            f"{_SPOT_COLUMN_CANDIDATES} - tatsaechlich vorhanden: "
+            f"{list(daily_df.columns)}). Strike-Eingabe ist dadurch nicht moeglich - "
+            "bitte _SPOT_COLUMN_CANDIDATES in dashboard_analog.py anpassen, oder "
+            "'Delta' als Eingabemodus waehlen."
+        )
+        return None
+    if vol_today is None or pd.isna(vol_today):
+        st.caption(
+            "⚠️ Strike-Eingabe am gewaehlten Tag nicht moeglich (die implizite Ziel-"
+            "IV oben konnte fuer diesen Tag nicht berechnet werden - vermutlich zu "
+            "wenig Historie im Lookback-Fenster). 'Delta' als Eingabemodus waehlen."
+        )
+        return None
+
+    strike = st.number_input(
+        f"{label}-Strike", min_value=0.0, value=float(round(spot_today)), step=1.0,
+        key=f"{label}_strike_input",
+        help="Strike-Preis AM GEWAEHLTEN TAG, bewertet mit der oben berechneten "
+             "Ziel-IV - dient NUR zur Delta-Ableitung. Im eigentlichen Backtest "
+             "wird pro Analog-Tag der zu GENAU DIESEM DELTA passende Strike neu "
+             "bestimmt (nicht dieser Strike-Wert selbst, der ist nur am "
+             "gewaehlten Tag gueltig).",
+    )
+    delta = delta_for_strike(
+        float(strike), is_put, spot_today, T_days, float(vol_today),
+        _R_FREE_DEFAULT, _DIVIDEND_YIELD_DEFAULT, VolSurfaceConfig(),
+    )
+    st.caption(f"→ entspricht einem Delta von **{delta:.3f}** (Strike {strike:.2f}, {label}).")
+    return float(delta)
 
 
 def _sidebar_params(daily_df: pd.DataFrame, valid_t_days: list[int]) -> dict:
@@ -54,15 +152,45 @@ def _sidebar_params(daily_df: pd.DataFrame, valid_t_days: list[int]) -> dict:
              "Datum erlaubt, das Verfahren selbst rueckblickend zu pruefen - es "
              "werden dabei nur Analog-Tage VOR diesem Datum verwendet.",
     )
-    analog_k = st.slider(
-        "Anzahl Analog-Tage (k)", 50, 3000, 1000, 50,
-        help="Mehr Tage -> stabilere Statistik, aber steigendes Risiko, dass sich "
-             "die Analog-Tage in wenigen historischen Ereignissen haeufen (siehe "
-             "Clustering-Warnung im Ergebnis).",
-    )
     analog_min_gap = st.number_input(
         "Mindestabstand zum gewaehlten Tag (Handelstage)", 0, 60, 5,
         help="Vermeidet triviale, fast identische Nachbartage als 'Analog'.",
+    )
+
+    st.caption("Ähnlichkeits-Schwelle (statt fester Anzahl):")
+    show_dist_preview = st.checkbox(
+        "Distanz-Verteilung zur Kalibrierung berechnen",
+        help="Einmalige Berechnung der Distanzen aller zulaessigen Kandidaten-Tage "
+             "zum gewaehlten Tag (ohne Schwelle) - zeigt Perzentile, damit sich eine "
+             "sinnvolle max. Distanz ablesen laesst, bevor der (teurere) Grid-Search "
+             "gestartet wird.",
+    )
+    if show_dist_preview:
+        with st.spinner("Berechne Distanz-Verteilung..."):
+            try:
+                dist_all = analog_distance_distribution(
+                    daily_df, pd.Timestamp(query_date_input), int(analog_min_gap)
+                )
+                qs = np.percentile(dist_all, [1, 5, 10, 25, 50])
+                st.caption(
+                    f"Perzentile der Distanzen aller zulaessigen Kandidaten-Tage "
+                    f"(n={len(dist_all)}): 1%={qs[0]:.3f} · 5%={qs[1]:.3f} · "
+                    f"10%={qs[2]:.3f} · 25%={qs[3]:.3f} · 50%={qs[4]:.3f}. "
+                    "Eine Schwelle beim 5%-Perzentil waehlt ungefaehr die aehnlichsten "
+                    "5% aller in Frage kommenden Tage als Analog-Tage."
+                )
+            except ValueError as e:
+                st.caption(f"Distanz-Vorschau nicht verfuegbar: {e}")
+
+    max_distance = st.number_input(
+        "Maximale Ähnlichkeitsdistanz", min_value=0.01, max_value=100.0,
+        value=3.0, step=0.1,
+        help="Alle Handelstage mit PCA-Distanz bis zu diesem Wert werden als "
+             "Analog-Tage verwendet - unabhaengig davon, wie viele das sind. "
+             "Ersetzt die fruehere feste Anzahl (k) der naechsten Tage: kleinere "
+             "Werte -> weniger, aber aehnlichere Tage; groessere Werte -> mehr, "
+             "aber weniger aehnliche Tage. Zur Kalibrierung die Distanz-Verteilung "
+             "oben einblenden.",
     )
     analog_T_days = st.selectbox(
         "Laufzeit T fuer die Analog-Bewertung (Tage)", valid_t_days,
@@ -104,6 +232,7 @@ def _sidebar_params(daily_df: pd.DataFrame, valid_t_days: list[int]) -> dict:
     # dient nur als Sanity-Check/Referenzpunkt fuer die Eingabe.
     bounds_preview = hv_rank_bounds(daily_df, int(hv_length), int(rank_lookback))
     today_bounds_rows = bounds_preview.loc[bounds_preview["date"] == pd.Timestamp(query_date_input)]
+    implied_iv_today = np.nan
     if len(today_bounds_rows):
         b = today_bounds_rows.iloc[0]
         implied_iv_today = target_vol_for_rank(b["hv_min"], b["hv_max"], target_rank_pct / 100.0)
@@ -121,18 +250,37 @@ def _sidebar_params(daily_df: pd.DataFrame, valid_t_days: list[int]) -> dict:
     else:
         st.caption("Rang-Umrechnung am gewaehlten Tag n/a (kein HV-Wert verfuegbar).")
 
-    st.caption("Delta-Raster fuer die Grid-Search (Put x Call):")
-    delta_grid_options = [0.05, 0.10, 0.16, 0.20, 0.25, 0.30, 0.35, 0.40]
-    put_delta_grid = st.multiselect("Put-Deltas", delta_grid_options, default=[0.10, 0.16, 0.20, 0.25, 0.30])
-    call_delta_grid = st.multiselect("Call-Deltas", delta_grid_options, default=[0.10, 0.16, 0.20, 0.25, 0.30])
+    st.subheader("Put- und Call-Bein festlegen")
+    st.caption(
+        "Es wird genau EIN Put- und EIN Call-Bein getestet (kein Delta-Raster "
+        "mehr). Eingabe wahlweise per Delta ODER per Strike - bei Strike-"
+        "Eingabe wird das zugehoerige Delta (am gewaehlten Tag, zur oben "
+        "berechneten Ziel-IV) bestimmt und angezeigt. Im eigentlichen Backtest "
+        "wird je Analog-Tag - wie zuvor - per solve_strike_delta_consistent() "
+        "der zu GENAU DIESEM DELTA passende Strike neu ermittelt; der hier "
+        "eingegebene Strike-Wert selbst wird NICHT in den Backtest uebernommen "
+        "(er ist nur am gewaehlten Tag gueltig, andere Analog-Tage haben "
+        "andere Spot-Preise/IV-Niveaus)."
+    )
+    spot_today = _get_spot(daily_df, query_date_input)
+
+    put_delta = _leg_input(
+        "Put", is_put=True, spot_today=spot_today, T_days=int(analog_T_days),
+        vol_today=implied_iv_today, daily_df=daily_df, default_delta=0.16,
+    )
+    call_delta = _leg_input(
+        "Call", is_put=False, spot_today=spot_today, T_days=int(analog_T_days),
+        vol_today=implied_iv_today, daily_df=daily_df, default_delta=0.16,
+    )
 
     run_analog = st.button("Analog-Matching ausfuehren", type="primary")
 
     return dict(
-        query_date=pd.Timestamp(query_date_input), analog_k=int(analog_k), analog_min_gap=int(analog_min_gap),
+        query_date=pd.Timestamp(query_date_input), max_distance=float(max_distance),
+        analog_min_gap=int(analog_min_gap),
         T_days=int(analog_T_days), target_rank_pct=float(target_rank_pct),
         hv_length=int(hv_length), rank_lookback=int(rank_lookback),
-        put_delta_grid=put_delta_grid, call_delta_grid=call_delta_grid,
+        put_delta=put_delta, call_delta=call_delta,
         run=run_analog,
     )
 
@@ -140,20 +288,30 @@ def _sidebar_params(daily_df: pd.DataFrame, valid_t_days: list[int]) -> dict:
 def _run_matching(daily_df: pd.DataFrame, training_table: pd.DataFrame, p: dict) -> None:
     """Fuehrt recommend_for_today() aus und legt das Ergebnis in
     st.session_state ab (ueberlebt den naechsten Rerun, z.B. beim Wechseln
-    der Detail-Kombination)."""
-    if not p["put_delta_grid"] or not p["call_delta_grid"]:
-        st.error("Bitte mindestens ein Put-Delta und ein Call-Delta im Raster auswaehlen.")
+    der Detail-Kombination).
+
+    GEAENDERT: put_delta_grid/call_delta_grid werden hier als EINELEMENTIGE
+    Listen an recommend_for_today() uebergeben (deren Signatur unveraendert
+    Listen erwartet) - dadurch testet leg_pair_grid_search() intern genau
+    EIN Put-/Call-Delta-Paar statt eines Rasters, ohne dass analog_matching.py
+    selbst angepasst werden musste."""
+    if p["put_delta"] is None or p["call_delta"] is None:
+        st.error(
+            "Put- und Call-Delta muessen bestimmt sein, bevor das Matching laufen "
+            "kann (bei Strike-Eingabe: ist ein Spot-Preis/eine gueltige Ziel-IV am "
+            "gewaehlten Tag verfuegbar? - siehe Hinweise oben)."
+        )
         return
     try:
         with st.spinner(
-            f"Suche {p['analog_k']} Analog-Tage und werte "
-            f"{len(p['put_delta_grid']) * len(p['call_delta_grid'])} Delta-Kombinationen aus..."
+            f"Suche Analog-Tage innerhalb Distanz {p['max_distance']:.3f} und werte "
+            f"Put-Δ={p['put_delta']:.3f} / Call-Δ={p['call_delta']:.3f} aus..."
         ):
             result = recommend_for_today(
                 daily_df, training_table,
                 query_date=p["query_date"], T_days=p["T_days"],
-                put_delta_grid=p["put_delta_grid"], call_delta_grid=p["call_delta_grid"],
-                analog_cfg=AnalogConfig(k=p["analog_k"], min_gap_days=p["analog_min_gap"]),
+                put_delta_grid=[p["put_delta"]], call_delta_grid=[p["call_delta"]],
+                analog_cfg=AnalogConfig(max_distance=p["max_distance"], min_gap_days=p["analog_min_gap"]),
                 space_cfg=SimilaritySpaceConfig(),
                 hv_length=p["hv_length"], rank_lookback_days=p["rank_lookback"],
                 vol_surface=VolSurfaceConfig(), target_rank_pct=p["target_rank_pct"],
@@ -174,7 +332,7 @@ def _render_grid_result(grid_result: pd.DataFrame) -> None:
         )
         return
 
-    st.subheader("Robusteste Leg-Paare (Short- und Long-Strangle)")
+    st.subheader("Short- vs. Long-Strangle fuer das gewaehlte Put-/Call-Bein")
     st.caption(
         "'robust' = Konfidenzintervall schliesst 0 aus UND gleiches (positives) "
         "Vorzeichen in BEIDEN chronologischen Haelften des Analog-Sets (Train/Val)."
@@ -384,6 +542,19 @@ def _render_result() -> None:
                       "(so viele wie fuer 80% erklaerte Varianz noetig).",
         )
 
+    # NEU: da die Anzahl der Analog-Tage jetzt aus einer Distanz-Schwelle
+    # folgt statt aus einer fest eingestellten Anzahl (k), kann sie je nach
+    # gewaehltem Tag/Schwelle sehr klein ausfallen - eine explizite Warnung
+    # dafuer, zusaetzlich zur bestehenden Clustering-Warnung unten.
+    if result["n_analogs"] < 30:
+        st.warning(
+            f"⚠️ Nur {result['n_analogs']} Analog-Tage innerhalb der gewaehlten Distanz-"
+            "Schwelle gefunden - die Statistik unten (Train/Validierungs-Split, "
+            "Newey-West) wird bei so wenigen Beobachtungen sehr instabil. "
+            "'Maximale Ähnlichkeitsdistanz' in der Sidebar erhoehen, um mehr Tage "
+            "einzubeziehen."
+        )
+
     clustering = result["clustering"]
     if clustering["frac_within_gap"] >= 0.30:
         st.warning(
@@ -413,12 +584,12 @@ def render(df: pd.DataFrame, daily_df: pd.DataFrame, has_resolution: bool) -> No
     nur aufgerufen, wenn 'Analog-Tage-Matching' oben aktiv ist."""
     st.header("Analog-Tage-Matching")
     st.caption(
-        "Findet die K historisch aehnlichsten Handelstage zu einem gewaehlten Tag "
-        "(PCA-Distanz ueber die taeglichen Features) und wertet auf genau diesen "
-        "Tagen einen Short- und Long-Strangle aus. Das Bewertungsniveau ist ein "
-        "vorgegebener HV-Rang, rollierend pro Analog-Tag in eine passende IV "
-        "umgerechnet. Per Grid-Search wird daraus das robusteste Put-/Call-Delta-"
-        "Paar fuer die Short-Beine (Bein 2/3) des Iron Condor gesucht - inkl. "
+        "Findet alle historisch aehnlichen Handelstage zu einem gewaehlten Tag "
+        "innerhalb einer einstellbaren Distanz-Schwelle (PCA-Distanz ueber die "
+        "taeglichen Features) und wertet auf genau diesen Tagen ein frei "
+        "gewaehltes Put-/Call-Bein (per Delta oder Strike) als Short- und "
+        "Long-Strangle aus. Das Bewertungsniveau ist ein vorgegebener HV-Rang, "
+        "rollierend pro Analog-Tag in eine passende IV umgerechnet - inkl. "
         "Train/Validierungs-Split gegen Mehrfachvergleich-Zufallstreffer."
     )
 

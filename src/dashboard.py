@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 import streamlit as st
-
+import dashboard_livechain
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dashboard_common import load_data, render_overview
@@ -56,10 +56,11 @@ daily_df = render_overview(df, has_resolution)
 
 st.divider()
 
-# ── Reiterleiste: waehlt den aktiven Modus ──
+
 MODES = {
     "📊 Iron Condor Backtest": dashboard_ladder,
     "🔍 Analog-Tage-Matching": dashboard_analog,
+    "⚡ Heutige Kette": dashboard_livechain,
 }
 active_mode_label = st.radio(
     "Modus", list(MODES.keys()), horizontal=True, label_visibility="collapsed",

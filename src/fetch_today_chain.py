@@ -73,6 +73,28 @@ def fetch_today_spot(ticker: str = TICKER) -> float:
     return float(price)
 
 
+def fetch_today_open(ticker: str = TICKER) -> float | None:
+    """Heutiger Eroeffnungskurs, FALLS die Sitzung bereits eroeffnet hat -
+    wird fuer den synthetischen 'Heute'-Tagesbalken in der Analog-Tage-
+    Simulation benoetigt (siehe dashboard_livechain._build_daily_df_with_today).
+
+    HINTERGRUND: daily_df enthaelt nur ABGESCHLOSSENE Handelstage. Ohne
+    diesen Eroeffnungskurs wuerde eine Abfrage waehrend eines laufenden
+    Handelstags fuer 'heute' auf den letzten abgeschlossenen Tag zurueckfallen
+    - montags waere das der Freitag (3 Tage alt). Der Eroeffnungskurs
+    schliesst diese Luecke ohne auf den EOD-Abschluss warten zu muessen.
+
+    Gibt None zurueck, wenn kein Eroeffnungskurs verfuegbar ist (vor
+    Handelsbeginn, Wochenende, Feiertag) - Aufrufer soll dann auf den
+    letzten echten Schlusskurs zurueckfallen (mit Warnhinweis)."""
+    tk = yf.Ticker(ticker)
+    fast = tk.fast_info
+    open_price = fast.get("open") or fast.get("regularMarketOpen")
+    if open_price is None or open_price <= 0:
+        return None
+    return float(open_price)
+
+
 def fetch_today_chain(ticker: str = TICKER, min_dte: float = MIN_DTE, max_dte: float = MAX_DTE) -> pd.DataFrame:
     tk = yf.Ticker(ticker)
     now_et = _now_et()

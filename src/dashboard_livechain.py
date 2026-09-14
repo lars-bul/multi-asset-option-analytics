@@ -1,39 +1,226 @@
 """
-MODUS 3 (neu, Ausbaustufe 1 von 2): Heutige Kette - symmetrische Abstands-Ansicht.
+MODUS 3: Heutige Kette - symmetrische Abstands-Ansicht + Analog-Tage-Simulation.
 
-Zeigt die AKTUELLE (heutige, ~15 Min. verzoegerte) SPX-Optionskette als EINE
-Tabelle: je Ziel-ABSTAND vom Spot (in %) eine Zeile - NICHT nach Delta
-gepaart (siehe chain_delta.build_symmetric_distance_table). Put-Zielstrike =
-spot*(1-x%), Call-Zielstrike = spot*(1+x%), beide unabhaengig auf den
-naechstgelegenen real vorhandenen Strike gerundet - dadurch IMMER
-symmetrisch um den Spot, per Definition.
+TEIL A (unveraendert): zeigt die AKTUELLE SPX-Optionskette als EINE Tabelle,
+je Ziel-ABSTAND vom Spot (in %) eine Zeile, Put/Call-Strike unabhaengig auf
+den naechstgelegenen real vorhandenen Strike gerundet - siehe
+chain_delta.build_symmetric_distance_table.
 
-WICHTIG (siehe Nutzer-Vorgabe): die HV-Periode fuer die flache/symmetrische
-Modell-Vola UND fuer das HV-Min/Max-Rang-Fenster wird NICHT mehr manuell
-eingestellt, sondern IMMER automatisch aus der gewaehlten Restlaufzeit
-(dte_exact) abgeleitet - 7.5 Tage Restlaufzeit -> HV(7.5)-Fenster. Da
-compute_hv() ein GANZZAHLIGES Rolling-Fenster (Anzahl Handelstage) braucht,
-wird auf die naechste ganze Zahl gerundet (min. 2) - die fraktionale
-Restlaufzeit selbst fliesst weiterhin exakt in T_years (Black-76) ein, nur
-das diskrete HV-Rolling-Fenster kann nicht fraktional sein.
+TEIL B (NEU): fuehrt fuer JEDE Zeile der Tabelle einen Analog-Tage-Lauf aus
+(identisches Prinzip wie dashboard_analog.py) und haengt die Ergebnis-
+Kennzahlen als zusaetzliche Spalten an. Wichtige Design-Entscheidungen
+(mit dem Nutzer abgestimmt):
 
-NEU: iv_pair_pct (die tatsaechliche 'Paket-IV' der Kombination, per
-Joint-Black-76-Solve - NICHT der Mittelwert der Einzel-IVs, siehe
-chain_delta.implied_vol_pair) und hv_rank_pct (welcher HV-Rang diese
-Paket-IV im (restlaufzeit-synchronen) HV-Min/Max-Fenster entspricht -
-Umkehrung von analog_matching.target_vol_for_rank()).
+  1. Ziel-HV-Rang je Zeile = die in Teil A bereits berechnete Spalte
+     'HV-Rang % (dieser Kombi)' - KEIN eigener Slider, jede Zeile hat ihren
+     eigenen Rang.
+  2. Put-/Call-Delta je Zeile = die 'Modell-Delta (flache HV)'-Spalten aus
+     Teil A - NICHT die echten Marktdeltas (die waeren mit Skew behaftet
+     und wuerden bei solve_strike_delta_consistent() einen anderen Strike
+     treffen als in der Tabelle gezeigt).
+  3. vol_surface = VolSurfaceConfig(use_vol_surface=False) - Skew fuer den
+     Analog-Lauf explizit AUS, damit die Delta-Definition durchgaengig
+     dieselbe (flache) bleibt wie in Punkt 2.
+  4. T_days fuer evaluate_analog_set() MUSS einer der in der vorab gebauten
+     training_table verfuegbaren Werte sein (siehe labels.py/build_dataset.py)
+     - die tatsaechliche Restlaufzeit (dte_exact) wird auf den naechst-
+     gelegenen verfuegbaren Wert GERUNDET (siehe available_t_days()).
+  5. 'Heute' fuer die Analog-Suche: waehrend eines laufenden Handelstags
+     enthaelt daily_df noch keinen abgeschlossenen Balken fuer heute (montags
+     waere das sonst Freitag, 3 Tage alt). Es wird daher ein synthetischer
+     Balken (open=high=low=close=heutiger Eroeffnungskurs) an eine KOPIE von
+     daily_df angehaengt (siehe _build_daily_df_with_today()).
+  6. Performance: die Aehnlichkeits-Raum-PCA und die Analog-Tage-Suche
+     (find_analogs) haengen NICHT von Delta/Rang ab - werden daher NUR
+     EINMAL pro Klick berechnet, nicht pro Zeile. Trotzdem bleibt die
+     eigentliche Bewertung (Strike-Solve je Analog-Tag x Zeile) ein
+     Python-Loop - bei vielen Zeilen x vielen Analog-Tagen kann das mehrere
+     Minuten dauern, daher expliziter Button statt Auto-Run.
+  7. Je Zeile: Kennzahlen auf dem KOMPLETTEN Analog-Set (n, Gewinnrate,
+     Profit Factor, Ø norm. P&L, t-Stat, CI≠0, Perioden-Konsistenz X/6)
+     PLUS Train/Val-Split-Robustheit (t-Stat Val, Robust-Flag) - identisches
+     Kriterium wie leg_pair_grid_search() in analog_matching.py, aber ohne
+     die dreifache Neuberechnung: evaluate_analog_set() wird nur EINMAL auf
+     dem kompletten Set aufgerufen, Train/Val wird danach aus dem fertigen
+     Ergebnis chronologisch aufgeteilt (mathematisch identisch, da jede
+     Analog-Tag-Bewertung unabhaengig von den anderen ist).
 """
 import sys
+from datetime import date
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fetch_today_chain import fetch_today_chain, fetch_today_spot
+from black76 import VolSurfaceConfig
+from fetch_today_chain import fetch_today_chain, fetch_today_spot, fetch_today_open
 from chain_delta import ChainDeltaConfig, enrich_chain_with_delta, build_symmetric_distance_table
-from analog_matching import hv_rank_bounds
+from analog_matching import (
+    AnalogConfig, SimilaritySpaceConfig, hv_rank_bounds, fit_similarity_space,
+    transform_query, find_analogs, evaluate_analog_set, summarize_analog_trades,
+    available_t_days, _reliability_for_side,
+)
+from features import FeatureConfig, build_feature_matrix
+from dashboard_common import load_training_table
+
+
+def _build_daily_df_with_today(daily_df: pd.DataFrame):
+    """Haengt einen synthetischen 'Heute'-Tagesbalken an eine KOPIE von
+    daily_df an (open=high=low=close=heutiger Eroeffnungskurs), damit die
+    Analog-Suche waehrend eines laufenden Handelstags nicht auf den letzten
+    ABGESCHLOSSENEN Tag zurueckfaellt (z.B. montags auf Freitag, 3 Tage alt).
+    Dieselbe open=high=low=close-Konvention wie fuer die interpolierten
+    Shiller-Monatsdaten im Rest des Projekts (siehe dashboard_common.py).
+
+    Faellt auf den letzten echten Schlusskurs zurueck (used_fallback=True),
+    falls kein Eroeffnungskurs verfuegbar ist (vor Handelsbeginn/Wochenende).
+
+    Rueckgabe: (daily_df_erweitert, query_date, used_fallback)."""
+    today = pd.Timestamp(date.today())
+    if (daily_df["date"] == today).any():
+        return daily_df.copy(), today, False
+
+    open_price = fetch_today_open()
+    if open_price is None:
+        return daily_df.copy(), daily_df["date"].max(), True
+
+    new_row = pd.DataFrame([{
+        "date": today, "open": open_price, "high": open_price,
+        "low": open_price, "close": open_price,
+    }])
+    if "resolution" in daily_df.columns:
+        new_row["resolution"] = "daily"
+    out = pd.concat([daily_df, new_row], ignore_index=True).sort_values("date").reset_index(drop=True)
+    return out, today, False
+
+
+def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
+                      chosen_dte_exact: float, r_free: float, dividend_yield: float,
+                      hv_length: int, rank_lookback: int,
+                      analog_max_distance: float, analog_min_gap: int) -> pd.DataFrame | None:
+    """Fuehrt den Analog-Tage-Lauf fuer JEDE Zeile von 'table' aus (siehe
+    Moduldokstring Punkt 1-7). Gibt None zurueck (mit st.error) bei
+    Abbruch, sonst ein DataFrame mit einer Zeile je distance_pct."""
+    training_table = load_training_table()
+    if training_table.empty:
+        st.error(
+            "Keine Trainingstabelle gefunden - einmal im Terminal "
+            "`python src/build_dataset.py` ausfuehren und die Seite neu laden."
+        )
+        return None
+
+    valid_t_days = available_t_days(training_table)
+    T_days_used = min(valid_t_days, key=lambda t: abs(t - chosen_dte_exact))
+    if abs(T_days_used - chosen_dte_exact) > 1.0:
+        st.info(
+            f"Restlaufzeit {chosen_dte_exact:.2f} Tage wird fuer die Analog-Bewertung "
+            f"auf das naechstgelegene verfuegbare T_days={T_days_used} gerundet "
+            f"(verfuegbar: {valid_t_days})."
+        )
+
+    daily_df_today, query_date, used_fallback = _build_daily_df_with_today(daily_df)
+    if used_fallback:
+        st.warning(
+            f"Kein heutiger Eroeffnungskurs verfuegbar (vor Handelsbeginn/Wochenende?) "
+            f"- Analog-Suche faellt auf den letzten echten Handelstag "
+            f"({pd.Timestamp(query_date).date()}) zurueck."
+        )
+
+    with st.spinner("Baue Aehnlichkeits-Raum und suche Analog-Tage (einmalig fuer alle Zeilen)..."):
+        try:
+            feature_df = build_feature_matrix(daily_df_today, FeatureConfig())
+            if query_date not in set(feature_df["date"]):
+                st.error(
+                    f"{pd.Timestamp(query_date).date()} hat keine vollstaendigen "
+                    "Features (Warmup-Fenster noch nicht voll?)."
+                )
+                return None
+            space = fit_similarity_space(
+                feature_df, SimilaritySpaceConfig(), max_date=query_date + pd.Timedelta(days=1),
+            )
+            query_row = feature_df.loc[feature_df["date"] == query_date].iloc[0]
+            query_score = transform_query(space, query_row)
+            analogs = find_analogs(
+                query_date, query_score, space,
+                AnalogConfig(max_distance=analog_max_distance, min_gap_days=analog_min_gap),
+            )
+            bounds = hv_rank_bounds(daily_df_today, hv_length, rank_lookback)
+        except ValueError as e:
+            st.error(f"Analog-Suche fehlgeschlagen: {e}")
+            return None
+
+    st.caption(f"{len(analogs)} Analog-Tage gefunden (einmalig ermittelt, gilt fuer alle Zeilen unten).")
+
+    # Skew fuer den Analog-Lauf explizit AUS (siehe Moduldokstring Punkt 3) -
+    # damit die Delta-Definition dieselbe (flache) bleibt wie in den
+    # Modell-Delta-Spalten von Teil A.
+    vol_surface = VolSurfaceConfig(use_vol_surface=False)
+
+    progress = st.progress(0.0)
+    status = st.empty()
+    results = []
+    n = len(table)
+    for i, row in enumerate(table.itertuples()):
+        status.text(f"Analog-Lauf {i + 1}/{n} (Ziel-Abstand {row.distance_pct:g}%)...")
+        progress.progress((i + 1) / n)
+
+        put_delta = row.model_delta_put_pct / 100.0 if pd.notna(row.model_delta_put_pct) else None
+        call_delta = row.model_delta_call_pct / 100.0 if pd.notna(row.model_delta_call_pct) else None
+        today_rank = row.hv_rank_pct / 100.0 if pd.notna(row.hv_rank_pct) else None
+
+        if put_delta is None or call_delta is None or today_rank is None:
+            results.append({"distance_pct": row.distance_pct, "analog_n": None})
+            continue
+
+        full_eval = evaluate_analog_set(
+            analogs, training_table, bounds, T_days_used, put_delta, call_delta,
+            r_free, dividend_yield, vol_surface, vol_mode="rank", today_rank=today_rank,
+        )
+        if full_eval.empty:
+            results.append({"distance_pct": row.distance_pct, "analog_n": 0})
+            continue
+
+        trade_summary = summarize_analog_trades(full_eval, "short")
+        rel_full = _reliability_for_side(full_eval, "short", 6)
+
+        median_date = full_eval["entry_date"].median()
+        train_eval = full_eval[full_eval["entry_date"] < median_date]
+        val_eval = full_eval[full_eval["entry_date"] >= median_date]
+        train_rel = _reliability_for_side(train_eval, "short", 4)
+        val_rel = _reliability_for_side(val_eval, "short", 4)
+
+        robust = False
+        if train_rel["n_trades"] > 0 and val_rel["n_trades"] > 0:
+            robust = bool(
+                train_rel["ci_excludes_zero"] and val_rel["ci_excludes_zero"]
+                and np.sign(train_rel["mean_pnl_norm"]) == np.sign(val_rel["mean_pnl_norm"])
+                and np.sign(train_rel["mean_pnl_norm"]) > 0.0
+            )
+
+        results.append({
+            "distance_pct": row.distance_pct,
+            "analog_n": trade_summary["n_trades"],
+            "win_rate_pct": trade_summary["win_rate_pct"],
+            "profit_factor": trade_summary["profit_factor"],
+            "avg_pnl_norm_pct": trade_summary["avg_pnl_norm_pct"],
+            "tstat_full": rel_full["tstat"],
+            "ci_excludes_zero_full": rel_full["ci_excludes_zero"],
+            "subperiod_matching": rel_full["subperiod_matching"],
+            "subperiod_nonempty": rel_full["subperiod_nonempty"],
+            "tstat_val": val_rel["tstat"],
+            "robust_train_val": robust,
+        })
+
+    status.empty()
+    progress.empty()
+
+    out = pd.DataFrame(results)
+    out["T_days_used"] = T_days_used
+    out["n_analogs_total"] = len(analogs)
+    return out
 
 
 def render(df, daily_df, has_resolution) -> None:
@@ -230,12 +417,13 @@ def render(df, daily_df, has_resolution) -> None:
         "Δ Put % (echt)", "Δ Call % (echt)",
     ]]
     st.caption(
-        "'IV Kombi' = die EINE Vola, die - in Black-76 fuer Put+Call GEMEINSAM "
-        "eingesetzt - exakt die Summe beider echter Mid-Preise reproduziert "
-        "(kein Mittelwert der Einzel-IVs, siehe chain_delta.implied_vol_pair). "
-        "'HV-Rang' = wo diese Kombi-IV im HV-Min/Max-Fenster (oben, Laenge = "
-        "gerundete Restlaufzeit) liegt - Werte ausserhalb 0-100% bedeuten "
-        "Extrapolation ueber das historische Fenster hinaus."
+        "'Ziel-Δ' ist die Suchvorgabe (Zeilenlabel). 'Δ Put/Call (echt)' sind die "
+        "TATSAECHLICHEN, aus dem realen Mid-Preis per Black-76 zurueckgerechneten "
+        "Deltas der jeweils gewaehlten Option - koennen leicht vom Ziel abweichen, "
+        "da nur reale (diskrete) Strikes existieren. 'IV Kombi' = die EINE Vola, "
+        "die - in Black-76 fuer Put+Call GEMEINSAM eingesetzt - exakt die Summe "
+        "beider echter Mid-Preise reproduziert (kein Mittelwert der Einzel-IVs). "
+        "'HV-Rang' = wo diese Kombi-IV im HV-Min/Max-Fenster oben liegt."
     )
     st.dataframe(
         show.style.format({
@@ -264,3 +452,80 @@ def render(df, daily_df, has_resolution) -> None:
             ].sort_values(["option_type", "strike"]),
             use_container_width=True, hide_index=True,
         )
+
+    # ── TEIL B: Analog-Tage-Simulation je Zeile (siehe Moduldokstring) ──
+    st.divider()
+    st.subheader("Analog-Tage-Simulation je Zeile")
+    st.caption(
+        "Fuehrt fuer JEDE Zeile oben (= reale Delta-Kombination) einen Analog-Tage-"
+        "Lauf aus - Ziel-HV-Rang je Zeile = 'HV-Rang % (dieser Kombi)' aus der "
+        "Tabelle oben, Put-/Call-Delta = die Modell-Delta-Spalten (flache HV, "
+        "Skew AUS). Analog-Tage werden NUR EINMAL gesucht (identisch fuer alle "
+        "Zeilen), danach je Zeile neu bewertet. Bei vielen Analog-Tagen x vielen "
+        "Zeilen kann das mehrere Minuten dauern - Fortschrittsbalken zeigt den Stand."
+    )
+    ac1, ac2 = st.columns(2)
+    with ac1:
+        analog_max_distance = st.number_input(
+            "Maximale Ähnlichkeitsdistanz", min_value=0.01, max_value=100.0, value=3.0, step=0.1,
+        )
+    with ac2:
+        analog_min_gap = st.number_input(
+            "Mindestabstand zu heute (Handelstage)", min_value=0, max_value=60, value=5,
+        )
+
+    run_bulk = st.button("Analog-Läufe für alle Zeilen starten")
+    if run_bulk:
+        analog_results = _run_bulk_analog(
+            table, daily_df, chosen_dte_exact, r_free, dividend_yield,
+            hv_length, int(rank_lookback), float(analog_max_distance), int(analog_min_gap),
+        )
+        if analog_results is not None:
+            st.session_state["livechain_analog_results"] = analog_results
+            st.session_state["livechain_analog_key"] = (chosen_expiry, tuple(distance_targets_pct))
+
+    stored = st.session_state.get("livechain_analog_results")
+    stored_key = st.session_state.get("livechain_analog_key")
+    if stored is not None and stored_key == (chosen_expiry, tuple(distance_targets_pct)):
+        merged = table.merge(stored, on="distance_pct", how="left")
+        show2 = merged.rename(columns={
+            "distance_pct": "Ziel-Abstand % v. Spot",
+            "analog_n": "Analog-Trades (n)",
+            "win_rate_pct": "Gewinnrate %",
+            "profit_factor": "Profit Factor",
+            "avg_pnl_norm_pct": "Ø norm. P&L %",
+            "tstat_full": "t-Stat (gesamt)",
+            "ci_excludes_zero_full": "CI ≠ 0 (gesamt)",
+            "subperiod_matching": "Perioden-Match",
+            "subperiod_nonempty": "Perioden gesamt",
+            "tstat_val": "t-Stat (Val)",
+            "robust_train_val": "Robust (Train+Val)",
+        })[[
+            "Ziel-Abstand % v. Spot", "Analog-Trades (n)", "Gewinnrate %", "Profit Factor",
+            "Ø norm. P&L %", "t-Stat (gesamt)", "CI ≠ 0 (gesamt)",
+            "Perioden-Match", "Perioden gesamt", "t-Stat (Val)", "Robust (Train+Val)",
+        ]]
+        st.caption(
+            f"T_days fuer die Analog-Bewertung: "
+            f"{int(stored['T_days_used'].iloc[0]) if len(stored) else 'n/a'} "
+            f"(gerundet von {chosen_dte_exact:.2f} Tagen Restlaufzeit) · "
+            f"{int(stored['n_analogs_total'].iloc[0]) if len(stored) else 0} Analog-Tage gefunden. "
+            "'Robust (Train+Val)' = Konfidenzintervall schliesst 0 aus UND gleiches "
+            "positives Vorzeichen in BEIDEN chronologischen Haelften des Analog-Sets."
+        )
+        st.dataframe(
+            show2.style.format({
+                "Ziel-Abstand % v. Spot": "{:.2f}",
+                "Analog-Trades (n)": "{:.0f}",
+                "Gewinnrate %": "{:.1f}",
+                "Profit Factor": "{:.2f}",
+                "Ø norm. P&L %": "{:+.2f}",
+                "t-Stat (gesamt)": "{:.2f}",
+                "Perioden-Match": "{:.0f}",
+                "Perioden gesamt": "{:.0f}",
+                "t-Stat (Val)": "{:.2f}",
+            }, na_rep="n/a"),
+            use_container_width=True, hide_index=True,
+        )
+    elif stored is not None:
+        st.info("Tabelle/Expiry hat sich seit dem letzten Analog-Lauf geaendert - bitte erneut starten.")

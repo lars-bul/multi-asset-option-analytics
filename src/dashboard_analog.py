@@ -25,6 +25,23 @@ exakt diesen Rang zu erreichen. Es gibt bewusst KEIN Eingabefeld fuer eine
 absolute IV mehr (frueher "Heutige IV (%)") - der Rang allein bestimmt die
 Bewertung, konsistent ueber alle Analog-Tage hinweg.
 
+VOL-OBERFLAECHE (Skew/Term-Structure): bewusst DEAKTIVIERT in diesem Modus
+(VolSurfaceConfig(use_vol_surface=False) ueberall unten) - siehe Kommentare
+an den jeweiligen Stellen. Grund: dieser Modus soll 1:1 mit dem Iron-Condor-
+Ladder-Backtest (dashboard_ladder.py) vergleichbar sein, und zwar unabhaengig
+davon, wie dort die Checkbox "Skew + Term Structure verwenden" gerade steht.
+Fruehere Version hat hier ueberall `VolSurfaceConfig()` ohne Argument
+aufgerufen - das griff lautlos auf den Default in black76.py zurueck
+(use_vol_surface=True), unabhaengig von der Ladder-Einstellung. Dadurch
+wichen beide Modi bei IDENTISCHER Basis-IV/IDENTISCHEM Datum in Strike UND
+Praemie spuerbar voneinander ab (z.B. am 2026-08-28 ca. 22.36 vs. 25.68 bei
+gleichem entry_iv=0.1243, T=7 Tage) - ein Nutzer, der beide Modi gegeneinander
+testet, verglich also unbemerkt Skew-bewertete gegen flach-bewertete Strikes.
+Eine Checkbox wie im Ladder-Modus wurde hier bewusst NICHT ergaenzt (das
+wuerde das eigentliche Problem - lautlos abweichende Defaults - nur auf
+diesen einen Modus verschieben); stattdessen ist Skew hier fest aus, bis
+beide Modi ueber einen gemeinsamen Vol-Oberflaechen-Parameter verfuegen.
+
 Aufbau (von oben nach unten in dieser Datei):
   1. _sidebar_params()     - alle Eingabefelder in der Sidebar, gibt ein dict zurueck
   2. _run_matching()       - fuehrt recommend_for_today() aus, speichert Ergebnis in st.session_state
@@ -66,6 +83,13 @@ _SPOT_COLUMN_CANDIDATES = ["close", "Close", "S", "spot", "last"]
 # tatsaechlich gelaufenen Backtest passt.
 _R_FREE_DEFAULT = 0.0
 _DIVIDEND_YIELD_DEFAULT = 0.015
+
+# VOL-OBERFLAECHE fuer diesen Modus: fest deaktiviert (siehe Moduldokstring
+# oben) - EINE zentrale Stelle statt an jeder Aufrufstelle ein eigenes
+# `VolSurfaceConfig(use_vol_surface=False)` zu wiederholen, damit sich das
+# spaeter (z.B. bei Einfuehrung einer echten, mit dashboard_ladder.py
+# geteilten Einstellung) an nur einer Stelle aendern laesst.
+_VOL_SURFACE = VolSurfaceConfig(use_vol_surface=False)
 
 
 def _get_spot(daily_df: pd.DataFrame, date) -> float | None:
@@ -134,7 +158,7 @@ def _leg_input(label: str, is_put: bool, spot_today: float | None, T_days: int,
     )
     delta = delta_for_strike(
         float(strike), is_put, spot_today, T_days, float(vol_today),
-        _R_FREE_DEFAULT, _DIVIDEND_YIELD_DEFAULT, VolSurfaceConfig(),
+        _R_FREE_DEFAULT, _DIVIDEND_YIELD_DEFAULT, _VOL_SURFACE,
     )
     st.caption(f"→ entspricht einem Delta von **{delta:.3f}** (Strike {strike:.2f}, {label}).")
     return float(delta)
@@ -294,7 +318,13 @@ def _run_matching(daily_df: pd.DataFrame, training_table: pd.DataFrame, p: dict)
     Listen an recommend_for_today() uebergeben (deren Signatur unveraendert
     Listen erwartet) - dadurch testet leg_pair_grid_search() intern genau
     EIN Put-/Call-Delta-Paar statt eines Rasters, ohne dass analog_matching.py
-    selbst angepasst werden musste."""
+    selbst angepasst werden musste.
+
+    KORREKTUR (Vol-Oberflaeche): `vol_surface` wird jetzt explizit als
+    _VOL_SURFACE (use_vol_surface=False) uebergeben statt eines default-
+    konstruierten VolSurfaceConfig() - siehe Moduldokstring oben. Vorher griff
+    das lautlos auf den black76.py-Default (use_vol_surface=True) zurueck,
+    unabhaengig davon, was im Iron-Condor-Ladder-Backtest eingestellt war."""
     if p["put_delta"] is None or p["call_delta"] is None:
         st.error(
             "Put- und Call-Delta muessen bestimmt sein, bevor das Matching laufen "
@@ -314,7 +344,7 @@ def _run_matching(daily_df: pd.DataFrame, training_table: pd.DataFrame, p: dict)
                 analog_cfg=AnalogConfig(max_distance=p["max_distance"], min_gap_days=p["analog_min_gap"]),
                 space_cfg=SimilaritySpaceConfig(),
                 hv_length=p["hv_length"], rank_lookback_days=p["rank_lookback"],
-                vol_surface=VolSurfaceConfig(), target_rank_pct=p["target_rank_pct"],
+                vol_surface=_VOL_SURFACE, target_rank_pct=p["target_rank_pct"],
             )
         st.session_state["analog_result"] = result
     except ValueError as e:
@@ -590,7 +620,9 @@ def render(df: pd.DataFrame, daily_df: pd.DataFrame, has_resolution: bool) -> No
         "gewaehltes Put-/Call-Bein (per Delta oder Strike) als Short- und "
         "Long-Strangle aus. Das Bewertungsniveau ist ein vorgegebener HV-Rang, "
         "rollierend pro Analog-Tag in eine passende IV umgerechnet - inkl. "
-        "Train/Validierungs-Split gegen Mehrfachvergleich-Zufallstreffer."
+        "Train/Validierungs-Split gegen Mehrfachvergleich-Zufallstreffer. "
+        "Bewertung OHNE Skew/Term-Structure (flache Black-76-Vola), damit "
+        "dieser Modus 1:1 mit dem Iron-Condor-Ladder-Backtest vergleichbar ist."
     )
 
     training_table = load_training_table()

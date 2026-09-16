@@ -44,6 +44,34 @@ Kennzahlen als zusaetzliche Spalten an. Wichtige Design-Entscheidungen
      dem kompletten Set aufgerufen, Train/Val wird danach aus dem fertigen
      Ergebnis chronologisch aufgeteilt (mathematisch identisch, da jede
      Analog-Tag-Bewertung unabhaengig von den anderen ist).
+  8. NEU - 'Erwarteter Gewinn Short' (in Punkten): Ø norm. P&L% ist eine
+     relative Kennzahl (normiert auf die historische Analog-Entry-Praemie
+     JEDES einzelnen Analog-Tages, siehe reprice_leg_pair() -
+     pnl_norm = net_pnl / entry_premium). Fuer einen Vergleich ueber
+     Zeilen/Strikes hinweg, der auf die HEUTIGE (reale) Praemiengroesse
+     bezogen ist, wird diese relative Kennzahl mit der HEUTIGEN Entry-
+     Praemie DIESER Zeile (mid_put + mid_call aus Teil A) multipliziert:
+
+         erwarteter Gewinn Short (Pkt) = avg_pnl_norm_pct/100 * (mid_put+mid_call)
+
+     avg_pnl_norm_pct wird hier IMMER aus Short-Sicht berechnet
+     (summarize_analog_trades(..., "short")) - diese Spalte bewertet daher
+     ausschliesslich das Short-Bein (die Praemien-Seite des Condors), NICHT
+     die Wings. Fuer die Wing-/Long-Auswahl und v.a. fuer die STREUUNG/
+     Konsistenz der KOMBINIERTEN Position (das eigentliche 'wie geradlinig
+     laeuft die Kapitalkurve') den Iron-Condor-Ladder-Backtest verwenden
+     (dashboard_ladder.py) - dort wird Short+Long GEMEINSAM pro Analog-/
+     Handelstag bewertet und liefert eine echte, korrelationskonsistente
+     Equity-Kurve (die Streuung der Kombination ist NICHT einfach die Summe
+     der Einzel-Streuungen, da beide Beine am selben Tag korreliert sind).
+  9. NEU - Auto-Load: die Kette wird beim ERSTEN Aufruf dieses Tabs
+     automatisch geladen (kein Klick auf 'Heutige Kette laden' mehr noetig,
+     siehe render()). Einmal geladene Daten (Kette, Distanz-Tabelle,
+     Analog-Ergebnisse) liegen in st.session_state und bleiben daher auch
+     nach einem Wechsel zu einem anderen Tab/Modus erhalten - Streamlit
+     raeumt st.session_state NICHT auf, nur weil ein anderer Reiter aktiv
+     ist (siehe dashboard.py-Docstring: es rendert zwar nur der aktive
+     Modus, aber session_state ist global fuer die gesamte Browser-Sitzung).
 """
 import sys
 from datetime import date
@@ -102,7 +130,7 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
                       hv_length: int, rank_lookback: int,
                       analog_max_distance: float, analog_min_gap: int) -> pd.DataFrame | None:
     """Fuehrt den Analog-Tage-Lauf fuer JEDE Zeile von 'table' aus (siehe
-    Moduldokstring Punkt 1-7). Gibt None zurueck (mit st.error) bei
+    Moduldokstring Punkt 1-8). Gibt None zurueck (mit st.error) bei
     Abbruch, sonst ein DataFrame mit einer Zeile je distance_pct."""
     training_table = load_training_table()
     if training_table.empty:
@@ -171,16 +199,63 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
         call_delta = row.model_delta_call_pct / 100.0 if pd.notna(row.model_delta_call_pct) else None
         today_rank = row.hv_rank_pct / 100.0 if pd.notna(row.hv_rank_pct) else None
 
-        if put_delta is None or call_delta is None or today_rank is None:
-            results.append({"distance_pct": row.distance_pct, "analog_n": None})
+        # NEU (siehe Moduldokstring Punkt 8): heutige (reale) Entry-Praemie
+        # DIESER Zeile - Grundlage fuer die 'erwarteter Gewinn'-Spalten
+        # unten. Kann NaN sein, falls put_row/call_row in Teil A fuer diese
+        # Zeile nicht gefunden wurden (siehe build_symmetric_distance_table) -
+        # dann bleiben auch die erwarteter-Gewinn-Spalten NaN.
+        entry_premium_today = None
+        if pd.notna(row.mid_put) and pd.notna(row.mid_call):
+            entry_premium_today = float(row.mid_put) + float(row.mid_call)
+
+        # GUARD (Fix): bei sehr weiten Zielabstaenden (siehe Distanz-Raster
+        # in der Sidebar, per Default bis 40%) kann das reale Modell-Delta
+        # numerisch auf EXAKT 0.0 runden (echte Zahl, kein None - der obige
+        # None-Check greift hier also NICHT). Ein Ziel-Delta von exakt 0
+        # entspricht rechnerisch einem Strike bei unendlich -
+        # solve_strike_delta_consistent()/leg_price() liefern dafuer keine
+        # sinnvolle Loesung mehr (Absturz mit 'ValueError: expected a
+        # positive input, got 0.0' tief in black76.py). Solche Zeilen daher
+        # genauso behandeln wie die bereits vorhandenen None-Faelle -
+        # ueberspringen statt den kompletten Bulk-Lauf abzubrechen.
+        if (put_delta is None or call_delta is None or today_rank is None
+                or put_delta <= 0.0 or call_delta <= 0.0):
+            results.append({
+                "distance_pct": row.distance_pct, "analog_n": None,
+                "entry_premium_today": entry_premium_today,
+                "expected_profit_short": None,
+            })
             continue
 
-        full_eval = evaluate_analog_set(
-            analogs, training_table, bounds, T_days_used, put_delta, call_delta,
-            r_free, dividend_yield, vol_surface, vol_mode="rank", today_rank=today_rank,
-        )
+        # ZUSAETZLICHER GUARD: selbst mit obigem Filter kann eine einzelne
+        # Zeile aus einem anderen numerischen Grenzfall heraus fehlschlagen
+        # (z.B. ein einzelner entarteter Analog-Tag). Ein try/except HIER
+        # (statt den Fehler bis dashboard.py durchschlagen zu lassen) sorgt
+        # dafuer, dass nur DIESE Zeile als 'n/a' markiert wird und der
+        # Bulk-Lauf fuer alle anderen Zeilen trotzdem fertig laeuft.
+        try:
+            full_eval = evaluate_analog_set(
+                analogs, training_table, bounds, T_days_used, put_delta, call_delta,
+                r_free, dividend_yield, vol_surface, vol_mode="rank", today_rank=today_rank,
+            )
+        except (ValueError, ZeroDivisionError) as e:
+            st.caption(
+                f"⚠️ Ziel-Abstand {row.distance_pct:g}%: Bewertung numerisch "
+                f"fehlgeschlagen ({e}) - Zeile wird als n/a markiert, Rest laeuft weiter."
+            )
+            results.append({
+                "distance_pct": row.distance_pct, "analog_n": None,
+                "entry_premium_today": entry_premium_today,
+                "expected_profit_short": None,
+            })
+            continue
+
         if full_eval.empty:
-            results.append({"distance_pct": row.distance_pct, "analog_n": 0})
+            results.append({
+                "distance_pct": row.distance_pct, "analog_n": 0,
+                "entry_premium_today": entry_premium_today,
+                "expected_profit_short": None,
+            })
             continue
 
         trade_summary = summarize_analog_trades(full_eval, "short")
@@ -200,12 +275,27 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
                 and np.sign(train_rel["mean_pnl_norm"]) > 0.0
             )
 
+        # NEU (siehe Moduldokstring Punkt 8): avg_pnl_norm_pct ist IMMER aus
+        # Short-Sicht (summarize_analog_trades(full_eval, "short")) - mit
+        # der heutigen Entry-Praemie DIESER Zeile multipliziert ergibt das
+        # den erwarteten Gewinn in PUNKTEN, vergleichbar ueber Zeilen
+        # hinweg (statt der relativen %-Kennzahl, die auf die historische
+        # Analog-Praemie JEDES einzelnen Tages normiert ist). Fuer 'Long'
+        # wird das Vorzeichen gedreht (pnl_norm_long = -pnl_norm_short exakt,
+        # siehe reprice_leg_pair()-Docstring) - keine Neuberechnung noetig.
+        expected_profit_short = None
+        if entry_premium_today is not None and pd.notna(trade_summary["avg_pnl_norm_pct"]):
+            avg_pnl_norm_frac = trade_summary["avg_pnl_norm_pct"] / 100.0
+            expected_profit_short = avg_pnl_norm_frac * entry_premium_today
+
         results.append({
             "distance_pct": row.distance_pct,
             "analog_n": trade_summary["n_trades"],
             "win_rate_pct": trade_summary["win_rate_pct"],
             "profit_factor": trade_summary["profit_factor"],
             "avg_pnl_norm_pct": trade_summary["avg_pnl_norm_pct"],
+            "entry_premium_today": entry_premium_today,
+            "expected_profit_short": expected_profit_short,
             "tstat_full": rel_full["tstat"],
             "ci_excludes_zero_full": rel_full["ci_excludes_zero"],
             "subperiod_matching": rel_full["subperiod_matching"],
@@ -249,11 +339,7 @@ def render(df, daily_df, has_resolution) -> None:
         st.caption("Abstands-Raster (Ziel-% vom Spot) fuer die Zeilen:")
         distance_grid_input = st.text_input(
             "Ziel-Abstaende (%, kommagetrennt)",
-            "0.25,0.5,0.75,1.0,1.25,1.5,1.75,2.0,2.25,2.5,2.75,3.0,3.5,4.0,4.5,5.0,5.5,6.0,6.5,7.0,"
-            "7.5,8.0,8.5,9.0,9.5,10.0,10.5,11.0,11.5,12.0,12.5,13.0,13.5,14.0,14.5,15.0,15.5,16.0,"
-            "16.5,17.0,17.5,18.0,18.5,19.0,19.5,20.0,20.5,21.0,21.5,22.0,22.5,23.0,23.5,24.0,24.5,"
-            "25.0,25.5,26.0,26.5,27.0,27.5,28.0,28.5,29.0,29.5,30.0,30.5,31.0,31.5,32.0,32.5,33.0,"
-            "33.5,34.0,34.5,35.0,35.5,36.0,36.5,37.0,37.5,38.0,38.5,39.0,39.5,40.0",
+            "0.25,0.5,0.75,1.0,1.25,1.5,1.75,2.0,2.25,2.5,2.75,3.0,3.5,4,5,6,8,10",
         )
         rank_lookback = st.number_input(
             "Lookback fuer HV-Min/Max-Rangfenster (Tage)", 30, 5000, 252,
@@ -263,9 +349,27 @@ def render(df, daily_df, has_resolution) -> None:
         )
         r_free = st.number_input("Risikoloser Zins", 0.0, 0.20, 0.0, 0.005, format="%.3f")
         dividend_yield = st.number_input("Dividendenrendite", 0.0, 0.10, 0.015, 0.001, format="%.3f")
-        load = st.button("Heutige Kette laden", type="primary")
+        reload_chain = st.button(
+            "Heutige Kette neu laden", type="primary",
+            help="Beim ERSTEN Oeffnen dieses Tabs wird die Kette automatisch geladen "
+                 "(siehe unten) - dieser Button ist nur fuer ein manuelles Neuladen "
+                 "noetig, z.B. nach Aenderung von DTE-Filter/Delta-Filter oder um "
+                 "einen aktuelleren Snapshot zu holen.",
+        )
 
-    if load:
+    # AUTO-LOAD (Fix): frueher musste 'Heutige Kette laden' bei JEDEM
+    # Tab-Wechsel erneut geklickt werden, bevor ueberhaupt etwas zu sehen
+    # war - das wirkte wie 'alles verschwindet beim Tab-Wechsel'. Jetzt wird
+    # beim ALLERERSTEN Aufruf dieses Tabs (kein 'livechain_enriched' in
+    # st.session_state) automatisch geladen, mit den aktuellen (Default-)
+    # Sidebar-Werten - kein Klick noetig. Ist einmal geladen, bleibt der
+    # Stand in st.session_state erhalten (siehe Modul-Docstring: Streamlit
+    # behaelt session_state ueber Tab-/Modus-Wechsel hinweg bei) - ein
+    # spaeterer Tab-Wechsel loescht NICHTS mehr. Der Button oben dient nur
+    # noch dem BEWUSSTEN manuellen Neuladen (z.B. nach Parameteraenderung
+    # oder fuer einen frischeren Snapshot).
+    needs_initial_load = "livechain_enriched" not in st.session_state
+    if reload_chain or needs_initial_load:
         with st.spinner("Lade heutige Kette und berechne Delta/IV je Serie..."):
             try:
                 spot = fetch_today_spot()
@@ -277,15 +381,20 @@ def render(df, daily_df, has_resolution) -> None:
                 )
             except Exception as e:
                 st.error(f"Laden fehlgeschlagen: {e}")
-                return
-        st.session_state["livechain_spot"] = spot
-        st.session_state["livechain_enriched"] = enriched
-        st.session_state["livechain_r_free"] = float(r_free)
-        st.session_state["livechain_dividend_yield"] = float(dividend_yield)
-        st.session_state["livechain_rank_lookback"] = int(rank_lookback)
+                if needs_initial_load:
+                    return
+                # Bei einem manuellen Neuladen NICHT den ganzen Tab abbrechen -
+                # der vorherige (funktionierende) Stand in st.session_state
+                # bleibt dann einfach unveraendert sichtbar.
+            else:
+                st.session_state["livechain_spot"] = spot
+                st.session_state["livechain_enriched"] = enriched
+                st.session_state["livechain_r_free"] = float(r_free)
+                st.session_state["livechain_dividend_yield"] = float(dividend_yield)
+                st.session_state["livechain_rank_lookback"] = int(rank_lookback)
 
     if "livechain_enriched" not in st.session_state:
-        st.info("Links 'Heutige Kette laden' klicken.")
+        st.info("Kette konnte noch nicht geladen werden - siehe Fehlermeldung oben.")
         return
 
     spot = st.session_state["livechain_spot"]
@@ -464,6 +573,15 @@ def render(df, daily_df, has_resolution) -> None:
         "Zeilen), danach je Zeile neu bewertet. Bei vielen Analog-Tagen x vielen "
         "Zeilen kann das mehrere Minuten dauern - Fortschrittsbalken zeigt den Stand."
     )
+    st.caption(
+        "'Erw. Gewinn Short' (Punkte) = Ø norm. P&L% dieser Zeile multipliziert mit "
+        "der HEUTIGEN Entry-Praemie dieser Zeile (Mid Put + Mid Call oben) - damit "
+        "auf die reale, heutige Praemiengroesse bezogen statt nur relativ zur "
+        "historischen Analog-Praemie. Bewertet NUR das Short-Bein (Praemien-Seite), "
+        "NICHT die Wings. Fuer die Wing-Auswahl und vor allem fuer die echte "
+        "kombinierte Equity-Kurve (Short+Long GEMEINSAM, inkl. Korrelation zwischen "
+        "den Beinen) den Iron-Condor-Ladder-Backtest verwenden."
+    )
     ac1, ac2 = st.columns(2)
     with ac1:
         analog_max_distance = st.number_input(
@@ -494,6 +612,8 @@ def render(df, daily_df, has_resolution) -> None:
             "win_rate_pct": "Gewinnrate %",
             "profit_factor": "Profit Factor",
             "avg_pnl_norm_pct": "Ø norm. P&L %",
+            "entry_premium_today": "Entry-Prämie heute (Pkt)",
+            "expected_profit_short": "Erw. Gewinn Short (Pkt)",
             "tstat_full": "t-Stat (gesamt)",
             "ci_excludes_zero_full": "CI ≠ 0 (gesamt)",
             "subperiod_matching": "Perioden-Match",
@@ -502,7 +622,9 @@ def render(df, daily_df, has_resolution) -> None:
             "robust_train_val": "Robust (Train+Val)",
         })[[
             "Ziel-Abstand % v. Spot", "Analog-Trades (n)", "Gewinnrate %", "Profit Factor",
-            "Ø norm. P&L %", "t-Stat (gesamt)", "CI ≠ 0 (gesamt)",
+            "Ø norm. P&L %", "Entry-Prämie heute (Pkt)",
+            "Erw. Gewinn Short (Pkt)",
+            "t-Stat (gesamt)", "CI ≠ 0 (gesamt)",
             "Perioden-Match", "Perioden gesamt", "t-Stat (Val)", "Robust (Train+Val)",
         ]]
         st.caption(
@@ -520,6 +642,8 @@ def render(df, daily_df, has_resolution) -> None:
                 "Gewinnrate %": "{:.1f}",
                 "Profit Factor": "{:.2f}",
                 "Ø norm. P&L %": "{:+.2f}",
+                "Entry-Prämie heute (Pkt)": "{:.2f}",
+                "Erw. Gewinn Short (Pkt)": "{:+.2f}",
                 "t-Stat (gesamt)": "{:.2f}",
                 "Perioden-Match": "{:.0f}",
                 "Perioden gesamt": "{:.0f}",

@@ -23,6 +23,25 @@ HINWEISE / GRENZEN dieses kostenlosen Wegs:
   Ticker "^SPX" zusammen - dieses Skript unterscheidet die Roots NICHT
   extra, sondern nimmt einfach alle von Yahoo gelisteten Expiries im
   gewuenschten DTE-Fenster.
+
+NEU - Staleness-Diagnose (last_trade_date/age): "15 Minuten verzoegert"
+gilt fuer den GESAMTEN Feed pauschal, sagt aber NICHTS darueber aus, wie alt
+die Bid/Ask-Quote EINES EINZELNEN, wenig gehandelten Strikes tatsaechlich
+ist - ein Market Maker aktualisiert eine kaum gehandelte Serie u.U. seit
+Stunden nicht, auch ohne dass der Gesamtfeed "veraltet" waere. yfinance
+liefert dafuer KEINEN offiziellen Bid/Ask-Zeitstempel, aber `lastTradeDate`
+(Zeitpunkt des letzten tatsaechlichen Trades dieses Kontrakts) als besten
+verfuegbaren Naeherungswert - vorher wurde dieses Feld beim Spalten-Select
+stillschweigend verworfen. Jetzt wird es durchgereicht (siehe
+fetch_today_chain()) und in enrich_chain_with_delta()/dashboard_livechain.py
+als `last_trade_date`/`quote_age_minutes` sichtbar gemacht. WICHTIG: das ist
+ein NAEHERUNGSWERT, kein Beweis - ein aktueller `lastTradeDate` bedeutet
+nicht zwingend eine frische Quote (der MM kann die Quote seit dem letzten
+Trade trotzdem bewegt haben), und ein alter `lastTradeDate` bedeutet nicht
+zwingend eine falsche Quote (bei ruhigem Markt kann eine alte Quote noch
+gueltig sein). Es ist trotzdem der beste Hinweis, den yfinance bietet, um
+einen Verdacht wie "dieser Put-Preis wirkt zu hoch" objektiv zu pruefen,
+statt ihn nur aus dem Preisvergleich selbst zu vermuten.
 """
 import sys
 from datetime import date, datetime
@@ -134,9 +153,18 @@ def fetch_today_chain(ticker: str = TICKER, min_dte: float = MIN_DTE, max_dte: f
             sub["dte_exact"] = dte_precise
             sub["option_type"] = option_type
             sub["mid"] = (sub["bid"] + sub["ask"]) / 2.0
+            # NEU: lastTradeDate durchreichen statt verwerfen (siehe
+            # Moduldokstring "Staleness-Diagnose") - fehlt die Spalte bei
+            # einer aelteren yfinance-Version, wird NaT eingesetzt, damit
+            # der Rest der Pipeline (enrich_chain_with_delta) nicht bricht.
+            if "lastTradeDate" in sub.columns:
+                sub["last_trade_date"] = sub["lastTradeDate"]
+            else:
+                sub["last_trade_date"] = pd.NaT
             rows.append(sub[[
                 "date", "expiry", "dte", "dte_exact", "strike", "option_type",
                 "bid", "ask", "mid", "lastPrice", "volume", "openInterest", "impliedVolatility",
+                "last_trade_date",
             ]].rename(columns={
                 "lastPrice": "last", "openInterest": "open_interest", "impliedVolatility": "implied_vol",
             }))

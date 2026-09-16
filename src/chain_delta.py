@@ -13,7 +13,19 @@ Moduls.
 
 Konvention (wie im Rest des Projekts): Put-Delta wird als POSITIVE Zahl
 zurueckgegeben (Betrag), nicht mit oekonomischem Vorzeichen.
-"""
+
+NEU - Staleness-Diagnose (last_trade_date/quote_age_minutes): siehe
+fetch_today_chain.py-Moduldokstring. enrich_chain_with_delta() reicht das
+dort neu durchgereichte `last_trade_date` durch und ergaenzt zusaetzlich
+`quote_age_minutes` (Minuten seit dem letzten tatsaechlichen Trade dieses
+Kontrakts, bezogen auf den Fetch-Zeitpunkt `as_of`). Grund fuer die
+Ergaenzung: eine auffaellig hohe/niedrige implizite Vola auf einer Seite
+(z.B. Put deutlich teurer als der Call bei symmetrischem Abstand) kann ein
+echtes Marktphaenomen (Skew) ODER eine schlicht veraltete Einzelquote sein -
+`quote_age_minutes` macht das objektiv pruefbar, statt es nur aus dem
+Preisvergleich zu vermuten (siehe build_symmetric_distance_table(), wo
+diese Spalten pro gewaehltem Strike in die Ausgabetabelle uebernommen
+werden)."""
 from dataclasses import dataclass
 
 import numpy as np
@@ -87,24 +99,36 @@ class ChainDeltaConfig:
     min_abs_delta: float = 0.01   # Filter: Serien mit kleinerem Delta werden verworfen (zu weit OTM)
 
 
-def enrich_chain_with_delta(chain: pd.DataFrame, spot: float, cfg: ChainDeltaConfig | None = None) -> pd.DataFrame:
+def enrich_chain_with_delta(chain: pd.DataFrame, spot: float, cfg: ChainDeltaConfig | None = None,
+                             as_of: pd.Timestamp | None = None) -> pd.DataFrame:
     """Nimmt das Ergebnis von fetch_today_chain.fetch_today_chain() (Spalten
-    date/expiry/dte/dte_exact/strike/option_type/bid/ask/mid/...) und
-    ergaenzt je Zeile implied_vol_mkt und delta_mkt (ECHTE, aus dem
-    Marktpreis invertierte Werte - siehe Moduldokstring). Zeilen ohne
-    gueltiges IV-Solve (z.B. mid<=0 oder Preis unter innerem Wert) werden
-    verworfen.
+    date/expiry/dte/dte_exact/strike/option_type/bid/ask/mid/.../
+    last_trade_date) und ergaenzt je Zeile implied_vol_mkt und delta_mkt
+    (ECHTE, aus dem Marktpreis invertierte Werte - siehe Moduldokstring).
+    Zeilen ohne gueltiges IV-Solve (z.B. mid<=0 oder Preis unter innerem
+    Wert) werden verworfen.
 
     Nutzt dte_exact (fraktionale Resttage aus fetch_today_chain.dte_exact)
     fuer T statt ganzzahligem dte - bei kurzen Laufzeiten (0DTE) macht das
     einen spuerbaren Unterschied in Delta/IV.
 
     Filtert danach auf cfg.min_abs_delta <= delta_mkt <= 1.0 - "am oder im
-    Geld bis Delta 0.01"."""
+    Geld bis Delta 0.01".
+
+    NEU: ergaenzt `quote_age_minutes` = Minuten zwischen `last_trade_date`
+    (letzter tatsaechlicher Trade dieses Kontrakts, siehe
+    fetch_today_chain.py) und `as_of` (Referenzzeitpunkt - Default: jetzt,
+    UTC). Ist NaN, falls `last_trade_date` fehlt (aeltere yfinance-Version
+    oder Serie ganz ohne Handelshistorie). Reiner Diagnose-/Warnwert - siehe
+    Moduldokstring: ein hoher Wert bedeutet NICHT zwingend eine falsche
+    Quote, ist aber der beste verfuegbare Hinweis auf eine moeglicherweise
+    veraltete Bid/Ask-Quote bei duenn gehandelten Serien."""
     from black76 import forward_price   # bereits vorhanden im Projekt
 
     if cfg is None:
         cfg = ChainDeltaConfig()
+    if as_of is None:
+        as_of = pd.Timestamp.now(tz="UTC")
 
     rows = []
     for r in chain.itertuples(index=False):
@@ -122,7 +146,21 @@ def enrich_chain_with_delta(chain: pd.DataFrame, spot: float, cfg: ChainDeltaCon
         delta = black76_delta(F, r.strike, T, iv, cfg.r_free, is_put)
         if delta < cfg.min_abs_delta or delta > 1.0:
             continue
-        rows.append({**r._asdict(), "implied_vol_mkt": iv, "delta_mkt": delta})
+
+        last_trade_date = getattr(r, "last_trade_date", pd.NaT)
+        quote_age_minutes = np.nan
+        if pd.notna(last_trade_date):
+            ltd = pd.Timestamp(last_trade_date)
+            if ltd.tzinfo is None:
+                ltd = ltd.tz_localize("UTC")
+            else:
+                ltd = ltd.tz_convert("UTC")
+            quote_age_minutes = (as_of - ltd).total_seconds() / 60.0
+
+        rows.append({
+            **r._asdict(), "implied_vol_mkt": iv, "delta_mkt": delta,
+            "quote_age_minutes": quote_age_minutes,
+        })
 
     return pd.DataFrame(rows)
 
@@ -188,7 +226,14 @@ def build_symmetric_distance_table(enriched_chain: pd.DataFrame, expiry, spot: f
     passen, siehe dashboard_livechain.py) einnehmen wuerde - direkte
     Umkehrung von analog_matching.target_vol_for_rank(). Werte ausserhalb
     0-100% bedeuten Extrapolation ueber das historische Fenster hinaus
-    (identisch zur Konvention von backtest.FixedRankConfig.target_rank_pct)."""
+    (identisch zur Konvention von backtest.FixedRankConfig.target_rank_pct).
+
+    NEU: quote_age_put_min/quote_age_call_min - Minuten seit dem letzten
+    tatsaechlichen Trade des jeweils gewaehlten Strikes (siehe
+    enrich_chain_with_delta) - reine Diagnose-Spalte, um eine auffaellige
+    Put/Call-Diskrepanz (z.B. Put deutlich teurer als der Abstand zum Call
+    vermuten laesst) von einer schlicht veralteten Einzelquote unterscheiden
+    zu koennen, statt das nur aus dem Preisvergleich zu vermuten."""
     from black76 import forward_price
 
     if distance_targets_pct is None:
@@ -198,6 +243,12 @@ def build_symmetric_distance_table(enriched_chain: pd.DataFrame, expiry, spot: f
     sub = enriched_chain[enriched_chain["expiry"] == expiry]
     calls = sub[sub["option_type"] == "call"]
     puts = sub[sub["option_type"] == "put"]
+
+    def _age(row) -> float | None:
+        if row is None or "quote_age_minutes" not in row.index:
+            return None
+        val = row["quote_age_minutes"]
+        return float(val) if pd.notna(val) else None
 
     rows = []
     for dist_pct in distance_targets_pct:
@@ -233,6 +284,8 @@ def build_symmetric_distance_table(enriched_chain: pd.DataFrame, expiry, spot: f
             "model_delta_call_pct": model_delta_call * 100.0 if model_delta_call is not None else None,
             "iv_pair_pct": iv_pair * 100.0 if iv_pair is not None else None,
             "hv_rank_pct": hv_rank_pct,
+            "quote_age_put_min": _age(put_row),
+            "quote_age_call_min": _age(call_row),
         })
 
     return pd.DataFrame(rows)

@@ -72,6 +72,71 @@ Kennzahlen als zusaetzliche Spalten an. Wichtige Design-Entscheidungen
      raeumt st.session_state NICHT auf, nur weil ein anderer Reiter aktiv
      ist (siehe dashboard.py-Docstring: es rendert zwar nur der aktive
      Modus, aber session_state ist global fuer die gesamte Browser-Sitzung).
+  10. NEU - Staleness-Diagnose je Zeile (Quote-Alter Put/Call): siehe
+      chain_delta.py-Moduldokstring - dort wird bereits `quote_age_minutes`
+      je Einzelserie und `quote_age_put_min`/`quote_age_call_min` je Zeile
+      der Distanz-Tabelle berechnet (Minuten seit dem letzten TATSAECHLICHEN
+      Trade dieses Strikes, bezogen auf den Fetch-Zeitpunkt). Bisher wurde
+      dieser Wert berechnet, aber nirgends angezeigt. Hintergrund: bei einem
+      Abgleich gegen externe Quellen (Barchart, Yahoo-Website) fiel auf,
+      dass einzelne, duenn gehandelte Strikes (v.a. auf der Put-Seite)
+      Bid/Ask-Quoten zeigten, die deutlich (~30%) von unabhaengigen,
+      fast zeitgleich abgerufenen Referenzquellen abwichen, waehrend der
+      Call auf unter 3% Abweichung uebereinstimmte. Der Code selbst
+      (Put/Call-Zuordnung, Strike-Auswahl, Mid-Berechnung) wurde darauf hin
+      geprueft und zeigte KEINEN Zuordnungsfehler - der wahrscheinlichste
+      Grund ist eine schlicht veraltete Einzelquote bei Yahoo (ein Market
+      Maker aktualisiert eine kaum gehandelte Serie seltener, als der
+      Gesamtfeed es suggeriert - "15 Minuten verzoegert" gilt nur pauschal
+      fuer den Feed, nicht pro Strike). Ein hohes Quote-Alter ist KEIN
+      Beweis fuer eine falsche Quote (bei ruhigem Markt bleibt eine Quote
+      laenger gueltig) und ein niedriges Quote-Alter ist KEIN Beweis fuer
+      eine korrekte Quote (der Market Maker kann die Quote seit dem letzten
+      Trade bewegt haben) - es ist trotzdem der beste verfuegbare
+      Anhaltspunkt, um einen Verdacht wie "dieser Preis wirkt zu hoch"
+      objektiv gegenzupruefen statt ihn nur aus dem Preisvergleich selbst zu
+      vermuten. Ab einem Schwellenwert (_QUOTE_AGE_WARNING_MINUTES) wird
+      eine explizite Warnung mit den betroffenen Zeilen angezeigt.
+  11. NEU/KORRIGIERT - 'Preis fuer PF=3' (Punkte): zusaetzliche Spalte in
+      Teil B, die die Frage beantwortet: "Welcher (einheitliche) Preis
+      waere noetig gewesen, damit sich auf dem KOMPLETTEN Analog-Set
+      (Short-Seite), ausgewertet mit den ECHTEN, heute in der Optionskette
+      sichtbaren Strikes dieser Zeile, ein Profit Factor von genau 3
+      ergeben haette?"
+
+      WICHTIGE KORREKTUR gegenueber der ersten Fassung: die erste Version
+      hat die historischen, per-era-spezifischen Modell-Payouts aus
+      evaluate_analog_set() direkt verwendet (entry_premium_i -
+      net_pnl_short_i, dort fuer die Delta-Treffgenauigkeit auf JEDES
+      Analog-Tages EIGENEN Spot-Stand berechnet). Bei einer Analog-Suche
+      ueber die komplette SPX-Historie (moeglich bei ausreichend grosser
+      max_distance) mischt das absolute Punktbetraege aus voellig
+      unterschiedlichen Index-Niveaus (SPX ~5 im Jahr 1932 vs. ~7500 heute)
+      - das gewichtet automatisch die betragsmaessig grossen, MODERNEN
+      Analog-Tage massiv staerker, unabhaengig davon ob sie relativ gesehen
+      ueberhaupt schlechter liefen. Das fuehrte zu einem in der Praxis
+      unplausibel NIEDRIGEN 'Preis fuer PF=3' (dominiert von den vielen,
+      betragsmaessig kleinen alten Analog-Tagen), der der bereits
+      bestehenden 'Profit Factor'-Spalte (die denselben Fehler hatte, siehe
+      analog_matching.summarize_analog_trades()-Korrektur) scheinbar
+      widersprach.
+
+      FIX (siehe _payout_at_todays_scale()): statt der absoluten
+      historischen Kursbewegung wird nur die PROZENTUALE Kursbewegung
+      jedes Analog-Tages (exit_S/entry_S - 1, aus evaluate_analog_set()
+      durchgereicht - siehe Punkt 11 im analog_matching.py-Moduldokstring)
+      auf den HEUTIGEN Spot projiziert, und GEGEN DIE ECHTEN, in der
+      Optionskette sichtbaren Strikes dieser Zeile (nicht die historischen
+      Modell-Strikes) ausgewertet. Damit sind alle Analog-Tage auf EINER
+      konsistenten, heutigen Skala, und das Ergebnis ist direkt mit dem am
+      Markt verfuegbaren Preis ('Entry-Praemie heute (Pkt)') vergleichbar:
+      liegt dieser darueber, waere der historische PF (bei angenommen
+      gleichartigen prozentualen Kursbewegungen) > 3 gewesen, liegt er
+      darunter, entsprechend < 3. Rein historische Ruecksimulation auf dem
+      gefundenen Analog-Set (siehe alle Vorbehalte zu Clustering/
+      Newey-West-Lag in den bisherigen Analysen), keine Zukunftsgarantie,
+      und bewertet - wie 'Erw. Gewinn Short' - ausschliesslich die
+      Short-Seite.
 """
 import sys
 from datetime import date
@@ -93,6 +158,103 @@ from analog_matching import (
 )
 from features import FeatureConfig, build_feature_matrix
 from dashboard_common import load_training_table
+
+# Schwellenwert (Minuten) fuer die Quote-Alter-Warnung in Teil A - bewusst
+# als Modul-Konstante statt Sidebar-Eingabe, um die Sidebar nicht mit einem
+# weiteren, selten geaenderten Parameter zu ueberladen. Bei Bedarf hier
+# anpassen (siehe Moduldokstring Punkt 10).
+_QUOTE_AGE_WARNING_MINUTES = 60.0
+
+
+def _required_premium_for_profit_factor(payout: np.ndarray, target_pf: float = 3.0,
+                                         max_iter: int = 60) -> float | None:
+    """Bisektion (siehe Moduldokstring Punkt 11): gesuchter EINHEITLICHER
+    Entry-Preis x, bei dem sich - gegen die uebergebenen Payouts - ein
+    Profit Factor von genau target_pf ergeben wuerde.
+
+    PF(x) = GrossProfit(x) / GrossLoss(x) mit net_pnl_i(x) = x - payout_i
+    ist monoton nicht-fallend in x (mit steigendem x werden mehr Tage zu
+    Gewinnern, und die Gewinnmargen wachsen, waehrend Verlustmargen
+    schrumpfen) - deshalb Bisektion statt eines Gradientenverfahrens,
+    robuster gegen die stueckweise-lineare, an den payout_i-Werten
+    geknickte Struktur von PF(x).
+
+    WICHTIG: `payout` muss bereits auf EINE konsistente Skala gebracht sein
+    (siehe _payout_at_todays_scale() - NICHT direkt die rohen, ueber
+    Jahrzehnte unterschiedlicher Index-Niveaus gemischten
+    entry_premium_i/net_pnl_i-Werte aus evaluate_analog_set() verwenden,
+    siehe Moduldokstring Punkt 11 fuer die Begruendung).
+
+    Sonderfall: sind ALLE Payouts 0 (Struktur ist auf dem kompletten
+    Analog-Set nie ins Geld gelaufen), ist JEDER Preis >= 0 bereits
+    verlustfrei (PF technisch nicht definiert/unendlich) - dann wird 0.0
+    zurueckgegeben ('jeder Preis reicht bereits'). Gibt None zurueck, falls
+    die obere Bisektions-Grenze (numerisch) nicht ausreicht (praktisch so
+    gut wie nie, da PF(x)->unendlich fuer x->unendlich)."""
+    payout = np.asarray(payout, dtype=float)
+    payout = payout[~np.isnan(payout)]
+    if len(payout) == 0:
+        return None
+    if not np.any(payout > 0.0):
+        return 0.0
+
+    def pf_at(x: float) -> float:
+        net = x - payout
+        gross_profit = net[net >= 0.0].sum()
+        gross_loss = -net[net < 0.0].sum()
+        if gross_loss <= 0.0:
+            return np.inf
+        return gross_profit / gross_loss
+
+    lo, hi = 0.0, float(payout.max()) * 10.0 + 1.0
+    if pf_at(hi) < target_pf:
+        return None
+
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2.0
+        if pf_at(mid) < target_pf:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+def _payout_at_todays_scale(entry_S: np.ndarray, exit_S: np.ndarray, spot_today: float,
+                             strike_put: float, strike_call: float) -> np.ndarray:
+    """KORREKTUR (siehe Moduldokstring Punkt 11): loest das Skalenproblem
+    einer Analog-Suche, die - bei ausreichend grosser max_distance - die
+    KOMPLETTE SPX-Historie seit 1927 umfassen kann. Der Index stand dort bei
+    voellig unterschiedlichen absoluten Niveaus (z.B. ~5 Punkte 1932 vs.
+    ~7500 Punkte heute) - eine direkte Verwendung der historischen,
+    per-era-spezifischen Modell-Strikes/Payouts (aus evaluate_analog_set(),
+    dort fuer die Delta-Treffgenauigkeit auf JEDES Analog-Tages EIGENEN
+    Spot-Stand berechnet) wuerde bei einer Preis-Schwellenwert-Berechnung
+    wie hier automatisch die betragsmaessig grossen, MODERNEN Analog-Tage
+    massiv staerker gewichten als alte - unabhaengig davon, ob sie relativ
+    gesehen ueberhaupt schlechter liefen (das genau war der Fehler in der
+    ersten Version dieser Funktion).
+
+    Fix: statt der historischen absoluten Kursbewegung wird nur die
+    PROZENTUALE Kursbewegung jedes Analog-Tages uebernommen
+    (exit_S/entry_S - 1) und auf den HEUTIGEN Spot projiziert - das ergibt
+    einen hypothetischen 'heutigen' Exit-Spot je Analog-Tag, alle auf
+    EXAKT DERSELBEN (heutigen) Skala. Ausgewertet wird dagegen mit den
+    ECHTEN, in der Optionskette sichtbaren Strikes (strike_put/strike_call
+    aus Teil A) - NICHT mit den historischen, per-era-spezifischen
+    Modell-Strikes aus evaluate_analog_set(). Ergebnis: ein Payout je
+    Analog-Tag, alle in HEUTIGEN Punkten, direkt vergleichbar mit dem
+    HEUTE am Markt verfuegbaren Preis (Mid Put + Mid Call)."""
+    entry_S = np.asarray(entry_S, dtype=float)
+    exit_S = np.asarray(exit_S, dtype=float)
+    mask = (entry_S > 0.0) & ~np.isnan(entry_S) & ~np.isnan(exit_S)
+    entry_S, exit_S = entry_S[mask], exit_S[mask]
+    if len(entry_S) == 0:
+        return np.array([])
+
+    pct_return = exit_S / entry_S - 1.0
+    hyp_exit_spot = spot_today * (1.0 + pct_return)
+    payout = np.maximum(strike_put - hyp_exit_spot, 0.0) + np.maximum(hyp_exit_spot - strike_call, 0.0)
+    return payout
 
 
 def _build_daily_df_with_today(daily_df: pd.DataFrame):
@@ -128,7 +290,8 @@ def _build_daily_df_with_today(daily_df: pd.DataFrame):
 def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
                       chosen_dte_exact: float, r_free: float, dividend_yield: float,
                       hv_length: int, rank_lookback: int,
-                      analog_max_distance: float, analog_min_gap: int) -> pd.DataFrame | None:
+                      analog_max_distance: float, analog_min_gap: int,
+                      spot_today: float) -> pd.DataFrame | None:
     """Fuehrt den Analog-Tage-Lauf fuer JEDE Zeile von 'table' aus (siehe
     Moduldokstring Punkt 1-8). Gibt None zurueck (mit st.error) bei
     Abbruch, sonst ein DataFrame mit einer Zeile je distance_pct."""
@@ -224,6 +387,7 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
                 "distance_pct": row.distance_pct, "analog_n": None,
                 "entry_premium_today": entry_premium_today,
                 "expected_profit_short": None,
+                "required_premium_pf3": None,
             })
             continue
 
@@ -247,6 +411,7 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
                 "distance_pct": row.distance_pct, "analog_n": None,
                 "entry_premium_today": entry_premium_today,
                 "expected_profit_short": None,
+                "required_premium_pf3": None,
             })
             continue
 
@@ -255,6 +420,7 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
                 "distance_pct": row.distance_pct, "analog_n": 0,
                 "entry_premium_today": entry_premium_today,
                 "expected_profit_short": None,
+                "required_premium_pf3": None,
             })
             continue
 
@@ -288,6 +454,18 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
             avg_pnl_norm_frac = trade_summary["avg_pnl_norm_pct"] / 100.0
             expected_profit_short = avg_pnl_norm_frac * entry_premium_today
 
+        # NEU (siehe Moduldokstring Punkt 11): historische PROZENTUALE
+        # Kursbewegungen (nicht absolute Punkte!) jedes Analog-Tages auf
+        # den HEUTIGEN Spot projizieren und gegen die ECHTEN, heute in der
+        # Optionskette sichtbaren Strikes auswerten - das vermeidet die
+        # Skalenverzerrung durch stark unterschiedliche historische
+        # Index-Niveaus (siehe _payout_at_todays_scale()-Docstring).
+        payout = _payout_at_todays_scale(
+            full_eval["entry_S"].to_numpy(), full_eval["exit_S"].to_numpy(),
+            spot_today, float(row.strike_put), float(row.strike_call),
+        )
+        required_premium_pf3 = _required_premium_for_profit_factor(payout, target_pf=3.0)
+
         results.append({
             "distance_pct": row.distance_pct,
             "analog_n": trade_summary["n_trades"],
@@ -296,6 +474,7 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
             "avg_pnl_norm_pct": trade_summary["avg_pnl_norm_pct"],
             "entry_premium_today": entry_premium_today,
             "expected_profit_short": expected_profit_short,
+            "required_premium_pf3": required_premium_pf3,
             "tstat_full": rel_full["tstat"],
             "ci_excludes_zero_full": rel_full["ci_excludes_zero"],
             "subperiod_matching": rel_full["subperiod_matching"],
@@ -372,12 +551,23 @@ def render(df, daily_df, has_resolution) -> None:
     if reload_chain or needs_initial_load:
         with st.spinner("Lade heutige Kette und berechne Delta/IV je Serie..."):
             try:
+                # NEU (Staleness-Diagnose, siehe Moduldokstring Punkt 10):
+                # Fetch-Zeitpunkt EXPLIZIT festhalten und als `as_of` an
+                # enrich_chain_with_delta() durchreichen, statt den
+                # dortigen Default (pd.Timestamp.now() beim Funktionsaufruf)
+                # implizit zu nutzen - so bleibt der Referenzzeitpunkt fuer
+                # 'quote_age_minutes' konsistent mit dem, was wir dem Nutzer
+                # als 'Kette abgerufen um...' anzeigen, auch wenn der
+                # Streamlit-Rerun-Zyklus zwischen Fetch und Anzeige etwas
+                # Zeit vergehen laesst.
+                fetch_ts = pd.Timestamp.now(tz="UTC")
                 spot = fetch_today_spot()
                 chain = fetch_today_chain(min_dte=float(min_dte), max_dte=float(max_dte))
                 enriched = enrich_chain_with_delta(
                     chain, spot,
                     ChainDeltaConfig(min_abs_delta=float(min_abs_delta),
                                       r_free=float(r_free), dividend_yield=float(dividend_yield)),
+                    as_of=fetch_ts,
                 )
             except Exception as e:
                 st.error(f"Laden fehlgeschlagen: {e}")
@@ -392,6 +582,7 @@ def render(df, daily_df, has_resolution) -> None:
                 st.session_state["livechain_r_free"] = float(r_free)
                 st.session_state["livechain_dividend_yield"] = float(dividend_yield)
                 st.session_state["livechain_rank_lookback"] = int(rank_lookback)
+                st.session_state["livechain_fetch_ts"] = fetch_ts
 
     if "livechain_enriched" not in st.session_state:
         st.info("Kette konnte noch nicht geladen werden - siehe Fehlermeldung oben.")
@@ -402,7 +593,13 @@ def render(df, daily_df, has_resolution) -> None:
     r_free = st.session_state["livechain_r_free"]
     dividend_yield = st.session_state["livechain_dividend_yield"]
     rank_lookback = st.session_state["livechain_rank_lookback"]
+    fetch_ts = st.session_state.get("livechain_fetch_ts")
     st.metric("Aktueller Spot (SPX)", f"{spot:,.2f}")
+    if fetch_ts is not None:
+        st.caption(
+            f"Kette abgerufen um {fetch_ts.tz_convert('America/New_York').strftime('%Y-%m-%d %H:%M:%S')} ET "
+            "- Referenzzeitpunkt fuer die 'Quote-Alter'-Spalten weiter unten."
+        )
 
     if enriched.empty:
         st.warning(
@@ -506,6 +703,30 @@ def render(df, daily_df, has_resolution) -> None:
             "|Delta|'-Filter in der Sidebar - dort verkleinern, um weiter OTM zu kommen."
         )
 
+    # NEU (siehe Moduldokstring Punkt 10): Quote-Alter-Warnung - unabhaengig
+    # vom Randbereich-Hinweis oben, da Staleness auch mitten in der Kette
+    # (nicht nur am Rand) auftreten kann, wie der Put/Call-Vergleich gegen
+    # externe Quellen gezeigt hat.
+    stale_mask = (
+        table["quote_age_put_min"].fillna(0) > _QUOTE_AGE_WARNING_MINUTES
+    ) | (
+        table["quote_age_call_min"].fillna(0) > _QUOTE_AGE_WARNING_MINUTES
+    )
+    if stale_mask.any():
+        stale_rows = table.loc[stale_mask, "distance_pct"].tolist()
+        preview = ", ".join(f"{d:g}%" for d in stale_rows[:10])
+        more = f" (+{len(stale_rows) - 10} weitere)" if len(stale_rows) > 10 else ""
+        st.warning(
+            f"⚠️ Veraltete Einzelquote(n) vermutet: bei {len(stale_rows)} Zeile(n) "
+            f"({preview}{more}) liegt der letzte tatsaechliche Trade von Put oder "
+            f"Call laenger als {_QUOTE_AGE_WARNING_MINUTES:g} Minuten zurueck (siehe "
+            "Spalten 'Quote-Alter Put/Call (Min.)' unten). Das ist KEIN Beweis fuer "
+            "eine falsche Quote (bei ruhigem Markt bleibt eine Quote laenger gueltig), "
+            "aber ein Hinweis, IV/Preis fuer diese Zeilen nicht ungeprueft zu "
+            "uebernehmen - insbesondere wenn Put und Call fuer denselben Abstand "
+            "deutlich unterschiedliche IV zeigen (siehe Moduldokstring Punkt 10)."
+        )
+
     show = table.rename(columns={
         "distance_pct": "Ziel-Abstand % v. Spot",
         "model_delta_put_pct": "Δ Put % (Modell, flache HV)",
@@ -516,6 +737,7 @@ def render(df, daily_df, has_resolution) -> None:
         "mid_put": "Mid Put", "mid_call": "Mid Call",
         "iv_put_pct": "IV Put % (echt)", "iv_call_pct": "IV Call % (echt)",
         "delta_put_pct": "Δ Put % (echt)", "delta_call_pct": "Δ Call % (echt)",
+        "quote_age_put_min": "Quote-Alter Put (Min.)", "quote_age_call_min": "Quote-Alter Call (Min.)",
     })[[
         "Ziel-Abstand % v. Spot",
         "Δ Put % (Modell, flache HV)", "Δ Call % (Modell, flache HV)",
@@ -524,6 +746,7 @@ def render(df, daily_df, has_resolution) -> None:
         "Mid Put", "Mid Call",
         "IV Put % (echt)", "IV Call % (echt)",
         "Δ Put % (echt)", "Δ Call % (echt)",
+        "Quote-Alter Put (Min.)", "Quote-Alter Call (Min.)",
     ]]
     st.caption(
         "'Ziel-Δ' ist die Suchvorgabe (Zeilenlabel). 'Δ Put/Call (echt)' sind die "
@@ -532,7 +755,11 @@ def render(df, daily_df, has_resolution) -> None:
         "da nur reale (diskrete) Strikes existieren. 'IV Kombi' = die EINE Vola, "
         "die - in Black-76 fuer Put+Call GEMEINSAM eingesetzt - exakt die Summe "
         "beider echter Mid-Preise reproduziert (kein Mittelwert der Einzel-IVs). "
-        "'HV-Rang' = wo diese Kombi-IV im HV-Min/Max-Fenster oben liegt."
+        "'HV-Rang' = wo diese Kombi-IV im HV-Min/Max-Fenster oben liegt. "
+        "'Quote-Alter' = Minuten seit dem letzten TATSAECHLICHEN Trade dieses "
+        "Strikes, bezogen auf den Fetch-Zeitpunkt oben (Naeherungswert fuer "
+        "Staleness, siehe Warnung oben und Moduldokstring Punkt 10 - kein "
+        "direkter Bid/Ask-Zeitstempel verfuegbar)."
     )
     st.dataframe(
         show.style.format({
@@ -543,6 +770,7 @@ def render(df, daily_df, has_resolution) -> None:
             "Δ Put % (echt)": "{:.2f}", "Δ Call % (echt)": "{:.2f}",
             "Δ Put % (Modell, flache HV)": "{:.2f}", "Δ Call % (Modell, flache HV)": "{:.2f}",
             "IV Kombi % (Markt, Paket-Solve)": "{:.2f}", "HV-Rang % (dieser Kombi)": "{:.1f}",
+            "Quote-Alter Put (Min.)": "{:.0f}", "Quote-Alter Call (Min.)": "{:.0f}",
         }, na_rep="n/a"),
         use_container_width=True, hide_index=True,
     )
@@ -557,8 +785,12 @@ def render(df, daily_df, has_resolution) -> None:
     with st.expander("Rohdaten dieser Expiry (alle Serien nach Delta-Filter)"):
         st.dataframe(
             enriched[enriched["expiry"] == chosen_expiry][
-                ["strike", "option_type", "bid", "ask", "mid", "implied_vol_mkt", "delta_mkt"]
-            ].sort_values(["option_type", "strike"]),
+                ["strike", "option_type", "bid", "ask", "mid", "implied_vol_mkt", "delta_mkt",
+                 "last_trade_date", "quote_age_minutes"]
+            ].rename(columns={
+                "last_trade_date": "Letzter Trade (yfinance)",
+                "quote_age_minutes": "Quote-Alter (Min.)",
+            }).sort_values(["option_type", "strike"]),
             use_container_width=True, hide_index=True,
         )
 
@@ -597,6 +829,7 @@ def render(df, daily_df, has_resolution) -> None:
         analog_results = _run_bulk_analog(
             table, daily_df, chosen_dte_exact, r_free, dividend_yield,
             hv_length, int(rank_lookback), float(analog_max_distance), int(analog_min_gap),
+            spot,
         )
         if analog_results is not None:
             st.session_state["livechain_analog_results"] = analog_results
@@ -614,6 +847,7 @@ def render(df, daily_df, has_resolution) -> None:
             "avg_pnl_norm_pct": "Ø norm. P&L %",
             "entry_premium_today": "Entry-Prämie heute (Pkt)",
             "expected_profit_short": "Erw. Gewinn Short (Pkt)",
+            "required_premium_pf3": "Preis für PF=3 (Pkt)",
             "tstat_full": "t-Stat (gesamt)",
             "ci_excludes_zero_full": "CI ≠ 0 (gesamt)",
             "subperiod_matching": "Perioden-Match",
@@ -623,7 +857,7 @@ def render(df, daily_df, has_resolution) -> None:
         })[[
             "Ziel-Abstand % v. Spot", "Analog-Trades (n)", "Gewinnrate %", "Profit Factor",
             "Ø norm. P&L %", "Entry-Prämie heute (Pkt)",
-            "Erw. Gewinn Short (Pkt)",
+            "Erw. Gewinn Short (Pkt)", "Preis für PF=3 (Pkt)",
             "t-Stat (gesamt)", "CI ≠ 0 (gesamt)",
             "Perioden-Match", "Perioden gesamt", "t-Stat (Val)", "Robust (Train+Val)",
         ]]
@@ -633,7 +867,13 @@ def render(df, daily_df, has_resolution) -> None:
             f"(gerundet von {chosen_dte_exact:.2f} Tagen Restlaufzeit) · "
             f"{int(stored['n_analogs_total'].iloc[0]) if len(stored) else 0} Analog-Tage gefunden. "
             "'Robust (Train+Val)' = Konfidenzintervall schliesst 0 aus UND gleiches "
-            "positives Vorzeichen in BEIDEN chronologischen Haelften des Analog-Sets."
+            "positives Vorzeichen in BEIDEN chronologischen Haelften des Analog-Sets. "
+            "'Preis für PF=3' = welcher (einheitliche) Entry-Preis auf dem KOMPLETTEN "
+            "Analog-Set (Short-Seite, gegen die dort tatsaechlich angefallenen "
+            "historischen Payouts) einen Profit Factor von genau 3 ergeben haette - "
+            "liegt 'Entry-Prämie heute' darueber, waere der historische PF > 3 gewesen, "
+            "liegt sie darunter, entsprechend < 3 (siehe Moduldokstring Punkt 11; rein "
+            "historische Ruecksimulation, keine Zukunftsgarantie)."
         )
         st.dataframe(
             show2.style.format({
@@ -644,6 +884,7 @@ def render(df, daily_df, has_resolution) -> None:
                 "Ø norm. P&L %": "{:+.2f}",
                 "Entry-Prämie heute (Pkt)": "{:.2f}",
                 "Erw. Gewinn Short (Pkt)": "{:+.2f}",
+                "Preis für PF=3 (Pkt)": "{:.2f}",
                 "t-Stat (gesamt)": "{:.2f}",
                 "Perioden-Match": "{:.0f}",
                 "Perioden gesamt": "{:.0f}",

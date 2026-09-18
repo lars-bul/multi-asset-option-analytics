@@ -120,6 +120,26 @@ Dashboard - siehe Kommentare an den jeweiligen Stellen fuer Details):
      Newey-West-Kennzahlen aus reliability_summary(), aber keine der
      "einfachen" Handelskennzahlen).
 
+     KORREKTUR (siehe Diskussion "dashboard_livechain.py Profit Factor
+     ergibt widerspruechliche Preis-Schwelle"): 'profit_factor' summierte
+     urspruenglich net_pnl_{side} - ABSOLUTE Punktbetraege - ueber alle
+     Analog-Tage. Bei einer Analog-Suche mit grosser max_distance (siehe
+     AnalogConfig) koennen die gefundenen Analog-Tage die GESAMTE
+     SPX-Historie seit 1927 umfassen - der Index stand dort bei voellig
+     unterschiedlichen absoluten Niveaus (z.B. ~5 Punkte 1932 vs. ~7500
+     Punkte heute). Eine Summe absoluter Punktbetraege UEBER diese Aeren
+     hinweg gewichtet automatisch die betragsmaessig grossen, MODERNEN Tage
+     massiv staerker als alte Tage - unabhaengig davon, ob diese relativ
+     gesehen ueberhaupt schlechter liefen. 'profit_factor' wird daher jetzt
+     aus pnl_norm_{side} (auf die jeweilige TAGESEIGENE Entry-Praemie
+     normierte Rendite, bereits an anderer Stelle im Modul fuer genau diesen
+     Zweck verwendet) statt aus net_pnl_{side} berechnet - jeder Analog-Tag
+     zaehlt dadurch mit GLEICHEM Gewicht, unabhaengig vom Index-Niveau
+     seiner Aera. 'avg_pnl'/'best_trade'/'worst_trade' bleiben bewusst in
+     absoluten Punkten (fuer die Einordnung einzelner Trades sinnvoll),
+     nur 'profit_factor' - eine aggregierte Kennzahl UEBER alle Analog-Tage
+     hinweg - wechselt auf die normierte Basis.
+
   8) NEU (Vereinfachung nach Nutzer-Feedback) - recommend_for_today() nutzt
      jetzt AUSSCHLIESSLICH den rang-basierten Modus (vol_mode="rank") und
      erwartet dafuer direkt einen vom Nutzer eingegebenen Ziel-HV-Rang
@@ -173,6 +193,17 @@ Dashboard - siehe Kommentare an den jeweiligen Stellen fuer Details):
       identisch zur sonst im Modul verwendeten Konvention (Put-Deltas
       werden ebenfalls als positive Zahlen wie 0.10, 0.16 angegeben, nicht
       mit oekonomischem Vorzeichen).
+
+  11) NEU - entry_S/exit_S im Ergebnis von evaluate_analog_set(): fuer die
+      "Preis fuer Profit Factor X"-Kennzahl in dashboard_livechain.py wird
+      die TATSAECHLICHE prozentuale Kursbewegung jedes Analog-Tages
+      benoetigt (nicht nur der bereits vorhandene, modellierte pnl_norm bei
+      einem PER-ERA-spezifischen Strike) - siehe dort fuer die Begruendung,
+      warum eine Skalen-konsistente Umrechnung auf den HEUTIGEN Spot noetig
+      ist. evaluate_analog_set() reicht entry_S/exit_S daher jetzt einfach
+      aus der ohnehin bereits nachgeschlagenen training_table-Zeile durch,
+      statt sie zu verwerfen - keine Verhaltensaenderung fuer bestehende
+      Aufrufer, die diese Spalten ignorieren.
 """
 
 from __future__ import annotations
@@ -550,7 +581,14 @@ def evaluate_analog_set(analogs: pd.DataFrame, training_table: pd.DataFrame, bou
     Reihenfolge waere die spaeter in reliability_summary() aufgerufene
     Newey-West-Korrektur wirkungslos (siehe Beleg im Moduldokstring: bei
     einer getesteten Konfiguration kippte dadurch nachweislich die
-    Signifikanz-Aussage)."""
+    Signifikanz-Aussage).
+
+    NEU (siehe Punkt 11 im Moduldokstring): entry_S/exit_S werden jetzt mit
+    ins Ergebnis durchgereicht (waren schon in `trow` vorhanden, wurden aber
+    bisher nicht in die Ausgabe uebernommen) - fuer Kennzahlen, die die
+    TATSAECHLICHE prozentuale Kursbewegung eines Analog-Tages brauchen,
+    unabhaengig vom hier verwendeten, per-era-spezifischen Modell-Strike
+    (siehe dashboard_livechain.py, 'Preis fuer Profit Factor X')."""
     if vol_mode not in ("direct", "rank"):
         raise ValueError(f"Unbekannter vol_mode={vol_mode!r} - erwartet 'direct' oder 'rank'.")
     if vol_mode == "direct" and (today_iv is None or np.isnan(today_iv) or today_iv <= 0.0):
@@ -595,7 +633,9 @@ def evaluate_analog_set(analogs: pd.DataFrame, training_table: pd.DataFrame, bou
         hold_days = (trow["exit_date"] - d).days
         rows.append({
             "entry_date": d, "hold_days": hold_days, "distance": arow["distance"],
-            "target_vol": target_vol, **result,
+            "target_vol": target_vol,
+            "entry_S": trow["entry_S"], "exit_S": trow["exit_S"],
+            **result,
         })
 
     out = pd.DataFrame(rows)
@@ -611,6 +651,19 @@ def summarize_analog_trades(evaluated: pd.DataFrame, side: str) -> dict:
     Trade), hier fuer das evaluate_analog_set()-Ergebnis EINER
     Delta-Kombination, side='short' oder 'long'.
 
+    KORREKTUR (siehe Punkt 7 im Moduldokstring): 'profit_factor' wird jetzt
+    aus pnl_norm_{side} (normierte Rendite je Analog-Tag) statt aus
+    net_pnl_{side} (absolute Punkte) berechnet. Grund: bei einer Analog-Suche
+    ueber die gesamte SPX-Historie hinweg (moegliche Spanne 1927 bis heute)
+    stehen absolute Punktbetraege auf VOELLIG unterschiedlichen Index-
+    Niveaus (SPX ~5 im Jahr 1932 vs. ~7500 heute) - eine Summe absoluter
+    Punkte ueber diese Aeren gewichtet automatisch die betragsmaessig
+    grossen, MODERNEN Tage massiv staerker, unabhaengig davon ob sie relativ
+    gesehen ueberhaupt schlechter liefen. Mit pnl_norm (auf die jeweilige
+    TAGESEIGENE Entry-Praemie normiert) zaehlt jeder Analog-Tag mit
+    gleichem Gewicht - konsistent mit 'avg_pnl_norm_pct', das im Modul
+    bereits genau aus diesem Grund verwendet wird.
+
     BEWUSST NICHT ENTHALTEN (anders als beim Ladder-Backtest): 'touch_rate'
     (kein Stop-Loss/Touch-Tracking - der Analog-Strangle wird wie das
     Referenzinstrument in labels.py immer bis Verfall gehalten),
@@ -625,8 +678,8 @@ def summarize_analog_trades(evaluated: pd.DataFrame, side: str) -> dict:
     net_col, norm_col = f"net_pnl_{side}", f"pnl_norm_{side}"
     n_total = len(evaluated)
     n_wins = int((evaluated[net_col] >= 0).sum())
-    gross_profit = evaluated.loc[evaluated[net_col] >= 0, net_col].sum()
-    gross_loss = -evaluated.loc[evaluated[net_col] < 0, net_col].sum()
+    gross_profit_norm = evaluated.loc[evaluated[norm_col] >= 0, norm_col].sum()
+    gross_loss_norm = -evaluated.loc[evaluated[norm_col] < 0, norm_col].sum()
 
     return {
         "n_trades": n_total,
@@ -634,7 +687,7 @@ def summarize_analog_trades(evaluated: pd.DataFrame, side: str) -> dict:
         "net_pnl_sum": evaluated[net_col].sum(),
         "avg_pnl": evaluated[net_col].mean(),
         "avg_pnl_norm_pct": evaluated[norm_col].mean() * 100.0,
-        "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else np.nan,
+        "profit_factor": (gross_profit_norm / gross_loss_norm) if gross_loss_norm > 0 else np.nan,
         "best_trade": evaluated[net_col].max(),
         "worst_trade": evaluated[net_col].min(),
     }

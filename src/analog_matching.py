@@ -204,6 +204,53 @@ Dashboard - siehe Kommentare an den jeweiligen Stellen fuer Details):
       aus der ohnehin bereits nachgeschlagenen training_table-Zeile durch,
       statt sie zu verwerfen - keine Verhaltensaenderung fuer bestehende
       Aufrufer, die diese Spalten ignorieren.
+
+  12) NEU - Kontinuierliche Kernel-Gewichtung statt hartem Cutoff (OPT-IN
+      ueber AnalogConfig.use_kernel_weighting, Default AUS): der bisherige
+      harte Filter `dist <= max_distance` in find_analogs() hat zwei
+      Probleme gezeigt. Erstens ist das Ergebnis unstetig - ein Tag knapp
+      innerhalb vs. knapp ausserhalb der Schwelle wird komplett
+      unterschiedlich behandelt (volles Gewicht vs. gar keins), obwohl beide
+      nahezu gleich aehnlich sind. Zweitens - und das war der konkrete
+      Ausloeser - kann in Marktphasen, die im Aehnlichkeits-Raum sehr
+      ungewoehnlich liegen (z.B. scharfe Krisen ohne nahe historische
+      Entsprechung), das Ergebnis KOMPLETT LEER sein: kein einziger
+      Kandidat lag innerhalb max_distance, find_analogs() warf eine
+      ValueError, und in dashboard_livechain.py fuehrte das zum Abbruch des
+      GESAMTEN Bulk-Laufs (keine Tabelle wurde angezeigt) statt nur zu
+      wenigen/unsicheren Zeilen.
+
+      Fix: bei use_kernel_weighting=True bekommt jeder Kandidat statt einer
+      Ja/Nein-Mitgliedschaft ein STETIGES Gewicht
+      `weight = exp(-(distance/bandwidth)**2)` (Gaussian-Kernel,
+      `bandwidth` = sigma, Default max_distance/2). Zusaetzlich garantiert
+      `min_candidates` (Default 20), dass IMMER mindestens so viele der
+      naechstgelegenen Tage aufgenommen werden - unabhaengig davon, wie
+      gross ihre Distanz oder wie klein ihr Kernel-Gewicht ist. Dadurch
+      liefert find_analogs() in einer Krisenphase mit nur wenigen/weit
+      entfernten Vergleichstagen weiterhin ein nicht-leeres Ergebnis (die
+      Tabelle laedt), nur eben mit sehr KLEINEN Gewichten - was sich in der
+      "effektiven Stichprobengroesse" (siehe effective_sample_size(), Kish's
+      Formel n_eff = (Σw)²/Σw²) unmittelbar niederschlaegt: n_eff faellt in
+      diesem Fall auf sehr kleine Werte (ggf. nahe 0-1), macht also
+      transparent, dass kaum echte Vergleichsinformation vorhanden ist,
+      statt einfach gar nichts anzuzeigen. Ein echter Abbruch (ValueError)
+      bleibt nur fuer den Fall bestehen, dass VOR dem Query-Tag ueberhaupt
+      keine Handelstage mit min_gap_days Abstand existieren (reines
+      Datenproblem, keine Distanzfrage).
+
+      summarize_analog_trades_weighted()/weighted_reliability_summary()
+      sind die gewichteten Pendants zu summarize_analog_trades()/
+      _reliability_for_side() - sie nutzen die 'weight'-Spalte, die
+      evaluate_analog_set() jetzt (unabhaengig vom Modus) durchreicht.
+
+      BEWUSST NICHT global aktiviert: use_kernel_weighting=False bleibt der
+      Default, damit Modus 2 (dashboard_analog.py, mit seiner eigenen
+      Distanz-Kalibrierungs-Vorschau/Perzentilen und dem Train/Val-Split um
+      eine harte Schwelle herum gebaut) unveraendert funktioniert. Aktiviert
+      wird die Kernel-Gewichtung gezielt in dashboard_livechain.py (Analog-
+      Tage-Simulation je Zeile), wo die alte harte Schwelle das beschriebene
+      Totalausfall-Problem verursacht hat.
 """
 
 from __future__ import annotations
@@ -320,28 +367,70 @@ def transform_query(space: SimilaritySpace, feature_row: pd.Series) -> np.ndarra
 
 @dataclass
 class AnalogConfig:
-    max_distance: float = 3.0   # Alle Kandidaten-Tage MIT DISTANZ <= max_distance werden
-                                 # verwendet, unabhaengig von ihrer Anzahl (ersetzt die
-                                 # fruehere feste Anzahl k der naechsten Tage - siehe Punkt 9
-                                 # im Moduldokstring). Skala haengt vom gewhitenten PCA-Raum
-                                 # ab (siehe SimilaritySpaceConfig) - zur Kalibrierung siehe
-                                 # analog_distance_distribution().
+    max_distance: float = 3.0   # Bei use_kernel_weighting=False (Default): harte Schwelle wie
+                                 # bisher - ALLE Kandidaten-Tage mit Distanz <= max_distance
+                                 # werden mit Gewicht 1 verwendet, alle anderen komplett
+                                 # ausgeschlossen (siehe Punkt 9 im Moduldokstring).
+                                 # Bei use_kernel_weighting=True: dient nur noch als EIN
+                                 # zusaetzliches (grosszuegiges) Aufnahmekriterium neben dem
+                                 # Kernel-Gewicht/der min_candidates-Garantie, siehe Punkt 12.
     min_gap_days: int = 5       # Mindestabstand in HANDELSTAGEN zum Query-Tag (siehe KORREKTUR 2)
+
+    # ── NEU (siehe Punkt 12 im Moduldokstring) - kontinuierliche Gewichtung ──
+    use_kernel_weighting: bool = False   # False = bisheriges Verhalten (harter Cutoff,
+                                          # unveraendert fuer Modus 2/dashboard_analog.py).
+                                          # True = Gaussian-Kernel-Gewichtung statt Ja/Nein
+                                          # (aktiviert in dashboard_livechain.py).
+    bandwidth: float | None = None       # sigma des Gaussian-Kernels (nur bei
+                                          # use_kernel_weighting=True). None -> max_distance/2
+                                          # als sinnvoller Default: bei dist=max_distance ist das
+                                          # Gewicht dann noch exp(-4)=1.8% - naeherungsweise der
+                                          # alte Rand der harten Schwelle.
+    min_weight: float = 1e-4             # Kandidaten mit Kernel-Gewicht darunter werden NICHT
+                                          # automatisch ueber das Gewicht aufgenommen (koennen aber
+                                          # trotzdem ueber min_candidates/max_distance mit
+                                          # aufgenommen werden) - reine Truncation des Kernel-
+                                          # Auslaeufers, kein Aehnlichkeits-Urteil.
+    min_candidates: int = 20             # GARANTIE gegen Krisenphasen-Totalausfall (siehe Punkt 12):
+                                          # mindestens so viele der naechstgelegenen Kandidaten
+                                          # werden IMMER aufgenommen, unabhaengig von Distanz/Gewicht -
+                                          # verhindert, dass eine ungewoehnliche Marktphase (kein
+                                          # nahes historisches Pendant) zu einem leeren Ergebnis und
+                                          # damit zu einer nicht ladenden Tabelle fuehrt.
 
 
 def find_analogs(query_date: pd.Timestamp, query_score: np.ndarray, space: SimilaritySpace,
                   cfg: AnalogConfig | None = None) -> pd.DataFrame:
-    """Findet ALLE Handelstage mit Distanz <= cfg.max_distance zu query_score
-    (euklidische Distanz im gewhitenten PCA-Raum), beschraenkt auf Kandidaten
-    VOR query_date (Kausalitaet - siehe Modul-Docstring).
+    """Findet Handelstage im Aehnlichkeits-Raum zu query_score (euklidische
+    Distanz im gewhitenten PCA-Raum), beschraenkt auf Kandidaten VOR
+    query_date (Kausalitaet - siehe Modul-Docstring).
 
-    GEAENDERT (siehe Punkt 9 im Moduldokstring): frueher wurden die cfg.k
-    NAEHESTEN Tage verwendet (feste Anzahl, variable Distanz). Jetzt gilt es
-    umgekehrt: eine feste Distanz-Schwelle, variable (und a priori unbekannte)
-    Anzahl an Tagen. Das bedeutet auch, dass n_analogs stark schwanken kann -
-    je nachdem, wie 'ungewoehnlich' der Query-Tag im Aehnlichkeits-Raum liegt
-    (siehe analog_clustering_diagnostic() und die Warnung im Dashboard bei
-    sehr wenigen gefundenen Tagen).
+    ZWEI MODI (siehe Punkt 12 im Moduldokstring):
+
+    use_kernel_weighting=False (Default, unveraendertes Verhalten): harter
+    Cutoff - alle Kandidaten mit Distanz <= cfg.max_distance werden mit
+    Gewicht 1.0 aufgenommen, alle anderen komplett verworfen. Ist KEIN
+    Kandidat innerhalb der Schwelle, wird eine ValueError geworfen (wie
+    bisher) - das ist das Verhalten, auf dem die Kalibrierungs-Vorschau und
+    der Train/Val-Split in Modus 2 (dashboard_analog.py) aufbauen.
+
+    use_kernel_weighting=True: STETIGE Gewichtung statt Ja/Nein -
+    weight = exp(-(distance/bandwidth)**2) (Gaussian-Kernel). Zusaetzlich
+    garantiert cfg.min_candidates, dass immer mindestens so viele der
+    naechstgelegenen Tage aufgenommen werden, unabhaengig von ihrer Distanz
+    oder ihrem Kernel-Gewicht - das verhindert einen kompletten Ausfall in
+    Marktphasen ohne nahe historische Entsprechung (z.B. scharfe Krisen).
+    Ein Kandidat wird aufgenommen, wenn er (a) innerhalb max_distance liegt,
+    ODER (b) ein Kernel-Gewicht >= min_weight hat, ODER (c) zu den
+    min_candidates naechstgelegenen Kandidaten gehoert - je nachdem, was
+    zuerst zutrifft (Vereinigungsmenge). Ein echter Abbruch (ValueError)
+    erfolgt nur noch, wenn VOR query_date mit min_gap_days Abstand
+    ueberhaupt keine Kandidaten existieren (reines Datenproblem).
+
+    In BEIDEN Modi enthaelt das Ergebnis eine 'weight'-Spalte (im
+    Cutoff-Modus konstant 1.0), damit nachgelagerte Funktionen
+    (evaluate_analog_set(), summarize_analog_trades_weighted(), ...)
+    einheitlich funktionieren.
 
     KORREKTUR (siehe Punkt 2 im Moduldokstring): min_gap_days war zuvor ueber
     Kalendertage (np.timedelta64) implementiert, obwohl als "Handelstage"
@@ -365,19 +454,57 @@ def find_analogs(query_date: pd.Timestamp, query_score: np.ndarray, space: Simil
     cand_idx = np.arange(max_allowed_pos)
     dist = np.linalg.norm(space.scores[cand_idx] - query_score[None, :], axis=1)
 
-    within = dist <= cfg.max_distance
-    if not within.any():
-        raise ValueError(
-            f"Keine Analog-Tage innerhalb der Distanz-Schwelle {cfg.max_distance:.4f} "
-            f"gefunden (kleinste verfuegbare Distanz: {dist.min():.4f}). "
-            "max_distance erhoehen."
-        )
+    if not cfg.use_kernel_weighting:
+        # ── Bisheriges Verhalten: harter Cutoff (unveraendert) ──
+        within = dist <= cfg.max_distance
+        if not within.any():
+            raise ValueError(
+                f"Keine Analog-Tage innerhalb der Distanz-Schwelle {cfg.max_distance:.4f} "
+                f"gefunden (kleinste verfuegbare Distanz: {dist.min():.4f}). "
+                "max_distance erhoehen."
+            )
+        chosen = cand_idx[within]
+        return pd.DataFrame({
+            "analog_date": dates[chosen],
+            "distance": dist[within],
+            "weight": 1.0,
+        }).sort_values("distance").reset_index(drop=True)
 
-    chosen = cand_idx[within]
+    # ── NEU: kontinuierliche Kernel-Gewichtung (siehe Punkt 12) ──
+    bandwidth = cfg.bandwidth if cfg.bandwidth is not None else cfg.max_distance / 2.0
+    if bandwidth <= 0.0:
+        raise ValueError(f"bandwidth muss > 0 sein (erhalten: {bandwidth}).")
+
+    weights = np.exp(-(dist / bandwidth) ** 2)
+
+    within_max_distance = dist <= cfg.max_distance
+    within_min_weight = weights >= cfg.min_weight
+
+    # Garantie gegen Krisenphasen-Totalausfall: die n naechstgelegenen
+    # Kandidaten werden IMMER aufgenommen, unabhaengig von Distanz/Gewicht.
+    n_guarantee = min(max(cfg.min_candidates, 0), len(dist))
+    guarantee_mask = np.zeros(len(dist), dtype=bool)
+    if n_guarantee > 0:
+        nearest_idx = np.argsort(dist)[:n_guarantee]
+        guarantee_mask[nearest_idx] = True
+
+    keep = within_max_distance | within_min_weight | guarantee_mask
+    chosen = cand_idx[keep]
+    dist_kept = dist[keep]
+    w_kept = weights[keep]
+
+    if len(chosen) == 0:
+        # Sollte praktisch nie auftreten (max_allowed_pos > 0 garantiert
+        # mind. einen Kandidaten, der ueber guarantee_mask erfasst wird),
+        # aber als Sicherheitsnetz behalten.
+        raise ValueError(
+            f"Keine Analog-Kandidaten vor {pd.Timestamp(query_date).date()} gefunden."
+        )
 
     return pd.DataFrame({
         "analog_date": dates[chosen],
-        "distance": dist[within],
+        "distance": dist_kept,
+        "weight": w_kept,
     }).sort_values("distance").reset_index(drop=True)
 
 
@@ -588,7 +715,12 @@ def evaluate_analog_set(analogs: pd.DataFrame, training_table: pd.DataFrame, bou
     bisher nicht in die Ausgabe uebernommen) - fuer Kennzahlen, die die
     TATSAECHLICHE prozentuale Kursbewegung eines Analog-Tages brauchen,
     unabhaengig vom hier verwendeten, per-era-spezifischen Modell-Strike
-    (siehe dashboard_livechain.py, 'Preis fuer Profit Factor X')."""
+    (siehe dashboard_livechain.py, 'Preis fuer Profit Factor X').
+
+    NEU (siehe Punkt 12 im Moduldokstring): das Kernel-Gewicht ('weight' aus
+    find_analogs(), im Cutoff-Modus konstant 1.0) wird ebenfalls mit
+    durchgereicht - Grundlage fuer summarize_analog_trades_weighted()/
+    weighted_reliability_summary()."""
     if vol_mode not in ("direct", "rank"):
         raise ValueError(f"Unbekannter vol_mode={vol_mode!r} - erwartet 'direct' oder 'rank'.")
     if vol_mode == "direct" and (today_iv is None or np.isnan(today_iv) or today_iv <= 0.0):
@@ -633,6 +765,7 @@ def evaluate_analog_set(analogs: pd.DataFrame, training_table: pd.DataFrame, bou
         hold_days = (trow["exit_date"] - d).days
         rows.append({
             "entry_date": d, "hold_days": hold_days, "distance": arow["distance"],
+            "weight": arow["weight"] if "weight" in arow.index else 1.0,
             "target_vol": target_vol,
             "entry_S": trow["entry_S"], "exit_S": trow["exit_S"],
             **result,
@@ -650,6 +783,10 @@ def summarize_analog_trades(evaluated: pd.DataFrame, side: str) -> dict:
     (Gewinnrate, Profit Factor, Erwartungswert/Trade, beste/schlechteste
     Trade), hier fuer das evaluate_analog_set()-Ergebnis EINER
     Delta-Kombination, side='short' oder 'long'.
+
+    UNGEWICHTET (jeder Analog-Tag zaehlt gleich) - fuer die GEWICHTETE
+    Variante (Kernel-Gewicht aus find_analogs(), siehe Punkt 12) siehe
+    summarize_analog_trades_weighted().
 
     KORREKTUR (siehe Punkt 7 im Moduldokstring): 'profit_factor' wird jetzt
     aus pnl_norm_{side} (normierte Rendite je Analog-Tag) statt aus
@@ -693,11 +830,137 @@ def summarize_analog_trades(evaluated: pd.DataFrame, side: str) -> dict:
     }
 
 
+def effective_sample_size(weights: np.ndarray) -> float:
+    """NEU (siehe Punkt 12 im Moduldokstring) - Kish's effektive
+    Stichprobengroesse: n_eff = (Σw)² / Σw². Bei Gleichgewichtung (alle
+    w=1, wie im harten-Cutoff-Modus) ist n_eff = n; je ungleicher die
+    Gewichte (wenige sehr nahe Analog-Tage dominieren die Gewichtssumme,
+    typisch in einer Krisenphase mit nur wenigen/weit entfernten
+    Vergleichstagen), desto kleiner n_eff relativ zur rohen Zeilenzahl -
+    das macht sichtbar, wie viel 'echte' unabhaengige Information hinter
+    einer kontinuierlich gewichteten Auswertung tatsaechlich steckt, statt
+    die (potenziell irrefuehrend hohe, durch die min_candidates-Garantie
+    aufgefuellte) rohe Zeilenzahl fuer bare Muenze zu nehmen."""
+    w = np.asarray(weights, dtype=float)
+    w = w[~np.isnan(w)]
+    if len(w) == 0 or w.sum() <= 0.0:
+        return 0.0
+    return float((w.sum() ** 2) / np.sum(w ** 2))
+
+
+def summarize_analog_trades_weighted(evaluated: pd.DataFrame, side: str) -> dict:
+    """NEU (siehe Punkt 12 im Moduldokstring) - gewichtetes Pendant zu
+    summarize_analog_trades(): jeder Analog-Tag geht mit seinem Kernel-
+    Gewicht (Spalte 'weight', siehe find_analogs()) ein statt mit Gewicht 1.
+    Funktioniert transparent auch im Cutoff-Modus (weight konstant 1.0 ->
+    identisch zu summarize_analog_trades(), bis auf die zusaetzliche
+    'n_eff'-Kennzahl).
+
+    'n_eff' (siehe effective_sample_size()) ersetzt 'n_trades' als
+    aussagekraeftigeres Mass fuer die tatsaechlich vorhandene statistische
+    Basis - insbesondere wichtig in Krisenphasen, wo find_analogs() per
+    min_candidates-Garantie eine Mindestzahl an (dann aber sehr niedrig
+    gewichteten) Zeilen liefert: 'n_trades' bliebe dort irrefuehrend hoch,
+    waehrend 'n_eff' korrekt sehr klein wird."""
+    if evaluated.empty or "weight" not in evaluated.columns:
+        return {"n_trades": len(evaluated), "n_eff": 0.0}
+
+    w = evaluated["weight"].to_numpy(dtype=float)
+    w_sum = w.sum()
+    if w_sum <= 0.0:
+        return {"n_trades": len(evaluated), "n_eff": 0.0}
+
+    net_col, norm_col = f"net_pnl_{side}", f"pnl_norm_{side}"
+    net = evaluated[net_col].to_numpy(dtype=float)
+    norm = evaluated[norm_col].to_numpy(dtype=float)
+
+    win_rate_pct = float(w[net >= 0.0].sum() / w_sum * 100.0)
+    gross_profit_norm = float(np.sum(w[norm >= 0.0] * norm[norm >= 0.0]))
+    gross_loss_norm = float(-np.sum(w[norm < 0.0] * norm[norm < 0.0]))
+
+    return {
+        "n_trades": len(evaluated),
+        "n_eff": effective_sample_size(w),
+        "win_rate_pct": win_rate_pct,
+        "avg_pnl": float(np.sum(w * net) / w_sum),
+        "avg_pnl_norm_pct": float(np.sum(w * norm) / w_sum * 100.0),
+        "profit_factor": (gross_profit_norm / gross_loss_norm) if gross_loss_norm > 0.0 else np.nan,
+        "best_trade": float(net.max()),
+        "worst_trade": float(net.min()),
+    }
+
+
+def weighted_reliability_summary(evaluated: pd.DataFrame, side: str, n_subperiods: int = 6) -> dict:
+    """NEU (siehe Punkt 12 im Moduldokstring) - gewichtetes Pendant zur
+    Newey-West-Reliability aus stats.reliability_summary(): t-Statistik/
+    95%-Konfidenzintervall des GEWICHTETEN Mittelwerts von pnl_norm_{side},
+    mit Kish's n_eff (statt der rohen Beobachtungsanzahl) als
+    Freiheitsgrad-Basis fuer die t-Verteilung.
+
+    WICHTIGER VORBEHALT: die Bartlett-Kernel-Autokorrelationskorrektur aus
+    stats.reliability_summary() ist fuer gleichgewichtete, chronologisch
+    geordnete Beobachtungen gebaut und hier NICHT eins-zu-eins uebertragbar.
+    Die Kish-Korrektur (n_eff statt n) federt den Effekt von stark
+    ueberlappenden/geclusterten bzw. sehr ungleich gewichteten Analog-Tagen
+    zwar ab (nahe beieinander liegende Tage mit hohem Gewicht schrumpfen
+    n_eff automatisch), ersetzt aber keine echte Autokorrelationskorrektur
+    ueber die Kalenderzeit - die bestehende Clustering-Warnung im Dashboard
+    (siehe analog_clustering_diagnostic()) bleibt daher weiterhin relevant."""
+    from scipy.stats import t as t_dist
+
+    norm_col = f"pnl_norm_{side}"
+    empty = {"n_trades": len(evaluated), "n_eff": 0.0, "mean_pnl_norm": np.nan,
+             "tstat": np.nan, "ci_low": np.nan, "ci_high": np.nan,
+             "ci_excludes_zero": False, "subperiod_matching": 0, "subperiod_nonempty": 0}
+    if evaluated.empty or "weight" not in evaluated.columns:
+        return empty
+
+    w = evaluated["weight"].to_numpy(dtype=float)
+    x = evaluated[norm_col].to_numpy(dtype=float)
+    w_sum = w.sum()
+    n_eff = effective_sample_size(w)
+    if w_sum <= 0.0 or n_eff < 2.0:
+        return {**empty, "n_eff": n_eff}
+
+    mean = float(np.sum(w * x) / w_sum)
+    var = float(np.sum(w * (x - mean) ** 2) / w_sum)   # gewichtete Varianz (frequency-weights)
+    se = np.sqrt(var / n_eff) if var > 0.0 else 0.0
+
+    df = max(n_eff - 1.0, 1.0)
+    tstat = mean / se if se > 0.0 else np.nan
+    tcrit = float(t_dist.ppf(0.975, df))
+    ci_low, ci_high = mean - tcrit * se, mean + tcrit * se
+
+    sub = evaluated.sort_values("entry_date")
+    blocks = np.array_split(np.arange(len(sub)), max(n_subperiods, 1))
+    matching, nonempty = 0, 0
+    overall_sign = np.sign(mean)
+    sw = sub["weight"].to_numpy(dtype=float)
+    sx = sub[norm_col].to_numpy(dtype=float)
+    for idx in blocks:
+        if len(idx) == 0 or sw[idx].sum() <= 0.0:
+            continue
+        bmean = np.sum(sw[idx] * sx[idx]) / sw[idx].sum()
+        nonempty += 1
+        if overall_sign != 0.0 and np.sign(bmean) == overall_sign:
+            matching += 1
+
+    return {
+        "n_trades": len(evaluated), "n_eff": n_eff, "mean_pnl_norm": mean,
+        "tstat": tstat, "ci_low": ci_low, "ci_high": ci_high,
+        "ci_excludes_zero": bool(ci_low > 0.0 or ci_high < 0.0),
+        "subperiod_matching": matching, "subperiod_nonempty": nonempty,
+    }
+
+
 def _reliability_for_side(evaluated: pd.DataFrame, side: str, n_subperiods: int) -> dict:
     """Baut aus dem kombinierten evaluate_analog_set()-Ergebnis die
     'pnl_norm'/'net_pnl'-Spalten, die reliability_summary() erwartet, fuer
     die gewuenschte Richtung (side='short' oder 'long'). Die chronologische
-    Sortierung aus evaluate_analog_set() bleibt dabei erhalten."""
+    Sortierung aus evaluate_analog_set() bleibt dabei erhalten.
+
+    UNGEWICHTET - fuer die GEWICHTETE Variante siehe
+    weighted_reliability_summary()."""
     if evaluated.empty:
         return reliability_summary(evaluated)
     sub = evaluated.rename(columns={
@@ -733,6 +996,14 @@ def leg_pair_grid_search(analogs: pd.DataFrame, training_table: pd.DataFrame, bo
     (ci_excludes_zero in Train UND Validierung, gleiches Vorzeichen) - reines
     In-Sample-Optimieren auf die komplette Menge wird bewusst NICHT als
     alleiniges Auswahlkriterium verwendet.
+
+    HINWEIS: nutzt weiterhin die UNGEWICHTETE reliability_summary() (ueber
+    _reliability_for_side()) - diese Funktion wird ausschliesslich von
+    Modus 2 (dashboard_analog.py) verwendet, der bewusst beim harten-Cutoff-
+    Verhalten bleibt (siehe Punkt 12 im Moduldokstring). Fuer die
+    gewichtete Variante (Modus 3/Livechain) siehe
+    weighted_reliability_summary(), direkt auf evaluate_analog_set()-
+    Ergebnissen angewendet (dashboard_livechain.py).
 
     Rueckgabe: eine Zeile je (put_delta, call_delta, side)-Kombination -
     'side' ist jetzt eine eigene Spalte statt eines Funktionsparameters,
@@ -828,6 +1099,12 @@ def recommend_for_today(daily_df: pd.DataFrame, training_table: pd.DataFrame,
     target_vol_for_rank) - z.B. bedeutet Rang 40% an einem ruhigen Markttag
     eine niedrige IV, in einer Vola-Krise bei DEMSELBEN Rang 40% dagegen
     eine deutlich hoehere IV.
+
+    HINWEIS (siehe Punkt 12 im Moduldokstring): analog_cfg wird 1:1
+    durchgereicht - falls der Aufrufer dort use_kernel_weighting=True setzt,
+    gilt die kontinuierliche Gewichtung auch hier. Standardmaessig
+    (analog_cfg=None -> AnalogConfig()) bleibt das bisherige harte
+    Cutoff-Verhalten aktiv, wie von dashboard_analog.py (Modus 2) erwartet.
 
     Fuer direkten Zugriff auf den frueheren 'direct'-Modus (feste absolute
     Vola statt Rang) evaluate_analog_set()/leg_pair_grid_search() direkt

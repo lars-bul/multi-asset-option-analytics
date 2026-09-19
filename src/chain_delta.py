@@ -3,29 +3,19 @@ Black-76-Bewertung DIREKT aus echten Marktpreisen (Mid) - bewusst getrennt
 von eurem internen Skew-Modell (black76.skewed_iv/VolSurfaceConfig). Zweck
 hier: aus dem beobachteten Bid/Ask/Mid je Serie der heutigen SPX-Kette die
 ECHTE implizite Vola und das ECHTE Delta zurueckrechnen. Das ist bewusst EIN
-eigener, einfacher Black-76-Solver, KEIN Aufruf von leg_price()/skewed_iv()
-- die reale Marktschraege steckt ja schon im beobachteten Preis selbst,
-muss also nicht ueber euer Skew-Modell nachgebildet werden. Fuer den
-naechsten Schritt (Rueckrechnung auf einen mit eurem Modell VERGLEICHBAREN
-base_iv/HV-Aequivalent) wird SPAETER zusaetzlich solve_strike_delta_consistent()
-aus backtest.py verwendet - das ist ein separater Schritt, NICHT Teil dieses
-Moduls.
+eigener, einfacher Black-76-Solver, KEIN Aufruf von leg_price()/skewed_iv().
 
 Konvention (wie im Rest des Projekts): Put-Delta wird als POSITIVE Zahl
 zurueckgegeben (Betrag), nicht mit oekonomischem Vorzeichen.
 
-NEU - Staleness-Diagnose (last_trade_date/quote_age_minutes): siehe
-fetch_today_chain.py-Moduldokstring. enrich_chain_with_delta() reicht das
-dort neu durchgereichte `last_trade_date` durch und ergaenzt zusaetzlich
-`quote_age_minutes` (Minuten seit dem letzten tatsaechlichen Trade dieses
-Kontrakts, bezogen auf den Fetch-Zeitpunkt `as_of`). Grund fuer die
-Ergaenzung: eine auffaellig hohe/niedrige implizite Vola auf einer Seite
-(z.B. Put deutlich teurer als der Call bei symmetrischem Abstand) kann ein
-echtes Marktphaenomen (Skew) ODER eine schlicht veraltete Einzelquote sein -
-`quote_age_minutes` macht das objektiv pruefbar, statt es nur aus dem
-Preisvergleich zu vermuten (siehe build_symmetric_distance_table(), wo
-diese Spalten pro gewaehltem Strike in die Ausgabetabelle uebernommen
-werden)."""
+Staleness-Diagnose: enrich_chain_with_delta() reicht `last_trade_date` durch
+und ergaenzt `quote_age_minutes` (Minuten seit dem letzten tatsaechlichen
+Trade, bezogen auf `as_of`). build_symmetric_distance_table() uebernimmt sie
+pro gewaehltem Strike.
+
+NEU: build_symmetric_distance_table() liefert zusaetzlich bid_put/ask_put/
+bid_call/ask_call je Zeile - Grundlage der modellfreien Iron-Condor-Suche
+(condor_search.py), die mit echten Bid/Ask-Preisen rechnet."""
 from dataclasses import dataclass
 
 import numpy as np
@@ -53,9 +43,7 @@ def black76_price(F: float, K: float, T: float, sigma: float, r: float, is_put: 
 
 
 def black76_delta(F: float, K: float, T: float, sigma: float, r: float, is_put: bool) -> float:
-    """Delta bezogen auf den TERMINKURS F (nicht Spot) - Betrag (positiv),
-    konsistent zur Delta-Konvention im Rest des Projekts (siehe
-    analog_matching.delta_for_strike Docstring)."""
+    """Delta bezogen auf den TERMINKURS F (nicht Spot) - Betrag (positiv)."""
     if T <= 0.0 or sigma <= 0.0:
         return 1.0 if ((F > K) != is_put) else 0.0
     d1, _ = _d1_d2(F, K, T, sigma)
@@ -68,18 +56,14 @@ def black76_delta(F: float, K: float, T: float, sigma: float, r: float, is_put: 
 def implied_vol(price: float, F: float, K: float, T: float, r: float, is_put: bool,
                  lo: float = 1e-4, hi: float = 5.0) -> float | None:
     """Invertiert den Black-76-Preis zur impliziten Vola (Brent-Verfahren).
-
     Gibt None zurueck, wenn kein gueltiges Ergebnis moeglich ist (Preis
-    ausserhalb des arbitragefreien Bereichs, z.B. bid=ask=0 oder Preis unter
-    dem inneren Wert - kommt bei sehr illiquiden Serien der echten Kette
-    durchaus vor und wird hier bewusst NICHT hart abgebrochen, sondern als
-    fehlender Wert weitergereicht, damit eine einzelne kaputte Serie nicht
-    die ganze Kette blockiert)."""
+    ausserhalb des arbitragefreien Bereichs) - eine einzelne kaputte Serie
+    blockiert nicht die ganze Kette."""
     if price <= 0.0 or T <= 0.0:
         return None
     intrinsic = max(K - F, 0.0) if is_put else max(F - K, 0.0)
     if price <= intrinsic * np.exp(-r * T):
-        return None   # Preis unterhalb des inneren Werts - arbitragefrei nicht invertierbar
+        return None
 
     def f(sigma: float) -> float:
         return black76_price(F, K, T, sigma, r, is_put) - price
@@ -96,34 +80,17 @@ def implied_vol(price: float, F: float, K: float, T: float, r: float, is_put: bo
 class ChainDeltaConfig:
     r_free: float = 0.0
     dividend_yield: float = 0.015
-    min_abs_delta: float = 0.01   # Filter: Serien mit kleinerem Delta werden verworfen (zu weit OTM)
+    min_abs_delta: float = 0.01   # Serien mit kleinerem Delta werden verworfen (zu weit OTM)
 
 
 def enrich_chain_with_delta(chain: pd.DataFrame, spot: float, cfg: ChainDeltaConfig | None = None,
                              as_of: pd.Timestamp | None = None) -> pd.DataFrame:
-    """Nimmt das Ergebnis von fetch_today_chain.fetch_today_chain() (Spalten
-    date/expiry/dte/dte_exact/strike/option_type/bid/ask/mid/.../
-    last_trade_date) und ergaenzt je Zeile implied_vol_mkt und delta_mkt
-    (ECHTE, aus dem Marktpreis invertierte Werte - siehe Moduldokstring).
-    Zeilen ohne gueltiges IV-Solve (z.B. mid<=0 oder Preis unter innerem
-    Wert) werden verworfen.
-
-    Nutzt dte_exact (fraktionale Resttage aus fetch_today_chain.dte_exact)
-    fuer T statt ganzzahligem dte - bei kurzen Laufzeiten (0DTE) macht das
-    einen spuerbaren Unterschied in Delta/IV.
-
-    Filtert danach auf cfg.min_abs_delta <= delta_mkt <= 1.0 - "am oder im
-    Geld bis Delta 0.01".
-
-    NEU: ergaenzt `quote_age_minutes` = Minuten zwischen `last_trade_date`
-    (letzter tatsaechlicher Trade dieses Kontrakts, siehe
-    fetch_today_chain.py) und `as_of` (Referenzzeitpunkt - Default: jetzt,
-    UTC). Ist NaN, falls `last_trade_date` fehlt (aeltere yfinance-Version
-    oder Serie ganz ohne Handelshistorie). Reiner Diagnose-/Warnwert - siehe
-    Moduldokstring: ein hoher Wert bedeutet NICHT zwingend eine falsche
-    Quote, ist aber der beste verfuegbare Hinweis auf eine moeglicherweise
-    veraltete Bid/Ask-Quote bei duenn gehandelten Serien."""
-    from black76 import forward_price   # bereits vorhanden im Projekt
+    """Nimmt das Ergebnis von fetch_today_chain.fetch_today_chain() und
+    ergaenzt je Zeile implied_vol_mkt, delta_mkt und quote_age_minutes.
+    Zeilen ohne gueltiges IV-Solve werden verworfen. Nutzt dte_exact
+    (fraktionale Resttage) fuer T, falls vorhanden. Filtert auf
+    cfg.min_abs_delta <= delta_mkt <= 1.0."""
+    from black76 import forward_price
 
     if cfg is None:
         cfg = ChainDeltaConfig()
@@ -167,18 +134,10 @@ def enrich_chain_with_delta(chain: pd.DataFrame, spot: float, cfg: ChainDeltaCon
 
 def implied_vol_pair(price_total: float, F: float, K_put: float, K_call: float, T: float, r: float,
                       lo: float = 1e-4, hi: float = 5.0) -> float | None:
-    """'Paket-IV' der KOMBINATION (Put+Call zusammen) - NICHT der Mittelwert
-    der beiden Einzel-IVs, sondern die EINE Vola, die - in Black-76 fuer
-    BEIDE Beine gemeinsam eingesetzt - exakt die Summe der beiden echten
-    Marktpreise (price_total = mid_put + mid_call) reproduziert.
-
-    Begruendung, warum das NICHT der einfache Durchschnitt der beiden
-    Einzel-IVs ist: der Preis ist eine NICHTLINEARE Funktion der Vola
-    (unterschiedliches Vega je Strike/Moneyness) - ein simpler IV-Mittelwert
-    wuerde bei ungleichem Vega der beiden Beine einen SYSTEMATISCH falschen
-    Kombinationspreis implizieren. Der Joint-Solve hier ist der korrekte,
-    Black-76-konsistente Weg, den 'einen Marktpreis, den der Markt fuer das
-    ganze Paket bieten wuerde' in eine einzelne Vola-Zahl zu uebersetzen."""
+    """'Paket-IV' der Kombination (Put+Call): die EINE Vola, die - in Black-76
+    fuer BEIDE Beine gemeinsam eingesetzt - exakt die Summe der beiden echten
+    Marktpreise reproduziert (NICHT der Mittelwert der Einzel-IVs, da der
+    Preis nichtlinear in der Vola ist)."""
     if price_total <= 0.0 or T <= 0.0:
         return None
 
@@ -196,9 +155,7 @@ def implied_vol_pair(price_total: float, F: float, K_put: float, K_call: float, 
 
 
 def _nearest_strike_row(df_side: pd.DataFrame, target_strike: float):
-    """Zeile mit dem naechstgelegenen tatsaechlich VORHANDENEN Strike zu
-    einem (kontinuierlichen) Ziel-Strike - reale Ketten haben nur diskrete
-    Strikes (meist 5- oder 25-Punkte-Raster)."""
+    """Zeile mit dem naechstgelegenen tatsaechlich VORHANDENEN Strike."""
     if df_side.empty:
         return None
     idx = (df_side["strike"] - target_strike).abs().idxmin()
@@ -210,30 +167,14 @@ def build_symmetric_distance_table(enriched_chain: pd.DataFrame, expiry, spot: f
                                     r_free: float, dividend_yield: float,
                                     distance_targets_pct: list[float] | None = None,
                                     hv_min: float | None = None, hv_max: float | None = None) -> pd.DataFrame:
-    """Ersetzt build_delta_pair_table(): statt Put/Call UNABHAENGIG nach
-    ihrem jeweiligen ECHTEN Marktdelta zu suchen (fuehrt bei realer
-    Marktschraege zu asymmetrischen Strikes um den Spot), wird der Strike
-    zuerst MODELLSEITIG bestimmt - genau wie euer Backtest das tun wuerde
-    (strike_from_delta() mit EINER flachen/symmetrischen Vola fuer beide
-    Beine, siehe backtest.solve_strike_delta_consistent) - und danach auf
-    den naechstgelegenen TATSAECHLICH VORHANDENEN Strike gerundet. Dort wird
-    der echte Marktpreis/echtes IV/echtes Delta nachgeschlagen.
+    """Je Ziel-ABSTAND vom Spot (in %) eine Zeile; Put-/Call-Strike werden auf
+    den naechstgelegenen real vorhandenen Strike gerundet, dort werden echter
+    Marktpreis/IV/Delta nachgeschlagen.
 
-    NEU: iv_pair_pct - die 'Paket-IV' der Kombination (siehe implied_vol_pair,
-    NICHT der Mittelwert der Einzel-IVs). NEU: hv_rank_pct - der HV-Rang,
-    den diese Paket-IV im HV-Min/Max-Fenster (hv_min/hv_max, siehe
-    analog_matching.hv_rank_bounds - Fenster-Laenge MUSS zur Restlaufzeit
-    passen, siehe dashboard_livechain.py) einnehmen wuerde - direkte
-    Umkehrung von analog_matching.target_vol_for_rank(). Werte ausserhalb
-    0-100% bedeuten Extrapolation ueber das historische Fenster hinaus
-    (identisch zur Konvention von backtest.FixedRankConfig.target_rank_pct).
-
-    NEU: quote_age_put_min/quote_age_call_min - Minuten seit dem letzten
-    tatsaechlichen Trade des jeweils gewaehlten Strikes (siehe
-    enrich_chain_with_delta) - reine Diagnose-Spalte, um eine auffaellige
-    Put/Call-Diskrepanz (z.B. Put deutlich teurer als der Abstand zum Call
-    vermuten laesst) von einer schlicht veralteten Einzelquote unterscheiden
-    zu koennen, statt das nur aus dem Preisvergleich zu vermuten."""
+    Spalten u.a.: iv_pair_pct (Paket-IV), hv_rank_pct (Rang der Paket-IV im
+    HV-Min/Max-Fenster; ausserhalb 0-100 = Extrapolation),
+    quote_age_put_min/quote_age_call_min (Staleness-Diagnose) und NEU
+    bid_put/ask_put/bid_call/ask_call (fuer die Condor-Suche)."""
     from black76 import forward_price
 
     if distance_targets_pct is None:
@@ -249,6 +190,11 @@ def build_symmetric_distance_table(enriched_chain: pd.DataFrame, expiry, spot: f
             return None
         val = row["quote_age_minutes"]
         return float(val) if pd.notna(val) else None
+
+    def _g(row, col):
+        if row is None or col not in row.index or pd.isna(row[col]):
+            return None
+        return float(row[col])
 
     rows = []
     for dist_pct in distance_targets_pct:
@@ -286,6 +232,8 @@ def build_symmetric_distance_table(enriched_chain: pd.DataFrame, expiry, spot: f
             "hv_rank_pct": hv_rank_pct,
             "quote_age_put_min": _age(put_row),
             "quote_age_call_min": _age(call_row),
+            "bid_put": _g(put_row, "bid"), "ask_put": _g(put_row, "ask"),
+            "bid_call": _g(call_row, "bid"), "ask_call": _g(call_row, "ask"),
         })
 
     return pd.DataFrame(rows)

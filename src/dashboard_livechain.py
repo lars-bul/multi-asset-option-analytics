@@ -1,137 +1,47 @@
 """
-MODUS 3: Heutige Kette - symmetrische Abstands-Ansicht + Analog-Tage-Simulation.
+MODUS 3: Heutige Kette - symmetrische Abstands-Ansicht + Analog-Tage-Simulation
++ modellfreie Iron-Condor-Suche.
 
-TEIL A (unveraendert): zeigt die AKTUELLE SPX-Optionskette als EINE Tabelle,
-je Ziel-ABSTAND vom Spot (in %) eine Zeile, Put/Call-Strike unabhaengig auf
-den naechstgelegenen real vorhandenen Strike gerundet - siehe
-chain_delta.build_symmetric_distance_table.
+TEIL A: aktuelle SPX-Optionskette als EINE Tabelle, je Ziel-ABSTAND vom Spot
+(in %) eine Zeile, Put/Call-Strike unabhaengig auf den naechstgelegenen real
+vorhandenen Strike gerundet (chain_delta.build_symmetric_distance_table).
 
-TEIL B: fuehrt fuer JEDE Zeile der Tabelle einen Analog-Tage-Lauf aus
-(identisches Prinzip wie dashboard_analog.py) und haengt die Ergebnis-
-Kennzahlen als zusaetzliche Spalten an. Wichtige Design-Entscheidungen
-(mit dem Nutzer abgestimmt):
-
-  1. Ziel-HV-Rang je Zeile = die in Teil A bereits berechnete Spalte
-     'HV-Rang % (dieser Kombi)' - KEIN eigener Slider, jede Zeile hat ihren
-     eigenen Rang.
-  2. Put-/Call-Delta je Zeile = die 'Modell-Delta (flache HV)'-Spalten aus
-     Teil A - NICHT die echten Marktdeltas (die waeren mit Skew behaftet
-     und wuerden bei solve_strike_delta_consistent() einen anderen Strike
-     treffen als in der Tabelle gezeigt).
-  3. vol_surface = VolSurfaceConfig(use_vol_surface=False) - Skew fuer den
-     Analog-Lauf explizit AUS, damit die Delta-Definition durchgaengig
-     dieselbe (flache) bleibt wie in Punkt 2.
-  4. T_days fuer evaluate_analog_set() MUSS einer der in der vorab gebauten
-     training_table verfuegbaren Werte sein (siehe labels.py/build_dataset.py)
-     - die tatsaechliche Restlaufzeit (dte_exact) wird auf den naechst-
-     gelegenen verfuegbaren Wert GERUNDET (siehe available_t_days()).
-  5. 'Heute' fuer die Analog-Suche: waehrend eines laufenden Handelstags
-     enthaelt daily_df noch keinen abgeschlossenen Balken fuer heute (montags
-     waere das sonst Freitag, 3 Tage alt). Es wird daher ein synthetischer
-     Balken (open=high=low=close=heutiger Eroeffnungskurs) an eine KOPIE von
-     daily_df angehaengt (siehe _build_daily_df_with_today()).
-  6. Performance: die Aehnlichkeits-Raum-PCA und die Analog-Tage-Suche
-     (find_analogs) haengen NICHT von Delta/Rang ab - werden daher NUR
-     EINMAL pro Klick berechnet, nicht pro Zeile. Trotzdem bleibt die
-     eigentliche Bewertung (Strike-Solve je Analog-Tag x Zeile) ein
-     Python-Loop - bei vielen Zeilen x vielen Analog-Tagen kann das mehrere
-     Minuten dauern, daher expliziter Button statt Auto-Run.
-  7. Je Zeile: Kennzahlen auf dem KOMPLETTEN Analog-Set (n, Gewinnrate,
-     Profit Factor, Ø norm. P&L, t-Stat, CI≠0, Perioden-Konsistenz X/6)
-     PLUS Train/Val-Split-Robustheit (t-Stat Val, Robust-Flag) - identisches
-     Kriterium wie leg_pair_grid_search() in analog_matching.py, aber ohne
-     die dreifache Neuberechnung: evaluate_analog_set() wird nur EINMAL auf
-     dem kompletten Set aufgerufen, Train/Val wird danach aus dem fertigen
-     Ergebnis chronologisch aufgeteilt (mathematisch identisch, da jede
-     Analog-Tag-Bewertung unabhaengig von den anderen ist).
-  8. 'Erwarteter Gewinn Short' (in Punkten): Ø norm. P&L% ist eine
-     relative Kennzahl (normiert auf die historische Analog-Entry-Praemie
-     JEDES einzelnen Analog-Tages, siehe reprice_leg_pair() -
-     pnl_norm = net_pnl / entry_premium). Fuer einen Vergleich ueber
-     Zeilen/Strikes hinweg, der auf die HEUTIGE (reale) Praemiengroesse
-     bezogen ist, wird diese relative Kennzahl mit der HEUTIGEN Entry-
-     Praemie DIESER Zeile (mid_put + mid_call aus Teil A) multipliziert:
-
-         erwarteter Gewinn Short (Pkt) = avg_pnl_norm_pct/100 * (mid_put+mid_call)
-
-     avg_pnl_norm_pct wird hier IMMER aus Short-Sicht berechnet
-     (summarize_analog_trades_weighted(..., "short")) - diese Spalte
-     bewertet daher ausschliesslich das Short-Bein (die Praemien-Seite des
-     Condors), NICHT die Wings. Fuer die Wing-/Long-Auswahl und v.a. fuer
-     die STREUUNG/Konsistenz der KOMBINIERTEN Position (das eigentliche
-     'wie geradlinig laeuft die Kapitalkurve') den Iron-Condor-Ladder-
-     Backtest verwenden (dashboard_ladder.py) - dort wird Short+Long
-     GEMEINSAM pro Analog-/Handelstag bewertet und liefert eine echte,
-     korrelationskonsistente Equity-Kurve.
-  9. Auto-Load: die Kette wird beim ERSTEN Aufruf dieses Tabs automatisch
-     geladen (kein Klick auf 'Heutige Kette laden' mehr noetig, siehe
-     render()). Einmal geladene Daten (Kette, Distanz-Tabelle, Analog-
-     Ergebnisse) liegen in st.session_state und bleiben daher auch nach
-     einem Wechsel zu einem anderen Tab/Modus erhalten.
-  10. Staleness-Diagnose je Zeile (Quote-Alter Put/Call): siehe
-      chain_delta.py-Moduldokstring - dort wird bereits `quote_age_minutes`
-      je Einzelserie und `quote_age_put_min`/`quote_age_call_min` je Zeile
-      der Distanz-Tabelle berechnet. Ab einem Schwellenwert
-      (_QUOTE_AGE_WARNING_MINUTES) wird eine explizite Warnung mit den
-      betroffenen Zeilen angezeigt.
-  11. 'Preis fuer PF=3' (Punkte): beantwortet die Frage "Welcher
-      (einheitliche) Preis waere noetig gewesen, damit sich auf dem
-      KOMPLETTEN Analog-Set (Short-Seite), ausgewertet mit den ECHTEN,
-      heute in der Optionskette sichtbaren Strikes dieser Zeile, ein
-      Profit Factor von genau 3 ergeben haette?" - siehe
-      _payout_at_todays_scale()/_required_premium_for_profit_factor() fuer
-      die Skalen-Korrektur (prozentuale statt absolute Kursbewegung).
-
-  12. NEU - Kontinuierliche Kernel-Gewichtung statt hartem max_distance-
-      Cutoff (siehe analog_matching.py, Punkt 12 im dortigen Moduldokstring
-      fuer die vollstaendige Begruendung). AUSLOESER: in ausgepraegten
-      Krisenphasen (Marktzustand liegt im Aehnlichkeits-Raum sehr
-      ungewoehnlich, es gibt keine nahen historischen Entsprechungen) fiel
-      find_analogs() bei der bisherigen harten Schwelle (dist <= max_distance)
-      haeufig komplett leer aus - eine ValueError brach den GESAMTEN
-      Bulk-Lauf ab, und die Tabelle 'Analog-Tage-Simulation je Zeile' blieb
-      unsichtbar/leer, obwohl es durchaus (wenn auch weit entfernte)
-      Vergleichstage gab.
-
-      FIX: _run_bulk_analog() ruft find_analogs() jetzt mit
-      use_kernel_weighting=True auf. Jeder Kandidat bekommt ein STETIGES
-      Gewicht exp(-(distance/bandwidth)**2) statt einer Ja/Nein-Mitgliedschaft,
-      UND es werden per AnalogConfig.min_candidates IMMER mindestens ein paar
-      der naechstgelegenen Tage aufgenommen, egal wie weit sie tatsaechlich
-      entfernt sind. Dadurch laedt die Tabelle jetzt auch in einer
-      Krisenphase mit nur wenigen/weit entfernten Vergleichstagen zuverlaessig -
-      die (dann sehr geringe) Verlaesslichkeit dieser Zeile zeigt sich
-      stattdessen TRANSPARENT in der neuen Spalte 'Effektive n (Kish)'
-      (siehe analog_matching.effective_sample_size()): faellt n_eff deutlich
-      unter die rohe Trade-Zahl, steckt kaum echte Vergleichsinformation
-      dahinter - die Zeile ist dann zwar sichtbar, aber mit Vorsicht zu
-      geniessen, statt komplett zu fehlen. Alle Kennzahlen (Gewinnrate,
-      Profit Factor, Ø norm. P&L, t-Stat, 'Preis fuer PF=3', ...) werden
-      entsprechend GEWICHTET berechnet (siehe
-      analog_matching.summarize_analog_trades_weighted()/
-      weighted_reliability_summary() sowie die lokal angepassten
-      _payout_at_todays_scale()/_required_premium_for_profit_factor()).
-
-      Modus 2 (dashboard_analog.py) ist von dieser Aenderung NICHT betroffen
-      (nutzt weiterhin use_kernel_weighting=False, siehe dort).
-
-  13. NEU - Zeilenfaerbung der Analog-Tabelle (gruen/rot) nach
-      Robustheitskriterien + Strike-Spalten (real) direkt hinter
-      'Ziel-Abstand % v. Spot'.
-        gruen: t-Stat (gesamt) > 2, CI ≠ 0 (gesamt), Perioden-Match >= 5/6,
-               t-Stat (Val) > 2, Robust (Train+Val) == True.
-        rot:   spiegelbildlich - t-Stat (gesamt) < -2, CI ≠ 0 (gesamt),
-               Perioden-Match >= 5/6, t-Stat (Val) < -2 und ein GESPIEGELTES
-               Robust-Flag (robust_train_val_neg: beide Haelften signifikant,
-               gleiches NEGATIVES Vorzeichen). Noetig, weil 'robust_train_val'
-               per Definition nur positive Edges erfasst (Vorzeichen > 0) und
-               bei einer negativen Zeile daher immer False waere.
-      Alle anderen Zeilen bleiben ungefaerbt. Die sichtbare Spalte
-      'Robust (Train+Val)' bleibt unveraendert (nur positives Kriterium).
-      Die Strike-Werte stammen aus 'strike_put'/'strike_call' der
-      Distanz-Tabelle aus Teil A (dieselben realen Strikes, die im
-      Analog-Lauf ausgewertet werden). Siehe _robustness_row_state().
+TEIL B: fuer JEDE Zeile ein Analog-Tage-Lauf (Prinzip wie dashboard_analog.py):
+  1. Ziel-HV-Rang je Zeile = Spalte 'HV-Rang % (dieser Kombi)' aus Teil A.
+  2. Put-/Call-Delta je Zeile = 'Modell-Delta (flache HV)' aus Teil A.
+  3. vol_surface = VolSurfaceConfig(use_vol_surface=False) (flache Delta-Definition).
+  4. T_days = naechstgelegener in der training_table verfuegbarer Wert
+     (jetzt 1..30, siehe labels.py). Fehlen Laufzeiten, bietet die Seite einen
+     Button zum Neubau der Tabelle an (siehe _ensure_training_table()).
+  5. 'Heute': synthetischer Balken mit heutigem Eroeffnungskurs
+     (_build_daily_df_with_today()).
+  6. PCA + Analog-Suche einmalig pro Klick und gecacht (_find_today_analogs()),
+     von Teil B und Teil C gemeinsam genutzt.
+  7. Kennzahlen je Zeile auf dem kompletten Analog-Set (gewichtet, Kernel) plus
+     Train/Val-Robustheit.
+  8. 'Erw. Gewinn Short (Pkt)' und 'Ø norm. P&L %': NEU direkt aus den
+     Payouts auf heutiger Skala (historische %-Bewegungen x heutiger Spot,
+     reale Strikes, gewichtet) minus heutige Praemie - keine Division durch
+     winzige Modellpraemien mehr (vorher z.B. -27.555 % am Rand).
+  9. Auto-Load der Kette beim ersten Aufruf; alles in st.session_state.
+ 10. Staleness-Warnung (Quote-Alter) ab _QUOTE_AGE_WARNING_MINUTES.
+ 11. 'Preis fuer PF=3' (Punkte): _payout_at_todays_scale()/
+     _required_premium_for_profit_factor(), gewichtet.
+ 12. Kernel-Gewichtung statt hartem max_distance-Cutoff + min_candidates-
+     Garantie (siehe analog_matching.py); 'Effektive n (Kish)' zeigt die
+     Datenbasis.
+ 13. Zeilenfaerbung gruen/rot nach Robustheitskriterien (_robustness_row_state()).
+ 14. NEU - HAC-Korrektur: alle t-Stats/CIs kommen aus
+     analog_matching.weighted_reliability_summary() mit HAC-Standardfehler
+     (Bartlett, Kalenderzeit) auf der skalenfreien Basis 'pnl_spot'. Guards
+     und Warnungen nutzen 'Effektive n (HAC)' statt Kish-n_eff. Dadurch sind
+     die t-Stats deutlich kleiner als vorher (Ueberlappung benachbarter
+     Analog-Tage bei mehrtaegiger Haltedauer) - die Faerbung faellt
+     entsprechend seltener aus.
+ 15. NEU - Teil C: Iron-Condor-Suche (condor_search.py), modellfrei und
+     tagesgenau, mit Bid/Ask-Preisen der Kette.
 """
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
@@ -153,30 +63,14 @@ from analog_matching import (
 )
 from features import FeatureConfig, build_feature_matrix
 from dashboard_common import load_training_table
+from condor_search import CondorConfig, analog_moves, evaluate_condor_grid
 
-# Schwellenwert (Minuten) fuer die Quote-Alter-Warnung in Teil A - bewusst
-# als Modul-Konstante statt Sidebar-Eingabe, um die Sidebar nicht mit einem
-# weiteren, selten geaenderten Parameter zu ueberladen. Bei Bedarf hier
-# anpassen (siehe Moduldokstring Punkt 10).
 _QUOTE_AGE_WARNING_MINUTES = 60.0
-
-# NEU (siehe Moduldokstring Punkt 12) - Mindestanzahl an Analog-Tagen, die
-# find_analogs() IMMER aufnimmt, unabhaengig von Distanz/Kernel-Gewicht.
-# Verhindert einen kompletten Ausfall der Tabelle in Marktphasen ohne nahe
-# historische Entsprechung (z.B. scharfe Krisen). Bewusst als Modul-Konstante
-# statt Sidebar-Eingabe - selten geaendert, und ein zu kleiner Wert wuerde
-# genau das Problem wieder einfuehren, das dieser Fix beheben soll.
 _ANALOG_MIN_CANDIDATES = 20
-
-# Schwellenwert fuer die 'geringe effektive Datenbasis'-Warnung unterhalb
-# der Analog-Ergebnistabelle (siehe Moduldokstring Punkt 12) - orientiert
-# sich an der bestehenden "< 30 Analog-Tage"-Warnung in dashboard_analog.py.
 _LOW_N_EFF_WARNING = 10.0
-
-# NEU (siehe Moduldokstring Punkt 13) - Schwellen/Farben fuer die
-# Zeilenfaerbung der Analog-Tabelle.
 _ROBUST_TSTAT_THRESHOLD = 2.0
 _ROBUST_MIN_PERIODS_MATCH = 5   # mindestens 5 von 6 Teilperioden
+_REQUIRED_T_DAYS = list(range(1, 31))
 
 _ROW_STYLE = {
     "green": "background-color: rgba(46, 160, 67, 0.30)",
@@ -184,22 +78,51 @@ _ROW_STYLE = {
 }
 
 
+def _ensure_training_table() -> None:
+    """Prueft, ob die training_table alle Laufzeiten 1..30 enthaelt. Falls
+    nicht (alte Tabelle), wird ein Hinweis + Button angezeigt, der
+    build_dataset.py in einem Subprozess ausfuehrt (dauert einige Minuten).
+    Die Seite bleibt bis dahin mit den vorhandenen Laufzeiten nutzbar."""
+    try:
+        tt = load_training_table()
+    except Exception:
+        return
+    if tt is None or tt.empty:
+        return
+    have = set(available_t_days(tt))
+    missing = [t for t in _REQUIRED_T_DAYS if t not in have]
+    if not missing:
+        return
+    st.warning(
+        f"Die Trainingstabelle enthaelt nur die Laufzeiten {sorted(have)} - es fehlen "
+        f"{len(missing)} von 30 (T_days 1..30). Einmal neu bauen (dauert einige Minuten)."
+    )
+    if st.button("Trainingstabelle jetzt neu bauen (T_days 1-30)"):
+        script = Path(__file__).resolve().parent / "build_dataset.py"
+        with st.spinner("Baue Trainingstabelle - bitte warten, das kann mehrere Minuten dauern..."):
+            proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
+        if proc.returncode == 0:
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.session_state.pop("livechain_analog_ctx", None)
+            st.success("Trainingstabelle neu gebaut. Seite wird neu geladen.")
+            st.rerun()
+        else:
+            st.error("build_dataset.py ist fehlgeschlagen:")
+            st.code((proc.stdout or "")[-1500:] + "\n" + (proc.stderr or "")[-3000:])
+
+
 def _robustness_row_state(df: pd.DataFrame) -> pd.Series:
-    """Klassifiziert jede Zeile als 'green' (alle Robustheitskriterien positiv
-    erfuellt), 'red' (alle spiegelbildlich negativ erfuellt) oder '' (Rest).
-
-    green: t(gesamt) > 2, CI != 0, Perioden-Match >= 5, t(Val) > 2, Robust (Train+Val)
-    red:   t(gesamt) < -2, CI != 0, Perioden-Match >= 5, t(Val) < -2,
-           gespiegeltes Robust-Flag (beide Haelften signifikant, gleiches NEGATIVES Vorzeichen)
-
-    NaN-Werte (uebersprungene Zeilen) ergeben bei jedem Vergleich False -> ''."""
+    """'green' (alle Robustheitskriterien positiv), 'red' (spiegelbildlich
+    negativ) oder '' (Rest). NaN -> ''."""
     T = _ROBUST_TSTAT_THRESHOLD
     tstat_full = pd.to_numeric(df["tstat_full"], errors="coerce")
     tstat_val = pd.to_numeric(df["tstat_val"], errors="coerce")
     periods_ok = pd.to_numeric(df["subperiod_matching"], errors="coerce") >= _ROBUST_MIN_PERIODS_MATCH
     ci_ok = df["ci_excludes_zero_full"].eq(True)
     robust_pos = df["robust_train_val"].eq(True)
-    # Fallback, falls Ergebnisse aus einem aelteren Lauf (ohne neue Spalte) in session_state liegen
     robust_neg = df.get("robust_train_val_neg", pd.Series(False, index=df.index)).eq(True)
 
     green = (tstat_full > T) & ci_ok & periods_ok & (tstat_val > T) & robust_pos
@@ -214,36 +137,10 @@ def _robustness_row_state(df: pd.DataFrame) -> pd.Series:
 def _required_premium_for_profit_factor(payout: np.ndarray, weights: np.ndarray,
                                          target_pf: float = 3.0,
                                          max_iter: int = 60) -> float | None:
-    """Bisektion (siehe Moduldokstring Punkt 11): gesuchter EINHEITLICHER
-    Entry-Preis x, bei dem sich - gegen die uebergebenen Payouts - ein
-    Profit Factor von genau target_pf ergeben wuerde.
-
-    PF(x) = GrossProfit(x) / GrossLoss(x) mit net_pnl_i(x) = x - payout_i
-    ist monoton nicht-fallend in x (mit steigendem x werden mehr Tage zu
-    Gewinnern, und die Gewinnmargen wachsen, waehrend Verlustmargen
-    schrumpfen) - deshalb Bisektion statt eines Gradientenverfahrens,
-    robuster gegen die stueckweise-lineare, an den payout_i-Werten
-    geknickte Struktur von PF(x).
-
-    NEU (siehe Moduldokstring Punkt 12): `weights` sind die Kernel-Gewichte
-    (siehe analog_matching.find_analogs()) der zugehoerigen Analog-Tage -
-    PF(x) wird jetzt GEWICHTET berechnet (jeder Analog-Tag zaehlt mit
-    seinem Gewicht statt gleich), konsistent zur Ablösung des harten
-    max_distance-Cutoffs an der Quelle.
-
-    WICHTIG: `payout` muss bereits auf EINE konsistente Skala gebracht sein
-    (siehe _payout_at_todays_scale() - NICHT direkt die rohen, ueber
-    Jahrzehnte unterschiedlicher Index-Niveaus gemischten
-    entry_premium_i/net_pnl_i-Werte aus evaluate_analog_set() verwenden,
-    siehe Moduldokstring Punkt 11 fuer die Begruendung).
-
-    Sonderfall: sind ALLE Payouts 0 (Struktur ist auf dem kompletten
-    Analog-Set nie ins Geld gelaufen), ist JEDER Preis >= 0 bereits
-    verlustfrei (PF technisch nicht definiert/unendlich) - dann wird 0.0
-    zurueckgegeben ('jeder Preis reicht bereits'). Gibt None zurueck, falls
-    die obere Bisektions-Grenze (numerisch) nicht ausreicht (praktisch so
-    gut wie nie, da PF(x)->unendlich fuer x->unendlich), oder falls keine
-    gueltigen (gewichteten) Payouts vorliegen."""
+    """Bisektion: einheitlicher Entry-Preis x, bei dem sich (gewichtet, gegen
+    die Payouts auf heutiger Skala) ein Profit Factor von target_pf ergibt.
+    PF(x) ist monoton nicht-fallend in x. Sind alle Payouts 0, wird 0.0
+    zurueckgegeben; None, falls nicht loesbar oder keine gueltigen Payouts."""
     payout = np.asarray(payout, dtype=float)
     weights = np.asarray(weights, dtype=float)
     mask = ~np.isnan(payout) & ~np.isnan(weights) & (weights > 0.0)
@@ -278,36 +175,10 @@ def _required_premium_for_profit_factor(payout: np.ndarray, weights: np.ndarray,
 def _payout_at_todays_scale(entry_S: np.ndarray, exit_S: np.ndarray, weights: np.ndarray,
                              spot_today: float, strike_put: float, strike_call: float
                              ) -> tuple[np.ndarray, np.ndarray]:
-    """KORREKTUR (siehe Moduldokstring Punkt 11): loest das Skalenproblem
-    einer Analog-Suche, die - bei ausreichend grosser max_distance/
-    min_candidates-Garantie (siehe Punkt 12) - die KOMPLETTE SPX-Historie
-    seit 1927 umfassen kann. Der Index stand dort bei voellig
-    unterschiedlichen absoluten Niveaus (z.B. ~5 Punkte 1932 vs. ~7500
-    Punkte heute) - eine direkte Verwendung der historischen,
-    per-era-spezifischen Modell-Strikes/Payouts (aus evaluate_analog_set(),
-    dort fuer die Delta-Treffgenauigkeit auf JEDES Analog-Tages EIGENEN
-    Spot-Stand berechnet) wuerde bei einer Preis-Schwellenwert-Berechnung
-    wie hier automatisch die betragsmaessig grossen, MODERNEN Analog-Tage
-    massiv staerker gewichten als alte - unabhaengig davon, ob sie relativ
-    gesehen ueberhaupt schlechter liefen (das genau war der Fehler in der
-    ersten Version dieser Funktion).
-
-    Fix: statt der historischen absoluten Kursbewegung wird nur die
-    PROZENTUALE Kursbewegung jedes Analog-Tages uebernommen
-    (exit_S/entry_S - 1) und auf den HEUTIGEN Spot projiziert - das ergibt
-    einen hypothetischen 'heutigen' Exit-Spot je Analog-Tag, alle auf
-    EXAKT DERSELBEN (heutigen) Skala. Ausgewertet wird dagegen mit den
-    ECHTEN, in der Optionskette sichtbaren Strikes (strike_put/strike_call
-    aus Teil A) - NICHT mit den historischen, per-era-spezifischen
-    Modell-Strikes aus evaluate_analog_set(). Ergebnis: ein Payout je
-    Analog-Tag, alle in HEUTIGEN Punkten, direkt vergleichbar mit dem
-    HEUTE am Markt verfuegbaren Preis (Mid Put + Mid Call).
-
-    NEU (siehe Moduldokstring Punkt 12): gibt zusaetzlich die zu jedem
-    Payout gehoerenden Kernel-Gewichte zurueck (gleiche Maskierung wie
-    entry_S/exit_S), damit 'Preis fuer PF=3' konsistent zur
-    kontinuierlichen Gewichtung berechnet werden kann statt jeden
-    Analog-Tag gleich zu zaehlen."""
+    """Payout je Analog-Tag auf HEUTIGER Skala: nur die PROZENTUALE
+    Kursbewegung (exit_S/entry_S - 1) wird uebernommen, auf den heutigen Spot
+    projiziert und gegen die ECHTEN Strikes ausgewertet. Gibt (payout,
+    weights) mit gleicher Maskierung zurueck."""
     entry_S = np.asarray(entry_S, dtype=float)
     exit_S = np.asarray(exit_S, dtype=float)
     weights = np.asarray(weights, dtype=float)
@@ -323,16 +194,10 @@ def _payout_at_todays_scale(entry_S: np.ndarray, exit_S: np.ndarray, weights: np
 
 
 def _build_daily_df_with_today(daily_df: pd.DataFrame):
-    """Haengt einen synthetischen 'Heute'-Tagesbalken an eine KOPIE von
-    daily_df an (open=high=low=close=heutiger Eroeffnungskurs), damit die
-    Analog-Suche waehrend eines laufenden Handelstags nicht auf den letzten
-    ABGESCHLOSSENEN Tag zurueckfaellt (z.B. montags auf Freitag, 3 Tage alt).
-    Dieselbe open=high=low=close-Konvention wie fuer die interpolierten
-    Shiller-Monatsdaten im Rest des Projekts (siehe dashboard_common.py).
-
-    Faellt auf den letzten echten Schlusskurs zurueck (used_fallback=True),
-    falls kein Eroeffnungskurs verfuegbar ist (vor Handelsbeginn/Wochenende).
-
+    """Haengt einen synthetischen 'Heute'-Tagesbalken (open=high=low=close=
+    heutiger Eroeffnungskurs) an eine KOPIE von daily_df an. Faellt auf den
+    letzten echten Schlusskurs zurueck (used_fallback=True), falls kein
+    Eroeffnungskurs verfuegbar ist.
     Rueckgabe: (daily_df_erweitert, query_date, used_fallback)."""
     today = pd.Timestamp(date.today())
     if (daily_df["date"] == today).any():
@@ -352,94 +217,78 @@ def _build_daily_df_with_today(daily_df: pd.DataFrame):
     return out, today, False
 
 
+def _find_today_analogs(daily_df, chosen_dte_exact, max_distance, bandwidth, min_gap):
+    """Analog-Suche fuer 'heute' (von Teil B und Teil C gemeinsam genutzt,
+    in st.session_state gecacht)."""
+    training_table = load_training_table()
+    if training_table.empty:
+        st.error("Keine Trainingstabelle gefunden - `python src/build_dataset.py` ausfuehren.")
+        return None
+    valid_t_days = available_t_days(training_table)
+    key = (round(chosen_dte_exact, 4), float(max_distance), float(bandwidth), int(min_gap),
+           date.today(), len(training_table), tuple(valid_t_days))
+    cached = st.session_state.get("livechain_analog_ctx")
+    if cached is not None and cached["key"] == key:
+        return cached
+
+    T_days_used = min(valid_t_days, key=lambda t: abs(t - chosen_dte_exact))
+    if abs(T_days_used - chosen_dte_exact) > 1.0:
+        st.info(f"Restlaufzeit {chosen_dte_exact:.2f} Tage wird auf T_days={T_days_used} gerundet "
+                f"(verfuegbar: {valid_t_days}).")
+
+    daily_df_today, query_date, used_fallback = _build_daily_df_with_today(daily_df)
+    if used_fallback:
+        st.warning(f"Kein heutiger Eroeffnungskurs verfuegbar - Analog-Suche nutzt "
+                   f"{pd.Timestamp(query_date).date()}.")
+
+    with st.spinner("Baue Aehnlichkeits-Raum und suche Analog-Tage..."):
+        try:
+            feature_df = build_feature_matrix(daily_df_today, FeatureConfig())
+            if query_date not in set(feature_df["date"]):
+                st.error(f"{pd.Timestamp(query_date).date()} hat keine vollstaendigen Features "
+                         "(Warmup-Fenster noch nicht voll?).")
+                return None
+            space = fit_similarity_space(feature_df, SimilaritySpaceConfig(),
+                                         max_date=query_date + pd.Timedelta(days=1))
+            query_score = transform_query(space, feature_df.loc[feature_df["date"] == query_date].iloc[0])
+            analogs = find_analogs(
+                query_date, query_score, space,
+                AnalogConfig(max_distance=max_distance, min_gap_days=min_gap,
+                             use_kernel_weighting=True, bandwidth=bandwidth,
+                             min_candidates=_ANALOG_MIN_CANDIDATES),
+            )
+        except ValueError as e:
+            st.error(f"Analog-Suche fehlgeschlagen: {e}")
+            return None
+
+    ctx = dict(key=key, analogs=analogs, T_days_used=T_days_used, training_table=training_table,
+               daily_df_today=daily_df_today, query_date=query_date)
+    st.session_state["livechain_analog_ctx"] = ctx
+    return ctx
+
+
 def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
                       chosen_dte_exact: float, r_free: float, dividend_yield: float,
                       hv_length: int, rank_lookback: int,
                       analog_max_distance: float, analog_bandwidth: float, analog_min_gap: int,
                       spot_today: float) -> pd.DataFrame | None:
-    """Fuehrt den Analog-Tage-Lauf fuer JEDE Zeile von 'table' aus (siehe
-    Moduldokstring Punkt 1-8). Gibt None zurueck (mit st.error) bei
-    Abbruch, sonst ein DataFrame mit einer Zeile je distance_pct.
-
-    NEU (siehe Moduldokstring Punkt 12): find_analogs() wird mit
-    use_kernel_weighting=True aufgerufen - jeder Analog-Tag bekommt ein
-    stetiges Kernel-Gewicht statt eines harten Ja/Nein, und mindestens
-    _ANALOG_MIN_CANDIDATES Tage werden IMMER aufgenommen (auch in
-    Krisenphasen ohne nahe historische Entsprechung). Alle Kennzahlen
-    unten werden entsprechend GEWICHTET berechnet (summarize_analog_trades_
-    weighted()/weighted_reliability_summary()) - 'analog_n_eff' (Kish)
-    macht sichtbar, wenn eine Zeile trotz vorhandener Zeilenzahl kaum echte
-    Vergleichsinformation traegt.
-
-    NEU (siehe Moduldokstring Punkt 13): zusaetzlich 'robust_train_val_neg'
-    (gespiegeltes Robust-Flag fuer negative Edges) fuer die Rotfaerbung."""
-    training_table = load_training_table()
-    if training_table.empty:
-        st.error(
-            "Keine Trainingstabelle gefunden - einmal im Terminal "
-            "`python src/build_dataset.py` ausfuehren und die Seite neu laden."
-        )
+    """Analog-Tage-Lauf fuer JEDE Zeile von 'table' (siehe Moduldokstring).
+    Gibt None zurueck (mit st.error) bei Abbruch, sonst ein DataFrame mit
+    einer Zeile je distance_pct."""
+    ctx = _find_today_analogs(daily_df, chosen_dte_exact, analog_max_distance,
+                              analog_bandwidth, analog_min_gap)
+    if ctx is None:
         return None
+    analogs, T_days_used, training_table = ctx["analogs"], ctx["T_days_used"], ctx["training_table"]
+    query_date = ctx["query_date"]
+    try:
+        bounds = hv_rank_bounds(ctx["daily_df_today"], hv_length, rank_lookback)
+    except ValueError as e:
+        st.error(f"HV-Rang-Fenster fehlgeschlagen: {e}")
+        return None
+    st.caption(f"{len(analogs)} Analog-Tage gefunden (gilt fuer alle Zeilen, stetige Kernel-Gewichte).")
 
-    valid_t_days = available_t_days(training_table)
-    T_days_used = min(valid_t_days, key=lambda t: abs(t - chosen_dte_exact))
-    if abs(T_days_used - chosen_dte_exact) > 1.0:
-        st.info(
-            f"Restlaufzeit {chosen_dte_exact:.2f} Tage wird fuer die Analog-Bewertung "
-            f"auf das naechstgelegene verfuegbare T_days={T_days_used} gerundet "
-            f"(verfuegbar: {valid_t_days})."
-        )
-
-    daily_df_today, query_date, used_fallback = _build_daily_df_with_today(daily_df)
-    if used_fallback:
-        st.warning(
-            f"Kein heutiger Eroeffnungskurs verfuegbar (vor Handelsbeginn/Wochenende?) "
-            f"- Analog-Suche faellt auf den letzten echten Handelstag "
-            f"({pd.Timestamp(query_date).date()}) zurueck."
-        )
-
-    with st.spinner("Baue Aehnlichkeits-Raum und suche Analog-Tage (einmalig fuer alle Zeilen)..."):
-        try:
-            feature_df = build_feature_matrix(daily_df_today, FeatureConfig())
-            if query_date not in set(feature_df["date"]):
-                st.error(
-                    f"{pd.Timestamp(query_date).date()} hat keine vollstaendigen "
-                    "Features (Warmup-Fenster noch nicht voll?)."
-                )
-                return None
-            space = fit_similarity_space(
-                feature_df, SimilaritySpaceConfig(), max_date=query_date + pd.Timedelta(days=1),
-            )
-            query_row = feature_df.loc[feature_df["date"] == query_date].iloc[0]
-            query_score = transform_query(space, query_row)
-            # NEU (siehe Moduldokstring Punkt 12): kontinuierliche Kernel-
-            # Gewichtung + Mindest-Kandidaten-Garantie statt hartem Cutoff -
-            # verhindert einen Totalausfall in Krisenphasen ohne nahe
-            # historische Entsprechung.
-            analogs = find_analogs(
-                query_date, query_score, space,
-                AnalogConfig(
-                    max_distance=analog_max_distance,
-                    min_gap_days=analog_min_gap,
-                    use_kernel_weighting=True,
-                    bandwidth=analog_bandwidth,
-                    min_candidates=_ANALOG_MIN_CANDIDATES,
-                ),
-            )
-            bounds = hv_rank_bounds(daily_df_today, hv_length, rank_lookback)
-        except ValueError as e:
-            st.error(f"Analog-Suche fehlgeschlagen: {e}")
-            return None
-
-    st.caption(
-        f"{len(analogs)} Analog-Tage gefunden (einmalig ermittelt, gilt fuer alle Zeilen unten). "
-        "Jeder Tag geht mit einem stetigen Kernel-Gewicht ein (siehe 'Effektive n (Kish)' unten) "
-        "statt einer harten Ja/Nein-Aufnahme."
-    )
-
-    # Skew fuer den Analog-Lauf explizit AUS (siehe Moduldokstring Punkt 3) -
-    # damit die Delta-Definition dieselbe (flache) bleibt wie in den
-    # Modell-Delta-Spalten von Teil A.
+    # Skew fuer den Analog-Lauf explizit AUS (flache Delta-Definition wie in Teil A).
     vol_surface = VolSurfaceConfig(use_vol_surface=False)
 
     progress = st.progress(0.0)
@@ -454,122 +303,82 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
         call_delta = row.model_delta_call_pct / 100.0 if pd.notna(row.model_delta_call_pct) else None
         today_rank = row.hv_rank_pct / 100.0 if pd.notna(row.hv_rank_pct) else None
 
-        # (siehe Moduldokstring Punkt 8): heutige (reale) Entry-Praemie
-        # DIESER Zeile - Grundlage fuer die 'erwarteter Gewinn'-Spalten
-        # unten. Kann NaN sein, falls put_row/call_row in Teil A fuer diese
-        # Zeile nicht gefunden wurden (siehe build_symmetric_distance_table) -
-        # dann bleiben auch die erwarteter-Gewinn-Spalten NaN.
         entry_premium_today = None
         if pd.notna(row.mid_put) and pd.notna(row.mid_call):
             entry_premium_today = float(row.mid_put) + float(row.mid_call)
 
-        # GUARD (Fix): bei sehr weiten Zielabstaenden (siehe Distanz-Raster
-        # in der Sidebar, per Default bis 40%) kann das reale Modell-Delta
-        # numerisch auf EXAKT 0.0 runden (echte Zahl, kein None - der obige
-        # None-Check greift hier also NICHT). Ein Ziel-Delta von exakt 0
-        # entspricht rechnerisch einem Strike bei unendlich -
-        # solve_strike_delta_consistent()/leg_price() liefern dafuer keine
-        # sinnvolle Loesung mehr (Absturz mit 'ValueError: expected a
-        # positive input, got 0.0' tief in black76.py). Solche Zeilen daher
-        # genauso behandeln wie die bereits vorhandenen None-Faelle -
-        # ueberspringen statt den kompletten Bulk-Lauf abzubrechen.
+        skipped = {
+            "distance_pct": row.distance_pct, "analog_n": None, "analog_n_eff": None,
+            "analog_n_eff_hac": None, "entry_premium_today": entry_premium_today,
+            "expected_profit_short": None, "required_premium_pf3": None,
+        }
+
+        # GUARD: Delta exakt 0 (sehr weite Abstaende) -> Zeile ueberspringen
         if (put_delta is None or call_delta is None or today_rank is None
                 or put_delta <= 0.0 or call_delta <= 0.0):
-            results.append({
-                "distance_pct": row.distance_pct, "analog_n": None, "analog_n_eff": None,
-                "entry_premium_today": entry_premium_today,
-                "expected_profit_short": None,
-                "required_premium_pf3": None,
-            })
+            results.append(skipped)
             continue
 
-        # ZUSAETZLICHER GUARD: selbst mit obigem Filter kann eine einzelne
-        # Zeile aus einem anderen numerischen Grenzfall heraus fehlschlagen
-        # (z.B. ein einzelner entarteter Analog-Tag). Ein try/except HIER
-        # (statt den Fehler bis dashboard.py durchschlagen zu lassen) sorgt
-        # dafuer, dass nur DIESE Zeile als 'n/a' markiert wird und der
-        # Bulk-Lauf fuer alle anderen Zeilen trotzdem fertig laeuft.
         try:
             full_eval = evaluate_analog_set(
                 analogs, training_table, bounds, T_days_used, put_delta, call_delta,
                 r_free, dividend_yield, vol_surface, vol_mode="rank", today_rank=today_rank,
+                query_date=query_date,
             )
         except (ValueError, ZeroDivisionError) as e:
             st.caption(
                 f"⚠️ Ziel-Abstand {row.distance_pct:g}%: Bewertung numerisch "
                 f"fehlgeschlagen ({e}) - Zeile wird als n/a markiert, Rest laeuft weiter."
             )
-            results.append({
-                "distance_pct": row.distance_pct, "analog_n": None, "analog_n_eff": None,
-                "entry_premium_today": entry_premium_today,
-                "expected_profit_short": None,
-                "required_premium_pf3": None,
-            })
+            results.append(skipped)
             continue
 
         if full_eval.empty:
-            results.append({
-                "distance_pct": row.distance_pct, "analog_n": 0, "analog_n_eff": 0.0,
-                "entry_premium_today": entry_premium_today,
-                "expected_profit_short": None,
-                "required_premium_pf3": None,
-            })
+            results.append({**skipped, "analog_n": 0, "analog_n_eff": 0.0, "analog_n_eff_hac": 0.0})
             continue
 
-        # NEU (siehe Moduldokstring Punkt 12): GEWICHTET statt gleichgewichtet.
         trade_summary = summarize_analog_trades_weighted(full_eval, "short")
-        rel_full = weighted_reliability_summary(full_eval, "short", 6)
+        # HAC-Statistik auf skalenfreier Basis pnl_spot
+        rel_full = weighted_reliability_summary(full_eval, "short", 6, "pnl_spot")
 
         median_date = full_eval["entry_date"].median()
         train_eval = full_eval[full_eval["entry_date"] < median_date]
         val_eval = full_eval[full_eval["entry_date"] >= median_date]
-        train_rel = weighted_reliability_summary(train_eval, "short", 4)
-        val_rel = weighted_reliability_summary(val_eval, "short", 4)
+        train_rel = weighted_reliability_summary(train_eval, "short", 4, "pnl_spot")
+        val_rel = weighted_reliability_summary(val_eval, "short", 4, "pnl_spot")
 
         robust = False
-        robust_neg = False   # NEU (Punkt 13): gespiegeltes Flag fuer negative Edges (Rotfaerbung)
-        if train_rel["n_eff"] >= 2.0 and val_rel["n_eff"] >= 2.0:
-            robust = bool(
-                train_rel["ci_excludes_zero"] and val_rel["ci_excludes_zero"]
-                and np.sign(train_rel["mean_pnl_norm"]) == np.sign(val_rel["mean_pnl_norm"])
-                and np.sign(train_rel["mean_pnl_norm"]) > 0.0
-            )
-            robust_neg = bool(
-                train_rel["ci_excludes_zero"] and val_rel["ci_excludes_zero"]
-                and np.sign(train_rel["mean_pnl_norm"]) == np.sign(val_rel["mean_pnl_norm"])
-                and np.sign(train_rel["mean_pnl_norm"]) < 0.0
-            )
+        robust_neg = False
+        if train_rel["n_eff_hac"] >= 2.0 and val_rel["n_eff_hac"] >= 2.0:
+            same_sign = np.sign(train_rel["mean_pnl_norm"]) == np.sign(val_rel["mean_pnl_norm"])
+            both_sig = train_rel["ci_excludes_zero"] and val_rel["ci_excludes_zero"]
+            robust = bool(both_sig and same_sign and np.sign(train_rel["mean_pnl_norm"]) > 0.0)
+            robust_neg = bool(both_sig and same_sign and np.sign(train_rel["mean_pnl_norm"]) < 0.0)
 
-        # (siehe Moduldokstring Punkt 8): avg_pnl_norm_pct ist IMMER aus
-        # Short-Sicht (summarize_analog_trades_weighted(full_eval, "short")) -
-        # mit der heutigen Entry-Praemie DIESER Zeile multipliziert ergibt
-        # das den erwarteten Gewinn in PUNKTEN, vergleichbar ueber Zeilen
-        # hinweg (statt der relativen %-Kennzahl, die auf die historische
-        # Analog-Praemie JEDES einzelnen Tages normiert ist).
-        expected_profit_short = None
-        if entry_premium_today is not None and pd.notna(trade_summary["avg_pnl_norm_pct"]):
-            avg_pnl_norm_frac = trade_summary["avg_pnl_norm_pct"] / 100.0
-            expected_profit_short = avg_pnl_norm_frac * entry_premium_today
-
-        # (siehe Moduldokstring Punkt 11/12): historische PROZENTUALE
-        # Kursbewegungen (nicht absolute Punkte!) jedes Analog-Tages auf
-        # den HEUTIGEN Spot projizieren und gegen die ECHTEN, heute in der
-        # Optionskette sichtbaren Strikes auswerten - GEWICHTET mit dem
-        # Kernel-Gewicht jedes Analog-Tages.
+        # Erwarteter Gewinn direkt in PUNKTEN: historische %-Bewegungen auf den
+        # heutigen Spot projiziert, gegen die ECHTEN Strikes, gewichtet -
+        # keine Division durch Modellpraemien.
         payout, payout_weights = _payout_at_todays_scale(
             full_eval["entry_S"].to_numpy(), full_eval["exit_S"].to_numpy(),
             full_eval["weight"].to_numpy(), spot_today,
             float(row.strike_put), float(row.strike_call),
         )
+        expected_profit_short, avg_pnl_norm_pct_today = None, None
+        if entry_premium_today is not None and len(payout) and payout_weights.sum() > 0.0:
+            exp_payout = float(np.sum(payout_weights * payout) / payout_weights.sum())
+            expected_profit_short = entry_premium_today - exp_payout
+            if entry_premium_today > 0.0:
+                avg_pnl_norm_pct_today = expected_profit_short / entry_premium_today * 100.0
         required_premium_pf3 = _required_premium_for_profit_factor(payout, payout_weights, target_pf=3.0)
 
         results.append({
             "distance_pct": row.distance_pct,
             "analog_n": trade_summary["n_trades"],
             "analog_n_eff": trade_summary["n_eff"],
+            "analog_n_eff_hac": rel_full["n_eff_hac"],
             "win_rate_pct": trade_summary["win_rate_pct"],
             "profit_factor": trade_summary["profit_factor"],
-            "avg_pnl_norm_pct": trade_summary["avg_pnl_norm_pct"],
+            "avg_pnl_norm_pct": avg_pnl_norm_pct_today,
             "entry_premium_today": entry_premium_today,
             "expected_profit_short": expected_profit_short,
             "required_premium_pf3": required_premium_pf3,
@@ -579,7 +388,7 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
             "subperiod_nonempty": rel_full["subperiod_nonempty"],
             "tstat_val": val_rel["tstat"],
             "robust_train_val": robust,
-            "robust_train_val_neg": robust_neg,   # NEU (Punkt 13)
+            "robust_train_val_neg": robust_neg,
         })
 
     status.empty()
@@ -589,6 +398,122 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
     out["T_days_used"] = T_days_used
     out["n_analogs_total"] = len(analogs)
     return out
+
+
+def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spot,
+                           max_distance, bandwidth, min_gap, distance_key) -> None:
+    """TEIL C: modellfreie Iron-Condor-Suche (siehe condor_search.py)."""
+    st.divider()
+    st.subheader("Iron-Condor-Suche (modellfrei, tagesgenau)")
+    st.caption(
+        "Jedes Paar (Short-Zeile i, Fluegel-Zeile j mit groesserem Abstand) wird auf DENSELBEN "
+        "Analog-Tagen bewertet: Kredit = heutige Bid/Ask-Preise, Payout = historische %-Bewegung "
+        "auf den heutigen Spot projiziert. Short und Fluegel gemeinsam pro Tag (korrelationsrichtig), "
+        "kein Vola-Modell. RANKING: hoechster Erwartungswert in Punkten unter allen Kandidaten. "
+        "Kandidat = Condor mit Erwartungswert in Train UND Val > 0, HAC-t-Stat > Schwelle (nur Schwelle, "
+        "kein Ranking), Tail-Kriterien erfuellt, Max-Loss <= Budget, UND die Short-Zeile ist als "
+        "Short-Strangle selbst gueltig (E, Train, Val > 0, t > Schwelle) UND Plateau: die Short-Zeilen "
+        "direkt ueber und unter (Abstand -1/+1 Raster) sind als Short-Strangle ebenfalls gueltig. "
+        "Die Long-Fluegel muessen keine Kriterien erfuellen. Randzeilen der Kette koennen nie Optimum sein."
+    )
+    if "bid_put" not in table.columns:
+        st.error("Distanz-Tabelle hat keine Bid/Ask-Spalten - Kette neu laden.")
+        return
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        basis = st.radio("Preisbasis", ["Bid/Ask (echt)", "Mid (Näherung)"], key="condor_basis",
+                         help="Ausserhalb der Handelszeit liefert Yahoo oft Bid/Ask=0 - dann Mid waehlen.")
+    with c2:
+        t_min = st.number_input("Min. t-Stat (HAC)", 0.0, 10.0, 3.0, 0.1, key="condor_tmin3")
+    with c3:
+        max_full = st.number_input("Max. Anteil Volltreffer-Verlust (%)", 0.0, 100.0, 3.0, 0.5,
+                                   key="condor_fullloss")
+    with c4:
+        tail_floor = st.number_input("Min. 5%-Quantil (Rendite/Max-Loss)", -1.0, 0.0, -0.75, 0.05,
+                                     key="condor_tail")
+    with c5:
+        loss_budget = st.number_input("Max-Loss-Budget (Punkte, 0 = unbegrenzt)", 0.0, 5000.0, 300.0, 25.0,
+                                      key="condor_budget",
+                                      help="Nur Condors mit Max-Loss <= Budget kommen in Frage. So werden "
+                                           "Condors mit gleichem Kapitaleinsatz verglichen.")
+
+    if st.button("Iron-Condor-Suche starten"):
+        ctx = _find_today_analogs(daily_df, chosen_dte_exact, max_distance, bandwidth, min_gap)
+        if ctx is not None:
+            moves = analog_moves(ctx["analogs"], ctx["training_table"], ctx["T_days_used"], ctx["query_date"])
+            cfg = CondorConfig(price_basis="mid" if basis.startswith("Mid") else "bidask",
+                               t_min=float(t_min), max_full_loss_share=max_full / 100.0,
+                               tail_floor=float(tail_floor), max_loss_budget=float(loss_budget))
+            cdf, sdf, meta = evaluate_condor_grid(table, moves, spot, cfg)
+            meta["T_days_used"] = ctx["T_days_used"]
+            st.session_state["livechain_condor"] = dict(key=distance_key, cdf=cdf, sdf=sdf, meta=meta)
+
+    res = st.session_state.get("livechain_condor")
+    if res is None:
+        return
+    if res["key"] != distance_key:
+        st.info("Tabelle/Expiry hat sich geaendert - Suche erneut starten.")
+        return
+    cdf, sdf, meta = res["cdf"], res["sdf"], res["meta"]
+    if cdf.empty:
+        st.warning("Kein gueltiges Paar (Kredit<=0 oder Bid/Ask fehlt). Bei Bid/Ask=0: Preisbasis 'Mid' testen.")
+        return
+
+    st.caption(
+        f"T_days={meta['T_days_used']} · {meta['n_days']} Analog-Tage (n_eff Kish {meta['n_eff']:.1f}, "
+        f"max. Haltedauer {meta['hold_max']}d) · {meta['n_pairs']} Paare getestet, "
+        f"{meta['n_base']} erfuellen die Basis-Kriterien, {meta['n_pass']} bestehen zusaetzlich Budget und Plateau."
+    )
+    if meta["n_pass"] == 0:
+        st.info("Kein Paar besteht alle Kriterien - kein belastbarer Condor-Edge fuer die heutige Lage.")
+    else:
+        b = cdf.iloc[0]
+        st.success(
+            f"Optimum (hoechster E[P&L] unter allen Kriterien): Short {b['strike_put_short']:.0f}P / {b['strike_call_short']:.0f}C, "
+            f"Fluegel {b['strike_put_wing']:.0f}P / {b['strike_call_wing']:.0f}C · Kredit {b['credit']:.2f}, "
+            f"Max-Loss {b['max_loss']:.2f} · E[P&L] {b['mean']:+.2f} Pkt = {b['ror']*100:+.1f}% auf Risikokapital "
+            f"(t={b['tstat']:.2f}, Val-E {b['e_val']:+.2f})."
+        )
+
+    yn = lambda s: s.map({True: "✅", False: "❌"})
+    show = pd.DataFrame({
+        "Short-Abstand %": cdf["distance_short"], "Flügel-Abstand %": cdf["distance_wing"],
+        "Put Flügel": cdf["strike_put_wing"], "Put Short": cdf["strike_put_short"],
+        "Call Short": cdf["strike_call_short"], "Call Flügel": cdf["strike_call_wing"],
+        "Kredit": cdf["credit"], "Max-Loss": cdf["max_loss"],
+        "E[P&L] (Pkt)": cdf["mean"], "Rendite/Risiko %": cdf["ror"] * 100,
+        "E Put-Spread": cdf["e_put_spread"], "E Call-Spread": cdf["e_call_spread"],
+        "t (HAC)": cdf["tstat"], "E Train": cdf["e_train"], "E Val": cdf["e_val"],
+        "Voll-Verlust %": cdf["full_loss_share"] * 100, "Voll-Verlust-Tage (n)": cdf["n_full_loss"],
+        "5%-Quantil (R/R)": cdf["q_tail"],
+        "Gewinnrate %": cdf["win_rate_pct"],
+        "Train>0": yn(cdf["c_train"]), "Val>0": yn(cdf["c_val"]), "t": yn(cdf["c_t"]),
+        "Tail": yn(cdf["c_tail"]), "Budget": yn(cdf["c_budget"]), "Short gültig": yn(cdf["c_short"]),
+        "Plateau (Short ±1)": yn(cdf["c_plateau"]),
+        "Kandidat": yn(cdf["passes"]),
+    })
+    fmt = {c: "{:.2f}" for c in show.select_dtypes("number").columns}
+    fmt.update({c: "{:.0f}" for c in ["Put Flügel", "Put Short", "Call Short", "Call Flügel", "Voll-Verlust-Tage (n)"]})
+    passing = show[cdf["passes"].to_numpy()]
+    if len(passing):
+        st.dataframe(passing.style.format(fmt, na_rep="n/a"), use_container_width=True, hide_index=True)
+    with st.expander(f"Alle getesteten Paare ({len(show)}) inkl. Kriterien"):
+        st.dataframe(show.style.format(fmt, na_rep="n/a"), use_container_width=True, hide_index=True)
+    if "short_df" in meta:
+        with st.expander("Short-Strangle je Zeile (Basis für Short-Kriterium und Plateau)"):
+            sh = meta["short_df"].copy()
+            sh["ok"] = sh["ok"].map({True: "✅", False: "❌"})
+            st.dataframe(sh.style.format({c: "{:.2f}" for c in sh.select_dtypes("number").columns},
+                                         na_rep="n/a"), use_container_width=True, hide_index=True)
+    with st.expander("Put- und Call-Spreads einzeln (welche Seite trägt den Edge?)"):
+        sd = sdf.sort_values(["side", "ror"], ascending=[True, False])[[
+            "side", "distance_short", "distance_wing", "strike_short", "strike_wing",
+            "credit", "max_loss", "mean", "ror", "tstat", "e_train", "e_val",
+        ]].copy()
+        sd["ror"] *= 100
+        st.dataframe(sd.style.format({c: "{:.2f}" for c in sd.select_dtypes("number").columns}, na_rep="n/a"),
+                     use_container_width=True, hide_index=True)
 
 
 def render(df, daily_df, has_resolution) -> None:
@@ -601,6 +526,8 @@ def render(df, daily_df, has_resolution) -> None:
         "HV-Rang wird automatisch an die gewaehlte Restlaufzeit gekoppelt "
         "(z.B. 7.5 Tage Restlaufzeit -> HV(7.5)-Fenster)."
     )
+
+    _ensure_training_table()
 
     with st.sidebar:
         st.divider()
@@ -629,36 +556,15 @@ def render(df, daily_df, has_resolution) -> None:
         dividend_yield = st.number_input("Dividendenrendite", 0.0, 0.10, 0.015, 0.001, format="%.3f")
         reload_chain = st.button(
             "Heutige Kette neu laden", type="primary",
-            help="Beim ERSTEN Oeffnen dieses Tabs wird die Kette automatisch geladen "
-                 "(siehe unten) - dieser Button ist nur fuer ein manuelles Neuladen "
-                 "noetig, z.B. nach Aenderung von DTE-Filter/Delta-Filter oder um "
-                 "einen aktuelleren Snapshot zu holen.",
+            help="Beim ERSTEN Oeffnen dieses Tabs wird die Kette automatisch geladen - "
+                 "dieser Button ist nur fuer ein manuelles Neuladen noetig, z.B. nach "
+                 "Aenderung von DTE-Filter/Delta-Filter oder fuer einen aktuelleren Snapshot.",
         )
 
-    # AUTO-LOAD (Fix): frueher musste 'Heutige Kette laden' bei JEDEM
-    # Tab-Wechsel erneut geklickt werden, bevor ueberhaupt etwas zu sehen
-    # war - das wirkte wie 'alles verschwindet beim Tab-Wechsel'. Jetzt wird
-    # beim ALLERERSTEN Aufruf dieses Tabs (kein 'livechain_enriched' in
-    # st.session_state) automatisch geladen, mit den aktuellen (Default-)
-    # Sidebar-Werten - kein Klick noetig. Ist einmal geladen, bleibt der
-    # Stand in st.session_state erhalten (siehe Modul-Docstring: Streamlit
-    # behaelt session_state ueber Tab-/Modus-Wechsel hinweg bei) - ein
-    # spaeterer Tab-Wechsel loescht NICHTS mehr. Der Button oben dient nur
-    # noch dem BEWUSSTEN manuellen Neuladen (z.B. nach Parameteraenderung
-    # oder fuer einen frischeren Snapshot).
     needs_initial_load = "livechain_enriched" not in st.session_state
     if reload_chain or needs_initial_load:
         with st.spinner("Lade heutige Kette und berechne Delta/IV je Serie..."):
             try:
-                # NEU (Staleness-Diagnose, siehe Moduldokstring Punkt 10):
-                # Fetch-Zeitpunkt EXPLIZIT festhalten und als `as_of` an
-                # enrich_chain_with_delta() durchreichen, statt den
-                # dortigen Default (pd.Timestamp.now() beim Funktionsaufruf)
-                # implizit zu nutzen - so bleibt der Referenzzeitpunkt fuer
-                # 'quote_age_minutes' konsistent mit dem, was wir dem Nutzer
-                # als 'Kette abgerufen um...' anzeigen, auch wenn der
-                # Streamlit-Rerun-Zyklus zwischen Fetch und Anzeige etwas
-                # Zeit vergehen laesst.
                 fetch_ts = pd.Timestamp.now(tz="UTC")
                 spot = fetch_today_spot()
                 chain = fetch_today_chain(min_dte=float(min_dte), max_dte=float(max_dte))
@@ -672,9 +578,6 @@ def render(df, daily_df, has_resolution) -> None:
                 st.error(f"Laden fehlgeschlagen: {e}")
                 if needs_initial_load:
                     return
-                # Bei einem manuellen Neuladen NICHT den ganzen Tab abbrechen -
-                # der vorherige (funktionierende) Stand in st.session_state
-                # bleibt dann einfach unveraendert sichtbar.
             else:
                 st.session_state["livechain_spot"] = spot
                 st.session_state["livechain_enriched"] = enriched
@@ -715,8 +618,6 @@ def render(df, daily_df, has_resolution) -> None:
         enriched = enriched.copy()
         enriched["dte_exact"] = enriched["dte"].astype(float)
 
-    # ── Expiry-Auswahl ZUERST (Datum + exakte fraktionale Resttage) - die
-    # HV-Periode haengt davon ab, muss also DANACH berechnet werden. ──
     expiry_info = (
         enriched[["expiry", "dte", "dte_exact"]]
         .drop_duplicates()
@@ -736,10 +637,6 @@ def render(df, daily_df, has_resolution) -> None:
         "Serien ca. 6.5h zu hoch)."
     )
 
-    # ── HV-Periode IMMER = Restlaufzeit (auf ganze Handelstage gerundet,
-    # da compute_hv()/hv_rank_bounds() ein ganzzahliges Rolling-Fenster
-    # brauchen - die fraktionale Restlaufzeit selbst geht weiterhin exakt
-    # in T_years fuer Black-76 ein, siehe Moduldokstring). ──
     hv_length = max(2, round(chosen_dte_exact))
     st.caption(
         f"→ HV-Periode automatisch auf **{hv_length} Handelstage** gesetzt "
@@ -783,9 +680,6 @@ def render(df, daily_df, has_resolution) -> None:
         r_free, dividend_yield, distance_targets_pct, hv_min, hv_max,
     )
 
-    # Grenzbereich erkennen: wiederholt sich strike_put/strike_call gegenueber
-    # der VORHERIGEN Zeile (Distanz-Grid ist aufsteigend sortiert), ist die
-    # Kette (nach Filter) an dieser Stelle "ausgegangen".
     put_stuck = table["strike_put"].astype(float).diff().eq(0)
     call_stuck = table["strike_call"].astype(float).diff().eq(0)
     if put_stuck.any() or call_stuck.any():
@@ -802,10 +696,6 @@ def render(df, daily_df, has_resolution) -> None:
             "|Delta|'-Filter in der Sidebar - dort verkleinern, um weiter OTM zu kommen."
         )
 
-    # NEU (siehe Moduldokstring Punkt 10): Quote-Alter-Warnung - unabhaengig
-    # vom Randbereich-Hinweis oben, da Staleness auch mitten in der Kette
-    # (nicht nur am Rand) auftreten kann, wie der Put/Call-Vergleich gegen
-    # externe Quellen gezeigt hat.
     stale_mask = (
         table["quote_age_put_min"].fillna(0) > _QUOTE_AGE_WARNING_MINUTES
     ) | (
@@ -823,7 +713,7 @@ def render(df, daily_df, has_resolution) -> None:
             "eine falsche Quote (bei ruhigem Markt bleibt eine Quote laenger gueltig), "
             "aber ein Hinweis, IV/Preis fuer diese Zeilen nicht ungeprueft zu "
             "uebernehmen - insbesondere wenn Put und Call fuer denselben Abstand "
-            "deutlich unterschiedliche IV zeigen (siehe Moduldokstring Punkt 10)."
+            "deutlich unterschiedliche IV zeigen."
         )
 
     show = table.rename(columns={
@@ -848,17 +738,14 @@ def render(df, daily_df, has_resolution) -> None:
         "Quote-Alter Put (Min.)", "Quote-Alter Call (Min.)",
     ]]
     st.caption(
-        "'Ziel-Δ' ist die Suchvorgabe (Zeilenlabel). 'Δ Put/Call (echt)' sind die "
-        "TATSAECHLICHEN, aus dem realen Mid-Preis per Black-76 zurueckgerechneten "
-        "Deltas der jeweils gewaehlten Option - koennen leicht vom Ziel abweichen, "
-        "da nur reale (diskrete) Strikes existieren. 'IV Kombi' = die EINE Vola, "
-        "die - in Black-76 fuer Put+Call GEMEINSAM eingesetzt - exakt die Summe "
-        "beider echter Mid-Preise reproduziert (kein Mittelwert der Einzel-IVs). "
-        "'HV-Rang' = wo diese Kombi-IV im HV-Min/Max-Fenster oben liegt. "
-        "'Quote-Alter' = Minuten seit dem letzten TATSAECHLICHEN Trade dieses "
-        "Strikes, bezogen auf den Fetch-Zeitpunkt oben (Naeherungswert fuer "
-        "Staleness, siehe Warnung oben und Moduldokstring Punkt 10 - kein "
-        "direkter Bid/Ask-Zeitstempel verfuegbar)."
+        "'Δ Put/Call (echt)' sind die TATSAECHLICHEN, aus dem realen Mid-Preis per "
+        "Black-76 zurueckgerechneten Deltas der jeweils gewaehlten Option - koennen "
+        "leicht vom Ziel abweichen, da nur reale (diskrete) Strikes existieren. "
+        "'IV Kombi' = die EINE Vola, die - in Black-76 fuer Put+Call GEMEINSAM "
+        "eingesetzt - exakt die Summe beider echter Mid-Preise reproduziert (kein "
+        "Mittelwert der Einzel-IVs). 'HV-Rang' = wo diese Kombi-IV im HV-Min/Max-"
+        "Fenster oben liegt. 'Quote-Alter' = Minuten seit dem letzten TATSAECHLICHEN "
+        "Trade dieses Strikes (Naeherungswert fuer Staleness)."
     )
     st.dataframe(
         show.style.format({
@@ -893,54 +780,42 @@ def render(df, daily_df, has_resolution) -> None:
             use_container_width=True, hide_index=True,
         )
 
-    # ── TEIL B: Analog-Tage-Simulation je Zeile (siehe Moduldokstring) ──
+    # ── TEIL B: Analog-Tage-Simulation je Zeile ──
     st.divider()
     st.subheader("Analog-Tage-Simulation je Zeile")
     st.caption(
-        "Fuehrt fuer JEDE Zeile oben (= reale Delta-Kombination) einen Analog-Tage-"
-        "Lauf aus - Ziel-HV-Rang je Zeile = 'HV-Rang % (dieser Kombi)' aus der "
-        "Tabelle oben, Put-/Call-Delta = die Modell-Delta-Spalten (flache HV, "
-        "Skew AUS). Analog-Tage werden NUR EINMAL gesucht (identisch fuer alle "
-        "Zeilen), danach je Zeile neu bewertet. Bei vielen Analog-Tagen x vielen "
-        "Zeilen kann das mehrere Minuten dauern - Fortschrittsbalken zeigt den Stand."
+        "Fuehrt fuer JEDE Zeile oben einen Analog-Tage-Lauf aus - Ziel-HV-Rang je Zeile = "
+        "'HV-Rang % (dieser Kombi)', Put-/Call-Delta = die Modell-Delta-Spalten (flache HV, "
+        "Skew AUS). Analog-Tage werden NUR EINMAL gesucht, danach je Zeile neu bewertet."
     )
     st.caption(
-        "**Kontinuierliche Gewichtung statt harter Distanz-Schwelle** (siehe "
-        "Moduldokstring Punkt 12): jeder Analog-Tag geht mit einem stetigen "
-        "Kernel-Gewicht ein, das mit seiner Ähnlichkeitsdistanz sinkt - statt ganz "
-        "drin oder ganz draussen zu sein. In Marktphasen ohne nahe historische "
-        "Entsprechung (z.B. scharfe Krisen) werden trotzdem immer ein paar der "
-        "naechstgelegenen Tage herangezogen, damit die Tabelle laedt - die Spalte "
-        "'Effektive n (Kish)' zeigt dann transparent an, wie wenig echte "
-        "Vergleichsinformation tatsaechlich dahintersteckt (deutlich kleiner als "
-        "'Analog-Trades (n)' = wenig belastbar)."
+        "**Kontinuierliche Gewichtung statt harter Distanz-Schwelle:** jeder Analog-Tag geht "
+        "mit einem stetigen Kernel-Gewicht ein; mindestens "
+        f"{_ANALOG_MIN_CANDIDATES} Tage werden immer aufgenommen. 'Effektive n (Kish)' und "
+        "'Effektive n (HAC)' zeigen, wie viel echte Vergleichsinformation dahintersteckt "
+        "(HAC beruecksichtigt zusaetzlich die Ueberlappung benachbarter Analog-Tage - "
+        "die t-Stats sind autokorrelationskorrigiert)."
     )
     st.caption(
-        "'Erw. Gewinn Short' (Punkte) = Ø norm. P&L% dieser Zeile multipliziert mit "
-        "der HEUTIGEN Entry-Praemie dieser Zeile (Mid Put + Mid Call oben) - damit "
-        "auf die reale, heutige Praemiengroesse bezogen statt nur relativ zur "
-        "historischen Analog-Praemie. Bewertet NUR das Short-Bein (Praemien-Seite), "
-        "NICHT die Wings. Fuer die Wing-Auswahl und vor allem fuer die echte "
-        "kombinierte Equity-Kurve (Short+Long GEMEINSAM, inkl. Korrelation zwischen "
-        "den Beinen) den Iron-Condor-Ladder-Backtest verwenden."
+        "'Erw. Gewinn Short' (Punkte) = heutige Praemie (Mid Put + Mid Call) minus "
+        "gewichteter erwarteter Payout (historische %-Bewegungen der Analog-Tage auf den "
+        "heutigen Spot projiziert, gegen die realen Strikes). 'Ø norm. P&L %' = dieser "
+        "Wert / heutige Praemie. Bewertet NUR das Short-Bein, NICHT die Wings - fuer "
+        "Condors siehe Teil C unten."
     )
     ac1, ac2, ac3 = st.columns(3)
     with ac1:
         analog_max_distance = st.number_input(
             "Max. Distanz (Performance-Grenze)", min_value=0.01, max_value=100.0, value=4.0, step=0.5,
             help="Kandidaten weiter als dieser Wert entfernt werden nur noch ueber die "
-                 "Mindest-Kandidaten-Garantie (siehe Bandbreite) beruecksichtigt. Deutlich "
-                 "groesser als die Kernel-Bandbreite waehlen, damit diese Grenze das "
-                 "Ergebnis normalerweise nicht beeinflusst.",
+                 "Mindest-Kandidaten-Garantie beruecksichtigt.",
         )
     with ac2:
         analog_bandwidth = st.number_input(
             "Kernel-Bandbreite σ (Gaussian)", min_value=0.01, max_value=50.0, value=1.0, step=0.1,
-            help="Ersetzt den frueheren harten Cutoff: jeder Analog-Tag geht mit Gewicht "
-                 "exp(-(Distanz/σ)²) ein, statt ganz drin oder ganz draussen zu sein. Kleiner σ "
-                 "= staerkere Fokussierung auf die aehnlichsten Tage. Mindestens "
-                 f"{_ANALOG_MIN_CANDIDATES} Tage werden IMMER aufgenommen, auch in Krisenphasen "
-                 "ohne nahe historische Entsprechung (siehe 'Effektive n (Kish)' unten).",
+            help="Jeder Analog-Tag geht mit Gewicht exp(-(Distanz/σ)²) ein. Kleiner σ = "
+                 "staerkere Fokussierung auf die aehnlichsten Tage. Mindestens "
+                 f"{_ANALOG_MIN_CANDIDATES} Tage werden IMMER aufgenommen.",
         )
     with ac3:
         analog_min_gap = st.number_input(
@@ -963,31 +838,18 @@ def render(df, daily_df, has_resolution) -> None:
     if stored is not None and stored_key == (chosen_expiry, tuple(distance_targets_pct)):
         merged = table.merge(stored, on="distance_pct", how="left")
 
-        # NEU (siehe Moduldokstring Punkt 12): Warnung, falls ein grosser Teil
-        # der Zeilen trotz vorhandener Analog-Trades kaum echte (gewichtete)
-        # Vergleichsinformation traegt - das Pendant zur bestehenden
-        # "< 30 Analog-Tage"-Warnung in dashboard_analog.py, hier auf n_eff
-        # statt der rohen Trade-Zahl bezogen, da die min_candidates-Garantie
-        # die rohe Zahl kuenstlich hochhalten kann.
-        if "analog_n_eff" in merged.columns:
-            low_neff = merged["analog_n_eff"].dropna()
+        if "analog_n_eff_hac" in merged.columns:
+            low_neff = merged["analog_n_eff_hac"].dropna()
             low_neff = low_neff[low_neff < _LOW_N_EFF_WARNING]
             if len(low_neff) > 0:
                 st.warning(
                     f"⚠️ {len(low_neff)} Zeile(n) haben eine effektive Stichprobengroesse "
-                    f"(Kish) unter {_LOW_N_EFF_WARNING:g} - das bedeutet, dass fuer diese "
-                    "Zeilen kaum nahe historische Vergleichstage existieren (typisch in "
-                    "ungewoehnlichen Marktphasen). Die Tabelle zeigt diese Zeilen trotzdem "
-                    "(statt sie komplett auszulassen), aber ihre Kennzahlen sind auf einer "
-                    "sehr duennen Datenbasis berechnet - siehe Spalte 'Effektive n (Kish)'."
+                    f"(HAC) unter {_LOW_N_EFF_WARNING:g} - fuer diese Zeilen existieren kaum "
+                    "unabhaengige nahe historische Vergleichstage (oder sie stammen aus wenigen "
+                    "ueberlappenden Ereignissen). Die Kennzahlen sind auf sehr duenner "
+                    "Datenbasis berechnet."
                 )
 
-        # NEU (siehe Moduldokstring Punkt 13): Zeilenzustand (gruen/rot/'')
-        # VOR dem Umbenennen/Auswaehlen der Spalten bestimmen - die Funktion
-        # arbeitet auf den internen Spaltennamen von 'merged'. Der Index von
-        # row_state ist derselbe wie der von show2 (rename/Spaltenauswahl
-        # aendern den Index nicht), daher kann das Styling ueber r.name
-        # nachschlagen.
         row_state = _robustness_row_state(merged)
 
         show2 = merged.rename(columns={
@@ -996,6 +858,7 @@ def render(df, daily_df, has_resolution) -> None:
             "strike_call": "Strike Call (real)",
             "analog_n": "Analog-Trades (n)",
             "analog_n_eff": "Effektive n (Kish)",
+            "analog_n_eff_hac": "Effektive n (HAC)",
             "win_rate_pct": "Gewinnrate %",
             "profit_factor": "Profit Factor",
             "avg_pnl_norm_pct": "Ø norm. P&L %",
@@ -1010,7 +873,7 @@ def render(df, daily_df, has_resolution) -> None:
             "robust_train_val": "Robust (Train+Val)",
         })[[
             "Ziel-Abstand % v. Spot", "Strike Put (real)", "Strike Call (real)",
-            "Analog-Trades (n)", "Effektive n (Kish)",
+            "Analog-Trades (n)", "Effektive n (Kish)", "Effektive n (HAC)",
             "Gewinnrate %", "Profit Factor",
             "Ø norm. P&L %", "Entry-Prämie heute (Pkt)",
             "Erw. Gewinn Short (Pkt)", "Preis für PF=3 (Pkt)",
@@ -1021,30 +884,20 @@ def render(df, daily_df, has_resolution) -> None:
             f"T_days fuer die Analog-Bewertung: "
             f"{int(stored['T_days_used'].iloc[0]) if len(stored) else 'n/a'} "
             f"(gerundet von {chosen_dte_exact:.2f} Tagen Restlaufzeit) · "
-            f"{int(stored['n_analogs_total'].iloc[0]) if len(stored) else 0} Analog-Tage gefunden "
-            "(bereits inkl. Mindest-Kandidaten-Garantie, siehe oben). "
-            "'Effektive n (Kish)' = gewichtete effektive Stichprobengroesse "
-            "((Σw)²/Σw²) - deutlich kleiner als 'Analog-Trades (n)' bedeutet, dass "
-            "wenige, sehr aehnliche Tage die Kennzahlen dominieren bzw. dass die "
-            "Zeile ueberwiegend aus der Mindest-Kandidaten-Garantie (weit entfernte "
-            "Tage mit winzigem Gewicht) besteht. "
-            "'Robust (Train+Val)' = Konfidenzintervall schliesst 0 aus UND gleiches "
-            "positives Vorzeichen in BEIDEN chronologischen Haelften des Analog-Sets. "
-            "'Preis für PF=3' = welcher (einheitliche) Entry-Preis auf dem KOMPLETTEN "
-            "Analog-Set (Short-Seite, gewichtet gegen die dort tatsaechlich angefallenen "
-            "historischen Payouts) einen Profit Factor von genau 3 ergeben haette - "
-            "liegt 'Entry-Prämie heute' darueber, waere der historische PF > 3 gewesen, "
-            "liegt sie darunter, entsprechend < 3 (siehe Moduldokstring Punkt 11; rein "
-            "historische Ruecksimulation, keine Zukunftsgarantie)."
+            f"{int(stored['n_analogs_total'].iloc[0]) if len(stored) else 0} Analog-Tage gefunden. "
+            "'Robust (Train+Val)' = Konfidenzintervall schliesst 0 aus UND gleiches positives "
+            "Vorzeichen in BEIDEN chronologischen Haelften. 'Preis für PF=3' = welcher "
+            "einheitliche Entry-Preis auf dem Analog-Set (gewichtet, gegen die historischen "
+            "Payouts auf heutiger Skala) einen Profit Factor von genau 3 ergeben haette - rein "
+            "historische Rueckrechnung, keine Zukunftsgarantie. Profit Factor und Gewinnrate "
+            "basieren noch auf der pnl_norm-Basis (am Rand durch kleine Modellpraemien verzerrbar)."
         )
         st.caption(
             "**Zeilenfarben:** 🟩 grün = alle Robustheitskriterien positiv erfüllt "
             f"(t-Stat gesamt > {_ROBUST_TSTAT_THRESHOLD:g}, CI ≠ 0, Perioden-Match ≥ "
             f"{_ROBUST_MIN_PERIODS_MATCH}/6, t-Stat Val > {_ROBUST_TSTAT_THRESHOLD:g}, "
-            "Robust Train+Val). 🟥 rot = spiegelbildlich negativ (t-Stat gesamt und Val "
-            f"< -{_ROBUST_TSTAT_THRESHOLD:g}, CI ≠ 0, Perioden-Match ≥ "
-            f"{_ROBUST_MIN_PERIODS_MATCH}/6, beide Hälften signifikant mit negativem "
-            "Vorzeichen). Alle anderen Zeilen ungefärbt."
+            "Robust Train+Val). 🟥 rot = spiegelbildlich negativ. Alle t-Werte sind "
+            "HAC-korrigiert. Alle anderen Zeilen ungefärbt."
         )
         st.dataframe(
             show2.style.apply(
@@ -1055,6 +908,7 @@ def render(df, daily_df, has_resolution) -> None:
                 "Strike Call (real)": "{:.0f}",
                 "Analog-Trades (n)": "{:.0f}",
                 "Effektive n (Kish)": "{:.1f}",
+                "Effektive n (HAC)": "{:.1f}",
                 "Gewinnrate %": "{:.1f}",
                 "Profit Factor": "{:.2f}",
                 "Ø norm. P&L %": "{:+.2f}",
@@ -1070,3 +924,10 @@ def render(df, daily_df, has_resolution) -> None:
         )
     elif stored is not None:
         st.info("Tabelle/Expiry hat sich seit dem letzten Analog-Lauf geaendert - bitte erneut starten.")
+
+    # ── TEIL C: Iron-Condor-Suche ──
+    _render_condor_section(
+        table, daily_df, chosen_expiry, chosen_dte_exact, spot,
+        float(analog_max_distance), float(analog_bandwidth), int(analog_min_gap),
+        (chosen_expiry, tuple(distance_targets_pct)),
+    )

@@ -1,256 +1,52 @@
 """
 Analog-Matching fuer die IC-Leg-Auswahl.
 
-GRUNDIDEE: statt eines global trainierten Klassifikators (train.py) wird
-direkt mit historischen "Analog-Tagen" gearbeitet:
+GRUNDIDEE: statt eines global trainierten Klassifikators wird direkt mit
+historischen "Analog-Tagen" gearbeitet:
 
   1. Finde alle Handelstage innerhalb einer Distanz-Schwelle im PCA-Raum zu
-     einem Query-Tag (Distanz im PCA-Raum der Tages-Features - siehe
-     fit_similarity_space()).
+     einem Query-Tag (siehe fit_similarity_space()).
   2. Rechne die Vola jedes Analog-Tags auf den HV-Rang des Query-Tags um
-     (siehe target_vol_for_rank() - direkte Erweiterung von
-     backtest.compute_rank_target_vol(), nur mit variablem statt festem
-     Ziel-Rang), damit ein "73%-Rang-Tag" von 1935 fair mit einem von 2021
-     vergleichbar ist. Das ist GENAU dasselbe Grundprinzip wie die im
-     Dashboard bereits vorhandene "Fixer IV-Rang"-Simulation
-     (backtest.FixedRankConfig/compute_rank_target_vol) - nur wird dort JEDER
-     Handelstag der gesamten Historie auf einen festen Rang umgerechnet,
-     hier NUR die Analog-Tage innerhalb der Distanz-Schwelle, und der
-     Ziel-Rang ist nicht fest eingestellt, sondern der TATSAECHLICHE heutige
-     Rang.
-  3. Bewerte auf diesen ranggerechten Analog-Tagen einen Short- UND Long-
-     Strangle (siehe reprice_leg_pair() - Long ist exakt das Spiegelbild des
-     Short, da keine Transaktionskosten modelliert werden: pnl_norm_long =
-     -pnl_norm_short, keine separate Simulation noetig - beide Richtungen
-     werden aus EINEM Repricing-Durchgang abgeleitet).
-  4. Suche per Grid-Search ueber Put-/Call-Delta-Kombinationen das robusteste
-     Leg-Paar, jeweils fuer Short UND Long (siehe leg_pair_grid_search() -
-     MIT Train/Validierungs-Split, um die Mehrfachvergleichs-Falle zu
-     entschaerfen, siehe Docstring dort).
+     (siehe target_vol_for_rank(), analog zu backtest.compute_rank_target_vol).
+  3. Bewerte auf diesen Analog-Tagen einen Short- UND Long-Strangle (siehe
+     reprice_leg_pair() - Long ist exakt das Spiegelbild des Short).
+  4. Grid-Search ueber Put-/Call-Delta-Kombinationen mit Train/Validierungs-
+     Split (siehe leg_pair_grid_search()).
 
-WICHTIG - Kausalitaet: find_analogs() beruecksichtigt fuer einen Query-Tag
-NUR Kandidaten mit Datum < Query-Datum (bei Backtests des Verfahrens selbst
-zusaetzlich: Analog-Tag muss VOR dem Query-Tag bereits abgeschlossen sein,
-also exit_date < query_date - sonst wuerde man in die Zukunft des simulierten
-'heute' schauen). Fuer den LIVE-Einsatz (Query-Tag = echter heutiger Tag)
-ist das automatisch erfuellt, da alle Analog-Tage ohnehin in der
-Vergangenheit liegen.
+WICHTIG - Kausalitaet: find_analogs() beruecksichtigt NUR Kandidaten mit
+Datum < Query-Datum. Bei langen Laufzeiten (T bis 30 Tage) kann ein Analog-
+Tag jedoch einen Exit NACH dem Query-Datum haben - evaluate_analog_set() hat
+dafuer den optionalen Parameter `query_date` (filtert exit_date <= query_date).
 
-KORREKTUREN GEGENUEBER DER URSPRUENGLICHEN FASSUNG (Review vor dem Einbau ins
-Dashboard - siehe Kommentare an den jeweiligen Stellen fuer Details):
-
-  1) KRITISCH - Newey-West auf falscher Reihenfolge: find_analogs() liefert
-     die Analog-Tage nach DISTANZ sortiert (naehester zuerst). Die
-     urspruengliche evaluate_analog_set() hat diese Reihenfolge unveraendert
-     an reliability_summary()/newey_west_tstat() weitergereicht. Newey-West
-     (Bartlett-Kernel) korrigiert Autokorrelation zwischen Zeile i und i+j -
-     das ist nur sinnvoll, wenn die Zeilenreihenfolge der KALENDER-Reihenfolge
-     entspricht (im Ladder-Backtest automatisch der Fall, da dort taeglich
-     ein Trade eroeffnet wird). Nach Distanz sortiert ist die Korrektur
-     wirkungslos fuer das eigentliche Problem, das sie loesen soll: Analog-
-     Tage haeufen sich in der Kalenderzeit (Vol-Regime dauern typischerweise
-     mehrere Tage bis Wochen an, daher sehen benachbarte Kalendertage oft
-     sehr aehnlich aus) - bei einem Test mit synthetischen Daten lagen ~40%
-     der (chronologisch sortierten) Analog-Tage nur 1 Kalendertag auseinander,
-     und bei einer konkreten Delta-Kombination (k=200, Put=Call=0.16) kippte
-     dadurch NACHWEISLICH die Signifikanz-Aussage (ci_excludes_zero True vs.
-     False) je nach Sortierreihenfolge. Fix: evaluate_analog_set() sortiert
-     das Ergebnis jetzt IMMER nach entry_date, bevor es an
-     reliability_summary() weitergegeben wird.
-
-  2) min_gap_days war als "Handelstage" dokumentiert, aber ueber
-     Kalendertage (np.timedelta64(..., "D")) auf dem Datum implementiert.
-     Fix: find_analogs() nutzt jetzt die Position in der (aufsteigend
-     sortierten) `space.dates`-Liste - das ist exakt Handelstage, wie im
-     Docstring behauptet.
-
-  3) reprice_leg_pair()/evaluate_analog_set() haben Short und Long bisher
-     ueber einen 'side'-Parameter GETRENNT bewertet - obwohl Long exakt das
-     Spiegelbild von Short ist (keine Transaktionskosten), wurde bei Bedarf
-     an beiden Richtungen der komplette (Strike-Solve + Black-76-Bewertungs-)
-     Durchlauf ZWEIMAL ausgefuehrt. Jetzt liefert reprice_leg_pair() beide
-     Richtungen aus einem einzigen Durchlauf zurueck - sowohl schneller als
-     auch garantiert konsistent. leg_pair_grid_search() bewertet dadurch pro
-     Delta-Kombination automatisch BEIDE Richtungen und meldet zurueck, welche
-     (falls ueberhaupt eine) robust ist.
-
-  4) NEU - Clustering-Diagnose (analog_clustering_diagnostic()): meldet, wie
-     stark sich die gefundenen Analog-Tage in der Kalenderzeit haeufen. Das
-     ist keine Korrektur der Statistik selbst (das leistet Punkt 1), sondern
-     eine explizite Warnung fuers Dashboard, wenn ein grosser Teil der
-     "unabhaengigen" Analog-Tage in Wahrheit aus wenigen historischen
-     Ereignissen (z.B. einer einzelnen Krise) stammt - das kann die
-     Newey-West-Korrektur zwar entschaerfen, aber nicht vollstaendig
-     kompensieren, wenn die effektive Anzahl unabhaengiger Beobachtungen
-     sehr viel kleiner als die Anzahl gefundener Analog-Tage ist.
-
-  5) NEU - T_days-Kompatibilitaetspruefung (available_t_days()): die
-     Analog-Bewertung nutzt entry_S/exit_S aus der vorab gebauten
-     training_table (siehe labels.py), die nur fuer die dort konfigurierten
-     StrangleLabelConfig.T_days_list-Werte existieren (Default [2,3,5,7,10,
-     14]). Ein T_days ausserhalb dieser Liste fuehrte bisher STILLSCHWEIGEND
-     zu einem leeren Ergebnis (0 Zeilen ueberall, kein Fehler). Jetzt wird
-     das explizit geprueft und mit einer klaren Fehlermeldung abgebrochen.
-
-  6) WICHTIGE ERGAENZUNG (kein Bugfix, sondern eine bewusste methodische
-     Ueberarbeitung nach Nutzer-Feedback) - zwei IV-Modi statt nur Rang:
-     der urspruengliche Ansatz (Punkt 2 der Grundidee oben) rechnet den
-     PERZENTIL-RANG von heute auf die HV-Bandbreite jedes Analog-Tages um.
-     Das ist ein rein theoretisches Konstrukt (ein "65%-Rang-Tag" ist keine
-     Aussage ueber ein reales Marktbewertungsniveau, sondern eine relative
-     Position in einer 90+ Jahre alten Verteilung) und spiegelt NICHT wider,
-     wie sich das TATSAECHLICHE heutige Bewertungsniveau (die IV, zu der
-     man heute wirklich handeln wuerde) an den Analog-Tagen verhalten haette.
-     evaluate_analog_set()/leg_pair_grid_search() unterstuetzen daher WEITER
-     zwei explizite Modi (Parameter `vol_mode`):
-       - "direct": verwendet auf JEDEM Analog-Tag exakt dieselbe absolute
-         Vola `today_iv` - das heutige Bewertungsniveau. Beantwortet:
-         "Haette ich HEUTE zu HEUTIGEN Konditionen gehandelt - wie waere
-         die Struktur gelaufen, waeren die tatsaechlichen Kursbewegungen
-         der historisch aehnlichsten Tage eingetreten?"
-       - "rank": die Perzentil-Umrechnung (s.o., siehe target_vol_for_rank).
-     (Siehe Punkt 8 fuer den seit dem Nutzer-Feedback ausschliesslich
-     verwendeten Modus im High-Level-Einstiegspunkt recommend_for_today().)
-
-  7) NEU - summarize_analog_trades(): dieselben Kennzahlen (Gewinnrate,
-     Profit Factor, Erwartungswert/Trade, beste/schlechteste Trade) wie
-     backtest.summarize_trades() bei der Ladder-Simulation, hier fuer die
-     Analog-Tage EINER Delta-Kombination/Richtung - fehlten in der
-     urspruenglichen Fassung komplett (dort gab es nur die
-     Newey-West-Kennzahlen aus reliability_summary(), aber keine der
-     "einfachen" Handelskennzahlen).
-
-     KORREKTUR (siehe Diskussion "dashboard_livechain.py Profit Factor
-     ergibt widerspruechliche Preis-Schwelle"): 'profit_factor' summierte
-     urspruenglich net_pnl_{side} - ABSOLUTE Punktbetraege - ueber alle
-     Analog-Tage. Bei einer Analog-Suche mit grosser max_distance (siehe
-     AnalogConfig) koennen die gefundenen Analog-Tage die GESAMTE
-     SPX-Historie seit 1927 umfassen - der Index stand dort bei voellig
-     unterschiedlichen absoluten Niveaus (z.B. ~5 Punkte 1932 vs. ~7500
-     Punkte heute). Eine Summe absoluter Punktbetraege UEBER diese Aeren
-     hinweg gewichtet automatisch die betragsmaessig grossen, MODERNEN Tage
-     massiv staerker als alte Tage - unabhaengig davon, ob diese relativ
-     gesehen ueberhaupt schlechter liefen. 'profit_factor' wird daher jetzt
-     aus pnl_norm_{side} (auf die jeweilige TAGESEIGENE Entry-Praemie
-     normierte Rendite, bereits an anderer Stelle im Modul fuer genau diesen
-     Zweck verwendet) statt aus net_pnl_{side} berechnet - jeder Analog-Tag
-     zaehlt dadurch mit GLEICHEM Gewicht, unabhaengig vom Index-Niveau
-     seiner Aera. 'avg_pnl'/'best_trade'/'worst_trade' bleiben bewusst in
-     absoluten Punkten (fuer die Einordnung einzelner Trades sinnvoll),
-     nur 'profit_factor' - eine aggregierte Kennzahl UEBER alle Analog-Tage
-     hinweg - wechselt auf die normierte Basis.
-
-  8) NEU (Vereinfachung nach Nutzer-Feedback) - recommend_for_today() nutzt
-     jetzt AUSSCHLIESSLICH den rang-basierten Modus (vol_mode="rank") und
-     erwartet dafuer direkt einen vom Nutzer eingegebenen Ziel-HV-Rang
-     (`target_rank_pct`, in Prozent, 0-100 - Werte ausserhalb extrapolieren
-     bewusst ueber das historische Fenster hinaus, identisch zu
-     backtest.FixedRankConfig.target_rank_pct). Der fruehere `vol_mode`-/
-     `today_iv_override`-Parameter dieser Funktion (Punkt 6, "direct"-Modus
-     bzw. ein manuell eingegebener/aus HV berechneter absoluter IV-Wert, aus
-     dem der Rang ERST rueckgerechnet wurde) entfaellt dadurch.
-
-     Der eigentliche Rechenkern ist UNVERAENDERT: fuer JEDEN Analog-Tag wird
-     weiterhin per target_vol_for_rank() rollierend zurueckgerechnet, welche
-     IV an GENAU DIESEM Tag noetig gewesen waere, um exakt den eingegebenen
-     Rang in seinem eigenen HV-Min/Max-Fenster (hv_length/rank_lookback_days)
-     zu erreichen - z.B. bedeutet Rang 40% an einem ruhigen Markttag eine
-     niedrige IV, in einer Vola-Krise (z.B. Finanzkrise 2008) bei DEMSELBEN
-     Rang 40% dagegen eine deutlich hoehere IV, weil sich dort das gesamte
-     HV-Min/Max-Fenster auf hoeherem Niveau befindet. Identisches Prinzip zum
-     'Fixer IV-Rang'-Modus im Iron-Condor-Ladder-Backtest
-     (backtest.FixedRankConfig/compute_rank_target_vol) - nur eben auf die
-     Analog-Tage innerhalb der Distanz-Schwelle statt auf JEDEN Handelstag
-     angewendet.
-
-     evaluate_analog_set()/leg_pair_grid_search() bleiben UNVERAENDERT und
-     unterstuetzen weiterhin beide Modi (siehe Punkt 6) fuer direkten
-     Gebrauch ausserhalb von recommend_for_today().
-
-  9) NEU (Umstellung nach Nutzer-Feedback) - Distanz-Schwelle statt fester
-     Anzahl (k): find_analogs() verwendet jetzt AnalogConfig.max_distance
-     statt AnalogConfig.k - es werden ALLE Kandidaten-Tage mit Distanz
-     <= max_distance verwendet, unabhaengig von ihrer Anzahl (frueher: die
-     k naechsten Tage, unabhaengig von ihrer absoluten Distanz). n_analogs
-     kann dadurch stark schwanken, je nachdem wie 'ungewoehnlich' der
-     Query-Tag im Aehnlichkeits-Raum liegt. analog_distance_distribution()
-     liefert eine Kalibrierungs-Vorschau (Perzentile der tatsaechlichen
-     Distanzen aller zulaessigen Kandidaten), damit sich im Dashboard eine
-     sinnvolle Schwelle ablesen laesst, OHNE dafuer schon den vollen
-     Grid-Search auszufuehren.
-
-  10) NEU - Delta-Eingabe per Strike (delta_for_strike()): das Dashboard
-      erlaubt jetzt, Put-/Call-Bein wahlweise per Strike statt per Delta
-      einzugeben. delta_for_strike() berechnet dafuer das zu einem
-      gegebenen Strike gehoerige Delta NUMERISCH per Bump-and-Reprice auf
-      dem Forward-Preis (zentrale Differenz), unter Verwendung von
-      forward_price()/leg_price() - also GENAU der Bewertungslogik (inkl.
-      Vol-Surface/Smile ueber `vol_surface`), die auch reprice_leg_pair()/
-      solve_strike_delta_consistent() verwenden. Es gibt bewusst KEINE
-      zweite, eigene Delta-Formel - dadurch bleibt das Ergebnis auch dann
-      konsistent, wenn sich die Bewertungslogik in black76.py spaeter
-      aendert. Delta wird als POSITIVE Groesse (Betrag) zurueckgegeben,
-      identisch zur sonst im Modul verwendeten Konvention (Put-Deltas
-      werden ebenfalls als positive Zahlen wie 0.10, 0.16 angegeben, nicht
-      mit oekonomischem Vorzeichen).
-
-  11) NEU - entry_S/exit_S im Ergebnis von evaluate_analog_set(): fuer die
-      "Preis fuer Profit Factor X"-Kennzahl in dashboard_livechain.py wird
-      die TATSAECHLICHE prozentuale Kursbewegung jedes Analog-Tages
-      benoetigt (nicht nur der bereits vorhandene, modellierte pnl_norm bei
-      einem PER-ERA-spezifischen Strike) - siehe dort fuer die Begruendung,
-      warum eine Skalen-konsistente Umrechnung auf den HEUTIGEN Spot noetig
-      ist. evaluate_analog_set() reicht entry_S/exit_S daher jetzt einfach
-      aus der ohnehin bereits nachgeschlagenen training_table-Zeile durch,
-      statt sie zu verwerfen - keine Verhaltensaenderung fuer bestehende
-      Aufrufer, die diese Spalten ignorieren.
-
-  12) NEU - Kontinuierliche Kernel-Gewichtung statt hartem Cutoff (OPT-IN
-      ueber AnalogConfig.use_kernel_weighting, Default AUS): der bisherige
-      harte Filter `dist <= max_distance` in find_analogs() hat zwei
-      Probleme gezeigt. Erstens ist das Ergebnis unstetig - ein Tag knapp
-      innerhalb vs. knapp ausserhalb der Schwelle wird komplett
-      unterschiedlich behandelt (volles Gewicht vs. gar keins), obwohl beide
-      nahezu gleich aehnlich sind. Zweitens - und das war der konkrete
-      Ausloeser - kann in Marktphasen, die im Aehnlichkeits-Raum sehr
-      ungewoehnlich liegen (z.B. scharfe Krisen ohne nahe historische
-      Entsprechung), das Ergebnis KOMPLETT LEER sein: kein einziger
-      Kandidat lag innerhalb max_distance, find_analogs() warf eine
-      ValueError, und in dashboard_livechain.py fuehrte das zum Abbruch des
-      GESAMTEN Bulk-Laufs (keine Tabelle wurde angezeigt) statt nur zu
-      wenigen/unsicheren Zeilen.
-
-      Fix: bei use_kernel_weighting=True bekommt jeder Kandidat statt einer
-      Ja/Nein-Mitgliedschaft ein STETIGES Gewicht
-      `weight = exp(-(distance/bandwidth)**2)` (Gaussian-Kernel,
-      `bandwidth` = sigma, Default max_distance/2). Zusaetzlich garantiert
-      `min_candidates` (Default 20), dass IMMER mindestens so viele der
-      naechstgelegenen Tage aufgenommen werden - unabhaengig davon, wie
-      gross ihre Distanz oder wie klein ihr Kernel-Gewicht ist. Dadurch
-      liefert find_analogs() in einer Krisenphase mit nur wenigen/weit
-      entfernten Vergleichstagen weiterhin ein nicht-leeres Ergebnis (die
-      Tabelle laedt), nur eben mit sehr KLEINEN Gewichten - was sich in der
-      "effektiven Stichprobengroesse" (siehe effective_sample_size(), Kish's
-      Formel n_eff = (Σw)²/Σw²) unmittelbar niederschlaegt: n_eff faellt in
-      diesem Fall auf sehr kleine Werte (ggf. nahe 0-1), macht also
-      transparent, dass kaum echte Vergleichsinformation vorhanden ist,
-      statt einfach gar nichts anzuzeigen. Ein echter Abbruch (ValueError)
-      bleibt nur fuer den Fall bestehen, dass VOR dem Query-Tag ueberhaupt
-      keine Handelstage mit min_gap_days Abstand existieren (reines
-      Datenproblem, keine Distanzfrage).
-
-      summarize_analog_trades_weighted()/weighted_reliability_summary()
-      sind die gewichteten Pendants zu summarize_analog_trades()/
-      _reliability_for_side() - sie nutzen die 'weight'-Spalte, die
-      evaluate_analog_set() jetzt (unabhaengig vom Modus) durchreicht.
-
-      BEWUSST NICHT global aktiviert: use_kernel_weighting=False bleibt der
-      Default, damit Modus 2 (dashboard_analog.py, mit seiner eigenen
-      Distanz-Kalibrierungs-Vorschau/Perzentilen und dem Train/Val-Split um
-      eine harte Schwelle herum gebaut) unveraendert funktioniert. Aktiviert
-      wird die Kernel-Gewichtung gezielt in dashboard_livechain.py (Analog-
-      Tage-Simulation je Zeile), wo die alte harte Schwelle das beschriebene
-      Totalausfall-Problem verursacht hat.
+HISTORIE DER KORREKTUREN (Kurzfassung):
+  1) Newey-West/HAC braucht chronologische Reihenfolge -> evaluate_analog_set()
+     sortiert immer nach entry_date.
+  2) min_gap_days sind echte HANDELSTAGE (Array-Positionen), nicht Kalendertage.
+  3) reprice_leg_pair() liefert Short UND Long aus einem Durchlauf.
+  4) analog_clustering_diagnostic(): Warnung bei stark geclusterten Analog-Tagen.
+  5) available_t_days(): explizite T_days-Pruefung gegen die training_table.
+  6) Zwei IV-Modi in evaluate_analog_set(): "direct" (feste absolute Vola) und
+     "rank" (HV-Rang-Umrechnung pro Analog-Tag).
+  7) summarize_analog_trades(): profit_factor auf pnl_norm (nicht absolute
+     Punkte), damit Index-Niveaus verschiedener Aeren nicht verzerren.
+  8) recommend_for_today() nutzt ausschliesslich den Rang-Modus.
+  9) Distanz-Schwelle (max_distance) statt fester Anzahl k;
+     analog_distance_distribution() als Kalibrierungs-Vorschau.
+ 10) delta_for_strike(): Delta zu gegebenem Strike per Bump-and-Reprice.
+ 11) evaluate_analog_set() reicht entry_S/exit_S durch.
+ 12) Optionale Kernel-Gewichtung (AnalogConfig.use_kernel_weighting):
+     weight = exp(-(distance/bandwidth)**2) plus min_candidates-Garantie gegen
+     Totalausfall in Krisenphasen. summarize_analog_trades_weighted()/
+     weighted_reliability_summary() sind die gewichteten Pendants.
+ 13) NEU - HAC-Standardfehler (Bartlett, Kalenderzeit) in
+     weighted_reliability_summary(): Analog-Tage im Abstand < Haltedauer haben
+     ueberlappende Payoffs. _hac_se_weighted_mean() korrigiert das; 'n_eff_hac'
+     = Kish-n_eff / Design-Effekt. Ohne diese Korrektur waren die t-Stats
+     deutlich zu hoch.
+ 14) NEU - Skalenfreie, beschraenkte Statistikbasis 'pnl_spot' (P&L in
+     Bruchteilen des Spots) in evaluate_analog_set(); weighted_reliability_
+     summary(value_prefix="pnl_spot") vermeidet die Division durch winzige
+     Modellpraemien weit OTM (pnl_norm konnte dort bei -10^5 % liegen).
 """
 
 from __future__ import annotations
@@ -295,21 +91,14 @@ class SimilaritySpace:
 def fit_similarity_space(feature_df: pd.DataFrame, cfg: SimilaritySpaceConfig | None = None,
                           max_date: pd.Timestamp | None = None) -> SimilaritySpace:
     """Baut den Aehnlichkeits-Raum: StandardScaler + PCA(whiten=True) auf den
-    Tages-Features (siehe features.build_feature_matrix - EIN Score-Vektor
-    pro Handelstag, KEIN T_days darin, da Aehnlichkeit eine Eigenschaft des
-    Tages ist, nicht der Handelsstruktur).
+    Tages-Features (EIN Score-Vektor pro Handelstag, KEIN T_days darin).
 
-    whiten=True: jede Hauptkomponente wird auf Einheitsvarianz normiert, bevor
-    die euklidische Distanz berechnet wird - sonst wuerde PC1 (die per
-    Definition die groesste Varianz traegt) die Distanz dominieren, nur weil
-    sie 'PC1' ist, nicht weil sie inhaltlich wichtiger fuer Aehnlichkeit waere.
+    whiten=True: jede Hauptkomponente wird auf Einheitsvarianz normiert, damit
+    PC1 die euklidische Distanz nicht allein dominiert.
 
     max_date: falls gesetzt, werden nur Zeilen bis (exklusive) max_date fuers
-    Fitten verwendet - Voraussetzung fuer einen sauberen Walk-Forward-
-    Backtest des Analog-Verfahrens selbst (siehe Modul-Docstring). Der
-    Query-Tag selbst darf/soll enthalten sein (siehe recommend_for_today,
-    das max_date=query_date+1 Tag uebergibt) - das ist keine Zukunftsinfo,
-    sondern genau der Tag, fuer den gerade eine Empfehlung gesucht wird."""
+    Fitten verwendet (sauberer Walk-Forward). Der Query-Tag selbst darf/soll
+    enthalten sein (recommend_for_today uebergibt query_date+1 Tag)."""
     if cfg is None:
         cfg = SimilaritySpaceConfig()
 
@@ -317,11 +106,8 @@ def fit_similarity_space(feature_df: pd.DataFrame, cfg: SimilaritySpaceConfig | 
     df = feature_df.dropna(subset=cols).reset_index(drop=True)
     if max_date is not None:
         df = df[df["date"] < max_date].reset_index(drop=True)
-    # WICHTIG fuer find_analogs()/min_gap_days: df ist bereits nach 'date'
-    # aufsteigend sortiert (build_feature_matrix() sortiert selbst), hier
-    # nochmal explizit sichergestellt, da find_analogs() sich auf diese
-    # Reihenfolge verlaesst, um den Handelstage-Abstand ueber Array-Positionen
-    # statt ueber Kalendertage zu bestimmen (siehe KORREKTUR 2 oben).
+    # find_analogs() verlaesst sich auf aufsteigende Sortierung (Handelstage-
+    # Abstand ueber Array-Positionen).
     df = df.sort_values("date").reset_index(drop=True)
 
     if df.empty:
@@ -337,9 +123,6 @@ def fit_similarity_space(feature_df: pd.DataFrame, cfg: SimilaritySpaceConfig | 
     scaler = StandardScaler().fit(X)
     X_scaled = scaler.transform(X)
 
-    # Erst mit vollem Rang fitten, um zu sehen, wie viele Komponenten fuer
-    # das Varianz-Ziel noetig sind - dann mit genau dieser Anzahl (+ whiten)
-    # final fitten.
     probe = PCA(n_components=min(len(cols), 40), random_state=42).fit(X_scaled)
     cum_var = np.cumsum(probe.explained_variance_ratio_)
     n_components = int(np.searchsorted(cum_var, cfg.variance_target) + 1)
@@ -367,77 +150,33 @@ def transform_query(space: SimilaritySpace, feature_row: pd.Series) -> np.ndarra
 
 @dataclass
 class AnalogConfig:
-    max_distance: float = 3.0   # Bei use_kernel_weighting=False (Default): harte Schwelle wie
-                                 # bisher - ALLE Kandidaten-Tage mit Distanz <= max_distance
-                                 # werden mit Gewicht 1 verwendet, alle anderen komplett
-                                 # ausgeschlossen (siehe Punkt 9 im Moduldokstring).
-                                 # Bei use_kernel_weighting=True: dient nur noch als EIN
-                                 # zusaetzliches (grosszuegiges) Aufnahmekriterium neben dem
-                                 # Kernel-Gewicht/der min_candidates-Garantie, siehe Punkt 12.
-    min_gap_days: int = 5       # Mindestabstand in HANDELSTAGEN zum Query-Tag (siehe KORREKTUR 2)
+    max_distance: float = 3.0   # use_kernel_weighting=False: harte Schwelle (Gewicht 1 innerhalb,
+                                 # sonst ausgeschlossen). True: nur noch ein zusaetzliches
+                                 # (grosszuegiges) Aufnahmekriterium neben Kernel/min_candidates.
+    min_gap_days: int = 5       # Mindestabstand in HANDELSTAGEN zum Query-Tag
 
-    # ── NEU (siehe Punkt 12 im Moduldokstring) - kontinuierliche Gewichtung ──
-    use_kernel_weighting: bool = False   # False = bisheriges Verhalten (harter Cutoff,
-                                          # unveraendert fuer Modus 2/dashboard_analog.py).
-                                          # True = Gaussian-Kernel-Gewichtung statt Ja/Nein
-                                          # (aktiviert in dashboard_livechain.py).
-    bandwidth: float | None = None       # sigma des Gaussian-Kernels (nur bei
-                                          # use_kernel_weighting=True). None -> max_distance/2
-                                          # als sinnvoller Default: bei dist=max_distance ist das
-                                          # Gewicht dann noch exp(-4)=1.8% - naeherungsweise der
-                                          # alte Rand der harten Schwelle.
-    min_weight: float = 1e-4             # Kandidaten mit Kernel-Gewicht darunter werden NICHT
-                                          # automatisch ueber das Gewicht aufgenommen (koennen aber
-                                          # trotzdem ueber min_candidates/max_distance mit
-                                          # aufgenommen werden) - reine Truncation des Kernel-
-                                          # Auslaeufers, kein Aehnlichkeits-Urteil.
-    min_candidates: int = 20             # GARANTIE gegen Krisenphasen-Totalausfall (siehe Punkt 12):
-                                          # mindestens so viele der naechstgelegenen Kandidaten
-                                          # werden IMMER aufgenommen, unabhaengig von Distanz/Gewicht -
-                                          # verhindert, dass eine ungewoehnliche Marktphase (kein
-                                          # nahes historisches Pendant) zu einem leeren Ergebnis und
-                                          # damit zu einer nicht ladenden Tabelle fuehrt.
+    use_kernel_weighting: bool = False   # False = harter Cutoff (Modus 2); True = Gaussian-Kernel (Modus 3)
+    bandwidth: float | None = None       # sigma; None -> max_distance/2
+    min_weight: float = 1e-4             # Truncation des Kernel-Auslaeufers
+    min_candidates: int = 20             # Garantie: mind. so viele naechste Kandidaten IMMER aufnehmen
 
 
 def find_analogs(query_date: pd.Timestamp, query_score: np.ndarray, space: SimilaritySpace,
                   cfg: AnalogConfig | None = None) -> pd.DataFrame:
     """Findet Handelstage im Aehnlichkeits-Raum zu query_score (euklidische
     Distanz im gewhitenten PCA-Raum), beschraenkt auf Kandidaten VOR
-    query_date (Kausalitaet - siehe Modul-Docstring).
+    query_date (Kausalitaet).
 
-    ZWEI MODI (siehe Punkt 12 im Moduldokstring):
+    use_kernel_weighting=False: harter Cutoff, ValueError falls kein Kandidat
+    innerhalb max_distance liegt.
 
-    use_kernel_weighting=False (Default, unveraendertes Verhalten): harter
-    Cutoff - alle Kandidaten mit Distanz <= cfg.max_distance werden mit
-    Gewicht 1.0 aufgenommen, alle anderen komplett verworfen. Ist KEIN
-    Kandidat innerhalb der Schwelle, wird eine ValueError geworfen (wie
-    bisher) - das ist das Verhalten, auf dem die Kalibrierungs-Vorschau und
-    der Train/Val-Split in Modus 2 (dashboard_analog.py) aufbauen.
+    use_kernel_weighting=True: weight = exp(-(distance/bandwidth)**2);
+    aufgenommen wird ein Kandidat, wenn (a) dist <= max_distance ODER
+    (b) weight >= min_weight ODER (c) er zu den min_candidates naechsten
+    gehoert. ValueError nur, wenn vor query_date gar keine Kandidaten
+    existieren.
 
-    use_kernel_weighting=True: STETIGE Gewichtung statt Ja/Nein -
-    weight = exp(-(distance/bandwidth)**2) (Gaussian-Kernel). Zusaetzlich
-    garantiert cfg.min_candidates, dass immer mindestens so viele der
-    naechstgelegenen Tage aufgenommen werden, unabhaengig von ihrer Distanz
-    oder ihrem Kernel-Gewicht - das verhindert einen kompletten Ausfall in
-    Marktphasen ohne nahe historische Entsprechung (z.B. scharfe Krisen).
-    Ein Kandidat wird aufgenommen, wenn er (a) innerhalb max_distance liegt,
-    ODER (b) ein Kernel-Gewicht >= min_weight hat, ODER (c) zu den
-    min_candidates naechstgelegenen Kandidaten gehoert - je nachdem, was
-    zuerst zutrifft (Vereinigungsmenge). Ein echter Abbruch (ValueError)
-    erfolgt nur noch, wenn VOR query_date mit min_gap_days Abstand
-    ueberhaupt keine Kandidaten existieren (reines Datenproblem).
-
-    In BEIDEN Modi enthaelt das Ergebnis eine 'weight'-Spalte (im
-    Cutoff-Modus konstant 1.0), damit nachgelagerte Funktionen
-    (evaluate_analog_set(), summarize_analog_trades_weighted(), ...)
-    einheitlich funktionieren.
-
-    KORREKTUR (siehe Punkt 2 im Moduldokstring): min_gap_days war zuvor ueber
-    Kalendertage (np.timedelta64) implementiert, obwohl als "Handelstage"
-    dokumentiert. space.dates ist aufsteigend sortiert (siehe
-    fit_similarity_space) - der Handelstage-Abstand zum Query-Tag entspricht
-    daher exakt der Differenz der Array-Positionen, hier jetzt korrekt
-    darueber bestimmt."""
+    In BEIDEN Modi enthaelt das Ergebnis eine 'weight'-Spalte."""
     if cfg is None:
         cfg = AnalogConfig()
 
@@ -455,7 +194,6 @@ def find_analogs(query_date: pd.Timestamp, query_score: np.ndarray, space: Simil
     dist = np.linalg.norm(space.scores[cand_idx] - query_score[None, :], axis=1)
 
     if not cfg.use_kernel_weighting:
-        # ── Bisheriges Verhalten: harter Cutoff (unveraendert) ──
         within = dist <= cfg.max_distance
         if not within.any():
             raise ValueError(
@@ -470,7 +208,6 @@ def find_analogs(query_date: pd.Timestamp, query_score: np.ndarray, space: Simil
             "weight": 1.0,
         }).sort_values("distance").reset_index(drop=True)
 
-    # ── NEU: kontinuierliche Kernel-Gewichtung (siehe Punkt 12) ──
     bandwidth = cfg.bandwidth if cfg.bandwidth is not None else cfg.max_distance / 2.0
     if bandwidth <= 0.0:
         raise ValueError(f"bandwidth muss > 0 sein (erhalten: {bandwidth}).")
@@ -480,8 +217,6 @@ def find_analogs(query_date: pd.Timestamp, query_score: np.ndarray, space: Simil
     within_max_distance = dist <= cfg.max_distance
     within_min_weight = weights >= cfg.min_weight
 
-    # Garantie gegen Krisenphasen-Totalausfall: die n naechstgelegenen
-    # Kandidaten werden IMMER aufgenommen, unabhaengig von Distanz/Gewicht.
     n_guarantee = min(max(cfg.min_candidates, 0), len(dist))
     guarantee_mask = np.zeros(len(dist), dtype=bool)
     if n_guarantee > 0:
@@ -494,9 +229,6 @@ def find_analogs(query_date: pd.Timestamp, query_score: np.ndarray, space: Simil
     w_kept = weights[keep]
 
     if len(chosen) == 0:
-        # Sollte praktisch nie auftreten (max_allowed_pos > 0 garantiert
-        # mind. einen Kandidaten, der ueber guarantee_mask erfasst wird),
-        # aber als Sicherheitsnetz behalten.
         raise ValueError(
             f"Keine Analog-Kandidaten vor {pd.Timestamp(query_date).date()} gefunden."
         )
@@ -511,20 +243,8 @@ def find_analogs(query_date: pd.Timestamp, query_score: np.ndarray, space: Simil
 def analog_distance_distribution(daily_df: pd.DataFrame, query_date: pd.Timestamp,
                                   min_gap_days: int = 5,
                                   space_cfg: SimilaritySpaceConfig | None = None) -> np.ndarray:
-    """NEU (siehe Punkt 9 im Moduldokstring) - reine Kalibrierungs-Hilfe fuers
-    Dashboard: fittet den Aehnlichkeits-Raum wie recommend_for_today() und
-    liefert die (aufsteigend sortierten) Distanzen ALLER zulaessigen
-    Kandidaten-Tage zum Query-Tag - VOR Anwendung einer max_distance-
-    Schwelle. Damit laesst sich z.B. ueber Perzentile ablesen, welche
-    Schwelle etwa 'die aehnlichsten 5% aller Tage' bedeutet, ohne dafuer
-    schon den vollen Grid-Search auszufuehren.
-
-    Bewusst unabhaengig von find_analogs()/recommend_for_today() gehalten
-    (etwas Code-Duplikation beim Fitten des Raums), damit diese leichte
-    Vorschau-Funktion nicht an die schwerere Pipeline (Grid-Search etc.)
-    gekoppelt ist - ein Aufruf dieser Funktion soll im Dashboard bei jeder
-    Aenderung von query_date/min_gap_days guenstig moeglich sein, ohne dass
-    dafuer bereits Delta-Grids o.ae. feststehen muessten."""
+    """Kalibrierungs-Hilfe fuers Dashboard: (aufsteigend sortierte) Distanzen
+    ALLER zulaessigen Kandidaten-Tage zum Query-Tag, VOR einer Schwelle."""
     feature_df = build_feature_matrix(daily_df, FeatureConfig())
     query_date = pd.Timestamp(query_date)
     if query_date not in set(feature_df["date"]):
@@ -549,16 +269,11 @@ def analog_distance_distribution(daily_df: pd.DataFrame, query_date: pd.Timestam
 
 
 def analog_clustering_diagnostic(analogs: pd.DataFrame, gap_days: int = 3) -> dict:
-    """NEU (siehe Punkt 4 im Moduldokstring): reine Diagnose, KEINE
-    Korrektur - meldet, wie stark sich die gefundenen Analog-Tage in der
-    Kalenderzeit haeufen (z.B. weil viele aus derselben historischen Krise
-    stammen). Ein grosser Anteil sehr kleiner Abstaende bedeutet, dass die
-    effektive Anzahl UNABHAENGIGER Beobachtungen deutlich kleiner ist als
-    len(analogs) - die Newey-West-Korrektur in reliability_summary() federt
-    das ab (siehe KORREKTUR 1), ersetzt aber keine gesunde Skepsis bei
-    extremem Clustering."""
+    """Reine Diagnose: wie stark haeufen sich die Analog-Tage in der
+    Kalenderzeit (z.B. weil viele aus derselben Krise stammen)?"""
     if len(analogs) < 2:
-        return {"frac_within_gap": 0.0, "median_gap_days": np.nan, "n_analogs": len(analogs)}
+        return {"frac_within_gap": 0.0, "median_gap_days": np.nan, "n_analogs": len(analogs),
+                "gap_days_threshold": gap_days}
 
     sorted_dates = analogs["analog_date"].sort_values().reset_index(drop=True)
     gaps = sorted_dates.diff().dt.days.dropna()
@@ -575,11 +290,7 @@ def analog_clustering_diagnostic(analogs: pd.DataFrame, gap_days: int = 3) -> di
 # ═══════════════════════════════════════════════════════════════════════
 
 def hv_rank_bounds(daily_df: pd.DataFrame, hv_length: int, lookback_days: int) -> pd.DataFrame:
-    """Rollierende hv/hv_min/hv_max je Handelstag (kausal) - dieselbe
-    Grundlage wie backtest.compute_rank_target_vol(), hier aber mit
-    hv_min/hv_max als EIGENSTAENDIGE Spalten, damit spaeter pro Analog-Tag
-    auf einen BELIEBIGEN (variablen) Ziel-Rang umgerechnet werden kann,
-    statt wie dort auf einen fest eingestellten."""
+    """Rollierende hv/hv_min/hv_max je Handelstag (kausal)."""
     if "resolution" in daily_df.columns:
         daily_df = daily_df[daily_df["resolution"] == "daily"]
     daily_df = daily_df.sort_values("date").reset_index(drop=True)
@@ -592,39 +303,23 @@ def hv_rank_bounds(daily_df: pd.DataFrame, hv_length: int, lookback_days: int) -
 
 
 def target_vol_for_rank(hv_min: float, hv_max: float, rank: float) -> float:
-    """Vola, die den Analog-Tag auf EXAKT denselben Rang bringt, den der
-    Query-Tag (='heute') in seinem eigenen rollierenden Fenster hat.
-    rank als Bruchteil 0..1 (nicht Prozent)."""
+    """Vola, die einen Tag auf EXAKT den gegebenen Rang (Bruchteil 0..1) in
+    seinem eigenen rollierenden Fenster bringt."""
     if np.isnan(hv_min) or np.isnan(hv_max) or hv_max <= hv_min:
         return np.nan
     return hv_min + rank * (hv_max - hv_min)
 
 
 def available_t_days(training_table: pd.DataFrame) -> list[int]:
-    """NEU (siehe Punkt 5 im Moduldokstring): welche T_days-Werte ueberhaupt
-    in der training_table vorhanden sind (siehe labels.StrangleLabelConfig.
-    T_days_list, mit dem die Tabelle gebaut wurde). Ein T_days ausserhalb
-    dieser Liste liefert in evaluate_analog_set() STILLSCHWEIGEND 0 Zeilen -
-    diese Funktion macht die gueltigen Werte explizit abfragbar (z.B. fuer
-    ein Dashboard-Dropdown, statt eines freien Sliders)."""
+    """Welche T_days-Werte in der training_table vorhanden sind."""
     return sorted(training_table["T_days"].unique().tolist())
 
 
 def reprice_leg_pair(entry_S: float, exit_S: float, T_days: int, target_vol: float,
                       put_delta: float, call_delta: float, r_free: float, dividend_yield: float,
                       vol_surface: VolSurfaceConfig) -> dict | None:
-    """Bewertet EINEN Strangle (Put-Delta/Call-Delta duerfen unterschiedlich
-    sein - 'Strangle' im weiteren Sinn) auf einem Analog-Tag, mit target_vol
-    STATT der tatsaechlichen historischen HV dieses Tages (siehe
-    target_vol_for_rank).
-
-    KORREKTUR (siehe Punkt 3 im Moduldokstring): liefert jetzt BEIDE
-    Richtungen (Short und Long) aus einem einzigen Strike-Solve/Black-76-
-    Durchlauf zurueck, statt wie zuvor ueber einen 'side'-Parameter nur eine
-    Richtung zu liefern und bei Bedarf an beiden Richtungen denselben
-    (identisch teuren) Durchlauf zweimal auszufuehren. Long ist exakt das
-    Spiegelbild von Short (net_pnl_long = -net_pnl_short), da keine
-    Transaktionskosten modelliert werden - das ist keine Naeherung."""
+    """Bewertet EINEN Strangle auf einem Analog-Tag mit target_vol STATT der
+    tatsaechlichen HV. Liefert Short UND Long (Long = exaktes Spiegelbild)."""
     if np.isnan(target_vol) or target_vol <= 0.0:
         return None
 
@@ -655,24 +350,9 @@ def reprice_leg_pair(entry_S: float, exit_S: float, T_days: int, target_vol: flo
 def delta_for_strike(K: float, is_put: bool, spot: float, T_days: int, vol: float,
                       r_free: float, dividend_yield: float,
                       vol_surface: VolSurfaceConfig, bump_frac: float = 1e-4) -> float:
-    """NEU (siehe Punkt 10 im Moduldokstring) - numerisches (zentrales) Delta
-    fuer einen GEGEBENEN Strike K, per Bump-and-Reprice auf dem
-    Forward-Preis F. Bewusst OHNE eigene/zweite Black-76-Delta-Formel
-    implementiert - nutzt ausschliesslich die bereits vorhandenen,
-    oeffentlichen Bewertungsfunktionen (forward_price, leg_price), damit das
-    Ergebnis automatisch zu JEDER Vol-Surface-/Smile-Logik konsistent ist,
-    die leg_price() ueber `vol_surface` intern anwendet (dieselbe Logik, die
-    auch reprice_leg_pair()/solve_strike_delta_consistent() verwenden) -
-    auch falls sich diese Logik spaeter aendert, muss hier nichts angepasst
-    werden.
-
-    bump_frac: relative Bump-Groesse auf F (Default 0.01% von F) - klein
-    genug fuer eine gute Naeherung der Ableitung, gross genug, um nicht in
-    numerische Rundungsprobleme zu laufen.
-
-    Rueckgabe als POSITIVE Groesse (Betrag), konsistent zur Delta-Konvention
-    im Rest des Moduls, wo Put-Deltas ebenfalls als positive Zahlen (z.B.
-    0.10, 0.16) angegeben werden statt mit dem oekonomischen Vorzeichen."""
+    """Numerisches (zentrales) Delta fuer einen GEGEBENEN Strike K per
+    Bump-and-Reprice auf dem Forward-Preis F, ausschliesslich ueber
+    forward_price()/leg_price(). Rueckgabe als POSITIVE Groesse (Betrag)."""
     T_years = T_days / 365.0
     F = forward_price(spot, r_free, dividend_yield, T_years)
     h = max(abs(F) * bump_frac, 1e-6)
@@ -687,40 +367,22 @@ def evaluate_analog_set(analogs: pd.DataFrame, training_table: pd.DataFrame, bou
                          T_days: int, put_delta: float, call_delta: float,
                          r_free: float, dividend_yield: float, vol_surface: VolSurfaceConfig,
                          vol_mode: str = "direct", today_iv: float | None = None,
-                         today_rank: float | None = None) -> pd.DataFrame:
-    """Fuer jeden Analog-Tag: entry_S/exit_S aus der Trainings-Tabelle holen
-    (dort bereits korrekt mit der Kalendertage-Suchlogik aus labels.py
-    bestimmt - wird hier NICHT neu berechnet), dann per reprice_leg_pair()
-    neu bewerten (Short UND Long, siehe dort) - mit welcher Vola, haengt vom
-    `vol_mode` ab (siehe Punkt 6 im Moduldokstring):
+                         today_rank: float | None = None,
+                         query_date: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Fuer jeden Analog-Tag: entry_S/exit_S aus der Trainings-Tabelle holen,
+    dann per reprice_leg_pair() neu bewerten (Short UND Long).
 
-      vol_mode="direct": JEDER Analog-Tag wird mit derselben absoluten Vola
-        `today_iv` bewertet (das heutige, tatsaechliche Bewertungsniveau) -
-        `bounds`/`today_rank` werden dabei NICHT zur Bewertung herangezogen.
-      vol_mode="rank": klassische Perzentil-Umrechnung (siehe
-        target_vol_for_rank) - `today_rank` ist in diesem Modus Pflicht,
-        `bounds` liefert hv_min/hv_max je Analog-Tag. Das ist der Modus, den
-        recommend_for_today() verwendet (siehe Punkt 8 im Moduldokstring).
+      vol_mode="direct": JEDER Analog-Tag mit derselben absoluten Vola today_iv.
+      vol_mode="rank":   Perzentil-Umrechnung (today_rank Pflicht).
 
-    KORREKTUR (siehe Punkt 1 im Moduldokstring, KRITISCH): das Ergebnis wird
-    vor der Rueckgabe explizit nach 'entry_date' (chronologisch) sortiert.
-    `analogs` kommt aus find_analogs() nach DISTANZ sortiert - in dieser
-    Reihenfolge waere die spaeter in reliability_summary() aufgerufene
-    Newey-West-Korrektur wirkungslos (siehe Beleg im Moduldokstring: bei
-    einer getesteten Konfiguration kippte dadurch nachweislich die
-    Signifikanz-Aussage).
+    query_date (optional, NEU): falls gesetzt, werden Analog-Tage verworfen,
+    deren exit_date NACH query_date liegt (Kausalitaet bei langen Laufzeiten).
+    Default None = bisheriges Verhalten.
 
-    NEU (siehe Punkt 11 im Moduldokstring): entry_S/exit_S werden jetzt mit
-    ins Ergebnis durchgereicht (waren schon in `trow` vorhanden, wurden aber
-    bisher nicht in die Ausgabe uebernommen) - fuer Kennzahlen, die die
-    TATSAECHLICHE prozentuale Kursbewegung eines Analog-Tages brauchen,
-    unabhaengig vom hier verwendeten, per-era-spezifischen Modell-Strike
-    (siehe dashboard_livechain.py, 'Preis fuer Profit Factor X').
-
-    NEU (siehe Punkt 12 im Moduldokstring): das Kernel-Gewicht ('weight' aus
-    find_analogs(), im Cutoff-Modus konstant 1.0) wird ebenfalls mit
-    durchgereicht - Grundlage fuer summarize_analog_trades_weighted()/
-    weighted_reliability_summary()."""
+    Das Ergebnis ist chronologisch nach entry_date sortiert (Voraussetzung fuer
+    jede Autokorrelationskorrektur). Spalten u.a.: weight, entry_S, exit_S,
+    pnl_norm_{short,long}, NEU pnl_spot_{short,long} (= net_pnl / entry_S,
+    skalenfrei und ohne Praemien-Nenner)."""
     if vol_mode not in ("direct", "rank"):
         raise ValueError(f"Unbekannter vol_mode={vol_mode!r} - erwartet 'direct' oder 'rank'.")
     if vol_mode == "direct" and (today_iv is None or np.isnan(today_iv) or today_iv <= 0.0):
@@ -737,6 +399,7 @@ def evaluate_analog_set(analogs: pd.DataFrame, training_table: pd.DataFrame, bou
 
     bounds_idx = bounds.set_index("date")
     tt = training_table[training_table["T_days"] == T_days].set_index("entry_date")
+    q_ts = pd.Timestamp(query_date) if query_date is not None else None
 
     rows = []
     for _, arow in analogs.iterrows():
@@ -744,8 +407,11 @@ def evaluate_analog_set(analogs: pd.DataFrame, training_table: pd.DataFrame, bou
         if d not in tt.index:
             continue
         trow = tt.loc[d]
-        if isinstance(trow, pd.DataFrame):   # falls doppelte Zeitstempel - Sicherheitsnetz
+        if isinstance(trow, pd.DataFrame):   # falls doppelte Zeitstempel
             trow = trow.iloc[0]
+
+        if q_ts is not None and pd.Timestamp(trow["exit_date"]) > q_ts:
+            continue
 
         if vol_mode == "direct":
             target_vol = today_iv
@@ -768,6 +434,8 @@ def evaluate_analog_set(analogs: pd.DataFrame, training_table: pd.DataFrame, bou
             "weight": arow["weight"] if "weight" in arow.index else 1.0,
             "target_vol": target_vol,
             "entry_S": trow["entry_S"], "exit_S": trow["exit_S"],
+            "pnl_spot_short": result["net_pnl_short"] / trow["entry_S"],
+            "pnl_spot_long": -result["net_pnl_short"] / trow["entry_S"],
             **result,
         })
 
@@ -778,37 +446,10 @@ def evaluate_analog_set(analogs: pd.DataFrame, training_table: pd.DataFrame, bou
 
 
 def summarize_analog_trades(evaluated: pd.DataFrame, side: str) -> dict:
-    """NEU (siehe Punkt 7 im Moduldokstring): dieselben "einfachen"
-    Handelskennzahlen wie backtest.summarize_trades() beim Ladder-Backtest
-    (Gewinnrate, Profit Factor, Erwartungswert/Trade, beste/schlechteste
-    Trade), hier fuer das evaluate_analog_set()-Ergebnis EINER
-    Delta-Kombination, side='short' oder 'long'.
-
-    UNGEWICHTET (jeder Analog-Tag zaehlt gleich) - fuer die GEWICHTETE
-    Variante (Kernel-Gewicht aus find_analogs(), siehe Punkt 12) siehe
-    summarize_analog_trades_weighted().
-
-    KORREKTUR (siehe Punkt 7 im Moduldokstring): 'profit_factor' wird jetzt
-    aus pnl_norm_{side} (normierte Rendite je Analog-Tag) statt aus
-    net_pnl_{side} (absolute Punkte) berechnet. Grund: bei einer Analog-Suche
-    ueber die gesamte SPX-Historie hinweg (moegliche Spanne 1927 bis heute)
-    stehen absolute Punktbetraege auf VOELLIG unterschiedlichen Index-
-    Niveaus (SPX ~5 im Jahr 1932 vs. ~7500 heute) - eine Summe absoluter
-    Punkte ueber diese Aeren gewichtet automatisch die betragsmaessig
-    grossen, MODERNEN Tage massiv staerker, unabhaengig davon ob sie relativ
-    gesehen ueberhaupt schlechter liefen. Mit pnl_norm (auf die jeweilige
-    TAGESEIGENE Entry-Praemie normiert) zaehlt jeder Analog-Tag mit
-    gleichem Gewicht - konsistent mit 'avg_pnl_norm_pct', das im Modul
-    bereits genau aus diesem Grund verwendet wird.
-
-    BEWUSST NICHT ENTHALTEN (anders als beim Ladder-Backtest): 'touch_rate'
-    (kein Stop-Loss/Touch-Tracking - der Analog-Strangle wird wie das
-    Referenzinstrument in labels.py immer bis Verfall gehalten),
-    'n_unlimited_risk' (der ungehedgte Strangle hat IMMER unbegrenztes
-    Risiko auf der Short-Seite - das waere hier keine Fallunterscheidung,
-    sondern der Normalfall) und 'n_iv_fallback' (target_vol ist hier per
-    Konstruktion nie NaN, siehe evaluate_analog_set - ungueltige Zeilen
-    werden dort bereits ausgefiltert)."""
+    """Handelskennzahlen (Gewinnrate, Profit Factor, Erwartungswert, beste/
+    schlechteste Trade) fuer EINE Richtung, UNGEWICHTET. profit_factor basiert
+    auf pnl_norm (nicht absolute Punkte), damit verschiedene Index-Niveaus
+    nicht verzerren."""
     if evaluated.empty:
         return {"n_trades": 0}
 
@@ -831,16 +472,7 @@ def summarize_analog_trades(evaluated: pd.DataFrame, side: str) -> dict:
 
 
 def effective_sample_size(weights: np.ndarray) -> float:
-    """NEU (siehe Punkt 12 im Moduldokstring) - Kish's effektive
-    Stichprobengroesse: n_eff = (Σw)² / Σw². Bei Gleichgewichtung (alle
-    w=1, wie im harten-Cutoff-Modus) ist n_eff = n; je ungleicher die
-    Gewichte (wenige sehr nahe Analog-Tage dominieren die Gewichtssumme,
-    typisch in einer Krisenphase mit nur wenigen/weit entfernten
-    Vergleichstagen), desto kleiner n_eff relativ zur rohen Zeilenzahl -
-    das macht sichtbar, wie viel 'echte' unabhaengige Information hinter
-    einer kontinuierlich gewichteten Auswertung tatsaechlich steckt, statt
-    die (potenziell irrefuehrend hohe, durch die min_candidates-Garantie
-    aufgefuellte) rohe Zeilenzahl fuer bare Muenze zu nehmen."""
+    """Kish: n_eff = (Sum w)^2 / Sum w^2."""
     w = np.asarray(weights, dtype=float)
     w = w[~np.isnan(w)]
     if len(w) == 0 or w.sum() <= 0.0:
@@ -849,19 +481,10 @@ def effective_sample_size(weights: np.ndarray) -> float:
 
 
 def summarize_analog_trades_weighted(evaluated: pd.DataFrame, side: str) -> dict:
-    """NEU (siehe Punkt 12 im Moduldokstring) - gewichtetes Pendant zu
-    summarize_analog_trades(): jeder Analog-Tag geht mit seinem Kernel-
-    Gewicht (Spalte 'weight', siehe find_analogs()) ein statt mit Gewicht 1.
-    Funktioniert transparent auch im Cutoff-Modus (weight konstant 1.0 ->
-    identisch zu summarize_analog_trades(), bis auf die zusaetzliche
-    'n_eff'-Kennzahl).
-
-    'n_eff' (siehe effective_sample_size()) ersetzt 'n_trades' als
-    aussagekraeftigeres Mass fuer die tatsaechlich vorhandene statistische
-    Basis - insbesondere wichtig in Krisenphasen, wo find_analogs() per
-    min_candidates-Garantie eine Mindestzahl an (dann aber sehr niedrig
-    gewichteten) Zeilen liefert: 'n_trades' bliebe dort irrefuehrend hoch,
-    waehrend 'n_eff' korrekt sehr klein wird."""
+    """Gewichtetes Pendant zu summarize_analog_trades() (Kernel-Gewicht aus
+    find_analogs()). 'n_eff' (Kish) ist das aussagekraeftigere Mass fuer die
+    statistische Basis. HINWEIS: profit_factor/win_rate haengen weiter an
+    pnl_norm."""
     if evaluated.empty or "weight" not in evaluated.columns:
         return {"n_trades": len(evaluated), "n_eff": 0.0}
 
@@ -890,43 +513,61 @@ def summarize_analog_trades_weighted(evaluated: pd.DataFrame, side: str) -> dict
     }
 
 
-def weighted_reliability_summary(evaluated: pd.DataFrame, side: str, n_subperiods: int = 6) -> dict:
-    """NEU (siehe Punkt 12 im Moduldokstring) - gewichtetes Pendant zur
-    Newey-West-Reliability aus stats.reliability_summary(): t-Statistik/
-    95%-Konfidenzintervall des GEWICHTETEN Mittelwerts von pnl_norm_{side},
-    mit Kish's n_eff (statt der rohen Beobachtungsanzahl) als
-    Freiheitsgrad-Basis fuer die t-Verteilung.
+def _hac_se_weighted_mean(dates, w, x, mean, bandwidth_days: int) -> tuple[float, float]:
+    """HAC-Standardfehler (Bartlett-Kernel) des gewichteten Mittelwerts auf der
+    KALENDER-Zeitachse. Analog-Tage im Abstand < Haltedauer haben
+    ueberlappende Payoffs -> korrelierte Fehler; ihre Kovarianz wird mit
+    (1 - h/L) gewichtet. Tagesarray mit Lags 0..L-1 -> O(Spanne*L).
+    Rueckgabe: (se_hac, se_iid) - se_iid nur fuer den Design-Effekt."""
+    day = pd.to_datetime(pd.Series(dates)).values.astype("datetime64[D]").astype("int64")
+    idx = day - day.min()
+    u = w * (x - mean)
+    a = np.zeros(int(idx.max()) + 1)
+    np.add.at(a, idx, u)                      # doppelte Tage werden summiert
+    L = max(int(bandwidth_days), 1)
+    s = float(a @ a)
+    for h in range(1, min(L, len(a))):
+        s += 2.0 * (1.0 - h / L) * float(a[:-h] @ a[h:])
+    W = w.sum()
+    return float(np.sqrt(max(s, 0.0)) / W), float(np.sqrt(np.sum(u ** 2)) / W)
 
-    WICHTIGER VORBEHALT: die Bartlett-Kernel-Autokorrelationskorrektur aus
-    stats.reliability_summary() ist fuer gleichgewichtete, chronologisch
-    geordnete Beobachtungen gebaut und hier NICHT eins-zu-eins uebertragbar.
-    Die Kish-Korrektur (n_eff statt n) federt den Effekt von stark
-    ueberlappenden/geclusterten bzw. sehr ungleich gewichteten Analog-Tagen
-    zwar ab (nahe beieinander liegende Tage mit hohem Gewicht schrumpfen
-    n_eff automatisch), ersetzt aber keine echte Autokorrelationskorrektur
-    ueber die Kalenderzeit - die bestehende Clustering-Warnung im Dashboard
-    (siehe analog_clustering_diagnostic()) bleibt daher weiterhin relevant."""
+
+def weighted_reliability_summary(evaluated: pd.DataFrame, side: str, n_subperiods: int = 6,
+                                  value_prefix: str = "pnl_norm") -> dict:
+    """t-Statistik/95%-CI des GEWICHTETEN Mittelwerts von {value_prefix}_{side}
+    (Default 'pnl_norm'; skalenfreie, beschraenkte Basis: 'pnl_spot').
+
+    Standardfehler: HAC (Bartlett) in Kalenderzeit, Bandbreite = max.
+    Haltedauer + 1 (siehe _hac_se_weighted_mean) - korrigiert die Ueberlappung
+    benachbarter Analog-Tage. 'n_eff_hac' = Kish-n_eff / Design-Effekt
+    (Freiheitsgrad-Basis der t-Verteilung)."""
     from scipy.stats import t as t_dist
 
-    norm_col = f"pnl_norm_{side}"
-    empty = {"n_trades": len(evaluated), "n_eff": 0.0, "mean_pnl_norm": np.nan,
+    norm_col = f"{value_prefix}_{side}"
+    empty = {"n_trades": len(evaluated), "n_eff": 0.0, "n_eff_hac": 0.0, "mean_pnl_norm": np.nan,
              "tstat": np.nan, "ci_low": np.nan, "ci_high": np.nan,
              "ci_excludes_zero": False, "subperiod_matching": 0, "subperiod_nonempty": 0}
-    if evaluated.empty or "weight" not in evaluated.columns:
+    if evaluated.empty or "weight" not in evaluated.columns or norm_col not in evaluated.columns:
         return empty
 
     w = evaluated["weight"].to_numpy(dtype=float)
     x = evaluated[norm_col].to_numpy(dtype=float)
+    ok = ~np.isnan(w) & ~np.isnan(x)
+    evaluated, w, x = evaluated[ok], w[ok], x[ok]
     w_sum = w.sum()
     n_eff = effective_sample_size(w)
-    if w_sum <= 0.0 or n_eff < 2.0:
+    if len(w) == 0 or w_sum <= 0.0 or n_eff < 2.0:
         return {**empty, "n_eff": n_eff}
 
     mean = float(np.sum(w * x) / w_sum)
-    var = float(np.sum(w * (x - mean) ** 2) / w_sum)   # gewichtete Varianz (frequency-weights)
-    se = np.sqrt(var / n_eff) if var > 0.0 else 0.0
 
-    df = max(n_eff - 1.0, 1.0)
+    hold = int(evaluated["hold_days"].max()) if "hold_days" in evaluated.columns else 1
+    se, se_iid = _hac_se_weighted_mean(evaluated["entry_date"].to_numpy(), w, x, mean, hold + 1)
+
+    deff = max((se / se_iid) ** 2, 1.0) if se_iid > 0.0 else 1.0
+    n_eff_hac = n_eff / deff
+    df = max(n_eff_hac - 1.0, 1.0)
+
     tstat = mean / se if se > 0.0 else np.nan
     tcrit = float(t_dist.ppf(0.975, df))
     ci_low, ci_high = mean - tcrit * se, mean + tcrit * se
@@ -946,21 +587,15 @@ def weighted_reliability_summary(evaluated: pd.DataFrame, side: str, n_subperiod
             matching += 1
 
     return {
-        "n_trades": len(evaluated), "n_eff": n_eff, "mean_pnl_norm": mean,
-        "tstat": tstat, "ci_low": ci_low, "ci_high": ci_high,
+        "n_trades": len(evaluated), "n_eff": n_eff, "n_eff_hac": n_eff_hac,
+        "mean_pnl_norm": mean, "tstat": tstat, "ci_low": ci_low, "ci_high": ci_high,
         "ci_excludes_zero": bool(ci_low > 0.0 or ci_high < 0.0),
         "subperiod_matching": matching, "subperiod_nonempty": nonempty,
     }
 
 
 def _reliability_for_side(evaluated: pd.DataFrame, side: str, n_subperiods: int) -> dict:
-    """Baut aus dem kombinierten evaluate_analog_set()-Ergebnis die
-    'pnl_norm'/'net_pnl'-Spalten, die reliability_summary() erwartet, fuer
-    die gewuenschte Richtung (side='short' oder 'long'). Die chronologische
-    Sortierung aus evaluate_analog_set() bleibt dabei erhalten.
-
-    UNGEWICHTET - fuer die GEWICHTETE Variante siehe
-    weighted_reliability_summary()."""
+    """UNGEWICHTETE Newey-West-Reliability fuer eine Richtung (Modus 2)."""
     if evaluated.empty:
         return reliability_summary(evaluated)
     sub = evaluated.rename(columns={
@@ -980,35 +615,12 @@ def leg_pair_grid_search(analogs: pd.DataFrame, training_table: pd.DataFrame, bo
                           today_iv: float | None = None, today_rank: float | None = None,
                           n_subperiods: int = 4) -> pd.DataFrame:
     """Testet ALLE Kombinationen aus put_delta_grid x call_delta_grid auf dem
-    Analog-Set, JEWEILS fuer Short UND Long (siehe KORREKTUR 3 - ein
-    Repricing-Durchgang liefert beide Richtungen). `vol_mode`/`today_iv`/
-    `today_rank` werden 1:1 an evaluate_analog_set() durchgereicht (siehe
-    dort) - sie beschreiben das heutige Bewertungsniveau und sind fuer
-    Train- und Validierungshaelfte identisch (nur die Analog-TAGE selbst
-    unterscheiden sich zwischen den Haelften, nicht die heutige Referenz).
+    Analog-Set, jeweils fuer Short UND Long. Das Analog-Set wird chronologisch
+    in zwei Haelften gesplittet; eine Kombination gilt nur als robust, wenn
+    BEIDE Haelften einen signifikanten Edge mit gleichem POSITIVEN Vorzeichen
+    zeigen. Nutzt die UNGEWICHTETE reliability_summary() (nur Modus 2).
 
-    WICHTIG - Mehrfachvergleichs-Falle (siehe Moduldokstring der Diskussion):
-    bei z.B. 5x5=25 Kombinationen findet sich durch reinen Zufall fast immer
-    eine 'signifikante' - deshalb wird das Analog-Set chronologisch in zwei
-    Haelften gesplittet (aeltere/juengere Analog-Tage). Eine Kombination gilt
-    nur dann als vertrauenswuerdig, wenn BEIDE Haelften UNABHAENGIG
-    voneinander einen robusten Edge in DERSELBEN Richtung zeigen
-    (ci_excludes_zero in Train UND Validierung, gleiches Vorzeichen) - reines
-    In-Sample-Optimieren auf die komplette Menge wird bewusst NICHT als
-    alleiniges Auswahlkriterium verwendet.
-
-    HINWEIS: nutzt weiterhin die UNGEWICHTETE reliability_summary() (ueber
-    _reliability_for_side()) - diese Funktion wird ausschliesslich von
-    Modus 2 (dashboard_analog.py) verwendet, der bewusst beim harten-Cutoff-
-    Verhalten bleibt (siehe Punkt 12 im Moduldokstring). Fuer die
-    gewichtete Variante (Modus 3/Livechain) siehe
-    weighted_reliability_summary(), direkt auf evaluate_analog_set()-
-    Ergebnissen angewendet (dashboard_livechain.py).
-
-    Rueckgabe: eine Zeile je (put_delta, call_delta, side)-Kombination -
-    'side' ist jetzt eine eigene Spalte statt eines Funktionsparameters,
-    damit Short- und Long-Ergebnisse in EINER Tabelle direkt vergleichbar
-    sind (siehe KORREKTUR 3)."""
+    Rueckgabe: eine Zeile je (put_delta, call_delta, side)."""
     if analogs.empty:
         return pd.DataFrame()
 
@@ -1056,10 +668,6 @@ def leg_pair_grid_search(analogs: pd.DataFrame, training_table: pd.DataFrame, bo
     result = pd.DataFrame(rows)
     if result.empty:
         return result
-    # Sortierung: robuste Kombinationen (beide Haelften signifikant + gleiches
-    # POSITIVES Vorzeichen fuer die jeweilige Richtung) zuerst, innerhalb
-    # dessen nach Validierungs-t-Stat - die Validierungshaelfte entscheidet,
-    # NICHT die (immer optimistischere) Trainingshaelfte.
     return result.sort_values(["robust_both_halves", "val_tstat"], ascending=[False, False]).reset_index(drop=True)
 
 
@@ -1079,36 +687,12 @@ def recommend_for_today(daily_df: pd.DataFrame, training_table: pd.DataFrame,
                          vol_surface: VolSurfaceConfig | None = None,
                          target_rank_pct: float = 50.0) -> dict:
     """Kompletter Ablauf: Aehnlichkeits-Raum fitten -> Query-Tag einordnen ->
-    Analog-Tage finden (alle innerhalb einer Distanz-Schwelle, siehe Punkt 9
-    im Moduldokstring) -> Leg-Paar-Grid-Search (Short + Long) auf dem
-    Analog-Set.
+    Analog-Tage finden -> Leg-Paar-Grid-Search (Short + Long).
 
-    query_date=None (Default): der spaeteste Tag in feature_df wird
-    verwendet ('heute'). Ein explizites frueheres Datum erlaubt, das
-    Verfahren selbst rueckblickend zu pruefen (siehe Moduldokstring zur
-    Kausalitaet).
-
-    IV-Bewertung ist HIER IMMER rang-basiert (siehe Punkt 8 im
-    Moduldokstring, vol_mode="rank"): `target_rank_pct` ist ein HV-Rang in
-    Prozent (0-100 ueblich, Werte ausserhalb extrapolieren bewusst ueber das
-    historische Fenster hinaus - identisch zu
-    backtest.FixedRankConfig.target_rank_pct), KEIN absoluter IV-Wert. Fuer
-    JEDEN Analog-Tag wird rollierend zurueckgerechnet, welche IV an GENAU
-    DIESEM Tag noetig gewesen waere, um exakt diesen Rang in seinem eigenen
-    HV-Min/Max-Fenster (hv_length/rank_lookback_days) zu erreichen (siehe
-    target_vol_for_rank) - z.B. bedeutet Rang 40% an einem ruhigen Markttag
-    eine niedrige IV, in einer Vola-Krise bei DEMSELBEN Rang 40% dagegen
-    eine deutlich hoehere IV.
-
-    HINWEIS (siehe Punkt 12 im Moduldokstring): analog_cfg wird 1:1
-    durchgereicht - falls der Aufrufer dort use_kernel_weighting=True setzt,
-    gilt die kontinuierliche Gewichtung auch hier. Standardmaessig
-    (analog_cfg=None -> AnalogConfig()) bleibt das bisherige harte
-    Cutoff-Verhalten aktiv, wie von dashboard_analog.py (Modus 2) erwartet.
-
-    Fuer direkten Zugriff auf den frueheren 'direct'-Modus (feste absolute
-    Vola statt Rang) evaluate_analog_set()/leg_pair_grid_search() direkt
-    aufrufen (siehe Punkt 6 im Moduldokstring)."""
+    IV-Bewertung ist IMMER rang-basiert (vol_mode="rank"): target_rank_pct ist
+    ein HV-Rang in Prozent; fuer JEDEN Analog-Tag wird zurueckgerechnet, welche
+    IV an diesem Tag den Rang erzeugt haette. analog_cfg wird 1:1 durchgereicht
+    (Default: harter Cutoff, wie von dashboard_analog.py erwartet)."""
     if put_delta_grid is None:
         put_delta_grid = [0.10, 0.16, 0.20, 0.25, 0.30]
     if call_delta_grid is None:
@@ -1139,14 +723,7 @@ def recommend_for_today(daily_df: pd.DataFrame, training_table: pd.DataFrame,
 
     analogs = find_analogs(query_date, query_score, space, analog_cfg)
 
-    # hv_rank_bounds() liefert das rollierende hv_min/hv_max-Fenster JEDES
-    # Handelstages (kausal) - wird unten pro Analog-Tag einzeln nachgeschlagen
-    # (siehe evaluate_analog_set). Der Query-Tag selbst braucht hier KEINE
-    # eigene Sonderbehandlung mehr: der Ziel-Rang kommt direkt von aussen
-    # (target_rank_pct), nicht mehr aus einer am Query-Tag beobachteten/
-    # eingegebenen absoluten IV (siehe Punkt 8 im Moduldokstring).
     bounds = hv_rank_bounds(daily_df, hv_length, rank_lookback_days)
-
     today_rank = target_rank_pct / 100.0
 
     grid_result = leg_pair_grid_search(
@@ -1166,11 +743,6 @@ def recommend_for_today(daily_df: pd.DataFrame, training_table: pd.DataFrame,
         "grid_result": grid_result,
         "n_pca_components": space.pca.n_components_,
         "clustering": clustering,
-        # Fuer die Detailansicht im Dashboard (volle Kennzahlen zu EINER
-        # gewaehlten Delta-Kombination, siehe summarize_analog_trades()) -
-        # damit muss recommend_for_today() dafuer nicht nochmal komplett
-        # neu ausgefuehrt werden (Aehnlichkeits-Raum + Analog-Suche sind der
-        # teure Teil, nicht die einzelne Neubewertung).
         "bounds": bounds, "T_days": T_days, "r_free": r_free,
         "dividend_yield": dividend_yield, "vol_surface": vol_surface,
         "training_table": training_table,

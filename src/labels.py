@@ -1,28 +1,21 @@
 """
-Label-Generierung fuer das ML-Regime-Modell.
+Label-Generierung fuer das ML-Regime-Modell / die Analog-Suche.
 
 REFERENZ-INSTRUMENT: 25-Delta Short Strangle (Short Put 25d + Short Call
 25d, KEINE Wings), bewusst gehalten bis Verfall (kein Stop-Loss/Early-Exit -
 das Label soll ein sauberes, reproduzierbares Mass fuer "wurde die
-eingesammelte Praemie durch die tatsaechliche Bewegung gerechtfertigt" sein,
-nicht durch Exit-Regel-Details verzerrt werden).
+eingesammelte Praemie durch die tatsaechliche Bewegung gerechtfertigt" sein).
 
-Das ist ABSICHTLICH ein anderes (einfacheres) Instrument als die spaeter real
-gehandelte 4-Bein-Iron-Condor-Struktur: das Label soll ein robustes
-Regime-Signal liefern, keine Kopie der konkreten Handelsstruktur. Welche
-IC-Konfiguration (Deltas, Wings, Exit-Regeln) auf Basis der Klassifikation
-dann tatsaechlich gehandelt wird, ist eine nachgelagerte Entscheidung (siehe
-Pro-Bein-Reliability-Diskussion).
+LAUFZEITEN: T_days = 1..30 (alle ganzen Tage). Exit-Tag ist der erste spaetere
+Handelstag mit mindestens T_days KALENDERTAGEN Abstand (identisch zum
+Ladder-Backtest). Bei T=1 ist das freitags der Montag (3 Kalendertage
+Bewegung) - dieselbe Konvention wie im Backtest.
 
 WICHTIG - Klassen-Schwellen sind NICHT global gueltig:
-generate_class_thresholds()/assign_classes() sind hier bewusst von der
+generate_class_thresholds()/assign_classes() sind bewusst von der
 Label-Generierung getrennt. Die Schwellen duerfen fuer ein echtes
 Walk-Forward-Training NUR aus den Trainingsdaten des jeweiligen Zeitfensters
-berechnet werden (siehe train.py, noch zu bauen) - alles andere ist
-Leakage (Klassengrenzen aus zukuenftigen Daten in die Vergangenheit
-projiziert). Die Funktionen hier global auf den kompletten Datensatz
-anzuwenden ist nur fuer Exploration/Sanity-Checks gedacht, NICHT fuers
-tatsaechliche Training.
+berechnet werden - alles andere ist Leakage.
 """
 
 from dataclasses import dataclass, field
@@ -36,7 +29,7 @@ from backtest import compute_hv, solve_strike_delta_consistent
 
 @dataclass
 class StrangleLabelConfig:
-    T_days_list: list[int] = field(default_factory=lambda: [2, 3, 5, 7, 10, 14])
+    T_days_list: list[int] = field(default_factory=lambda: list(range(1, 31)))
     delta: float = 0.25            # Put UND Call, symmetrisch (klassischer 25d Strangle)
     hv_length: int = 30            # IV-Quelle fuer Strike-Wahl + Bewertung: HV(hv_length)
     r_free: float = 0.0
@@ -46,23 +39,16 @@ class StrangleLabelConfig:
 
 def generate_strangle_labels(df: pd.DataFrame, cfg: StrangleLabelConfig | None = None) -> pd.DataFrame:
     """Fuer JEDEN echten Handelstag und JEDE Laufzeit aus cfg.T_days_list wird
-    ein 25-Delta Short Strangle eroeffnet und bis Verfall gehalten. Exit-Tag
-    ist der erste spaetere Handelstag, an dem mindestens T_days KALENDERTAGE
-    vergangen sind (identische Konvention wie backtest.run_daily_ladder()).
+    ein 25-Delta Short Strangle eroeffnet und bis Verfall gehalten.
 
-    Rueckgabe: ein DataFrame, eine Zeile je (entry_date, T_days)-Kombination,
-    mit Spalten:
+    Rueckgabe: eine Zeile je (entry_date, T_days)-Kombination, Spalten:
       entry_date, T_days, exit_date, entry_S, exit_S, entry_iv,
       K_put, K_call, entry_premium, net_pnl, pnl_norm
 
-    pnl_norm = net_pnl / entry_premium (Normierung auf die kassierte Praemie -
-    beim reinen Short Strangle ohne Wings ist das theoretische Verlustrisiko
-    unbegrenzt, "Praemie" ist hier der einzig sinnvolle Referenzpunkt, siehe
-    Diskussion zur Pro-Bein-Reliability).
+    pnl_norm = net_pnl / entry_premium.
 
-    Zeilen, fuer die entweder current_iv ungueltig ist ODER die Laufzeit ueber
-    das Ende der verfuegbaren Historie hinausreicht (kein Exit-Tag mehr
-    vorhanden), werden ausgelassen."""
+    Zeilen mit ungueltiger current_iv oder ohne Exit-Tag in der Historie
+    werden ausgelassen."""
     if cfg is None:
         cfg = StrangleLabelConfig()
 
@@ -82,9 +68,6 @@ def generate_strangle_labels(df: pd.DataFrame, cfg: StrangleLabelConfig | None =
 
     for T_days in cfg.T_days_list:
         T_years = T_days / 365.0
-        # Exit-Index je Entry-Tag vorab bestimmen: erster spaeterer Handelstag
-        # mit (date_exit - date_entry).days >= T_days. Effizient per
-        # searchsorted statt pro Zeile linear zu suchen (dates ist sortiert).
         target_dates = dates + np.timedelta64(T_days, "D")
         exit_idx_arr = np.searchsorted(dates, target_dates, side="left")
 
@@ -95,8 +78,6 @@ def generate_strangle_labels(df: pd.DataFrame, cfg: StrangleLabelConfig | None =
 
             j = exit_idx_arr[i]
             if j >= n:
-                # Laufzeit reicht ueber das Ende der verfuegbaren Historie
-                # hinaus - kein gueltiger Exit-Tag vorhanden, Zeile auslassen.
                 continue
 
             S = float(closes[i])
@@ -146,30 +127,17 @@ class ClassThresholds:
     Grenze, keine Datenquantile) - siehe generate_class_thresholds()."""
     neg_split: float   # Grenze zwischen 'stark_negativ' und 'negativ' (<0)
     pos_split: float   # Grenze zwischen 'positiv' und 'stark_positiv' (>=0)
-    n_neg: int = 0      # Diagnose: wie viele Trades gingen in die Berechnung ein
+    n_neg: int = 0
     n_pos: int = 0
 
 
 def generate_class_thresholds(pnl_norm: np.ndarray, split_quantile: float = 0.5) -> ClassThresholds:
-    """Berechnet die beiden inneren Klassengrenzen, symmetrisch um 0 herum
-    gebaut (nicht die klassischen 25/50/75%-Quantile der Rohverteilung, die
-    bei 70-80% Win-Rate stark zur Gewinnseite verschoben waeren):
+    """Berechnet die beiden inneren Klassengrenzen, symmetrisch um 0 gebaut:
+    Rohwerte werden am FESTEN Punkt 0 in Gewinner/Verlierer getrennt, innerhalb
+    jeder Seite wird SEPARAT das `split_quantile`-Quantil bestimmt.
 
-      1. Rohwerte werden am FESTEN Punkt 0 in Gewinner (>=0) und Verlierer
-         (<0) getrennt - das ist keine Datenquantile, sondern eine bewusst
-         inhaltliche Grenze (Trade war netto profitabel oder nicht).
-      2. Innerhalb jeder Seite wird SEPARAT das `split_quantile`-Quantil
-         bestimmt (Default 0.5 = Median) - das ist die eigentliche
-         quantilbasierte Komponente, jetzt aber unverzerrt von der
-         Grundasymmetrie der Win-Rate.
-
-    So ergeben sich 4 Klassen (stark_negativ / negativ / positiv /
-    stark_positiv), deren Grenze zwischen den beiden mittleren Klassen IMMER
-    exakt bei 0 liegt, waehrend die beiden aeusseren Grenzen sich an die
-    jeweilige Seite der tatsaechlichen Verteilung anpassen.
-
-    WICHTIG: `pnl_norm` muss hier NUR die Werte des Trainingsfensters
-    enthalten (siehe Modul-Docstring - sonst Leakage)."""
+    WICHTIG: `pnl_norm` darf NUR die Werte des Trainingsfensters enthalten
+    (sonst Leakage)."""
     pnl_norm = np.asarray(pnl_norm, dtype=float)
     pnl_norm = pnl_norm[~np.isnan(pnl_norm)]
 
@@ -186,8 +154,7 @@ CLASS_LABELS = ["stark_negativ", "negativ", "positiv", "stark_positiv"]
 
 
 def assign_classes(pnl_norm: pd.Series, thresholds: ClassThresholds) -> pd.Categorical:
-    """Weist jedem pnl_norm-Wert eine der 4 Klassen zu, auf Basis der (extern,
-    z.B. nur auf dem Trainingsfenster berechneten) Schwellen."""
+    """Weist jedem pnl_norm-Wert eine der 4 Klassen zu."""
     pnl_norm = pd.Series(pnl_norm)
     conditions = [
         pnl_norm < thresholds.neg_split,
@@ -200,22 +167,15 @@ def assign_classes(pnl_norm: pd.Series, thresholds: ClassThresholds) -> pd.Categ
 
 
 def class_distribution(classes: pd.Categorical) -> pd.Series:
-    """Bequemer Diagnose-Helfer: Klassenhaeufigkeiten (absolut + Prozent)."""
+    """Diagnose-Helfer: Klassenhaeufigkeiten (absolut + Prozent)."""
     counts = pd.Series(classes).value_counts().reindex(CLASS_LABELS)
     pct = counts / counts.sum() * 100.0
     return pd.DataFrame({"n": counts, "pct": pct.round(2)})
 
 
 def build_training_table(feature_df: pd.DataFrame, label_df: pd.DataFrame) -> pd.DataFrame:
-    """Verbindet Feature-Matrix (eine Zeile je Handelstag, siehe features.py)
-    und Label-Tabelle (eine Zeile je Handelstag x T_days, siehe
-    generate_strangle_labels()) ueber das Entry-Datum. Jede Laufzeit T_days
-    bekommt dabei dieselben Tages-Features zugeordnet (T_days selbst ist
-    zusaetzlich eine eigene Spalte/Feature, siehe Diskussion zur
-    Term-Structure-Interaktion) - Ergebnis: eine Zeile je (Handelstag,
-    T_days)-Kombination, direkt nutzbar fuer X (Feature-Spalten inkl.
-    T_days) und y (pnl_norm -> Klassen, siehe generate_class_thresholds/
-    assign_classes)."""
+    """Verbindet Feature-Matrix (eine Zeile je Handelstag) und Label-Tabelle
+    (eine Zeile je Handelstag x T_days) ueber das Entry-Datum."""
     merged = label_df.merge(
         feature_df, left_on="entry_date", right_on="date", how="left",
     )

@@ -6,21 +6,23 @@ Start:
 
 Struktur (bewusst in mehrere kleine Module aufgeteilt, damit man einen Modus
 aendern kann, ohne den Rest lesen zu muessen):
-  - dashboard_common.py  Daten laden, Candlestick-Uebersicht, kleine UI-Helfer
-                          (von BEIDEN Modi genutzt)
-  - dashboard_ladder.py  Modus 1: Iron-Condor-/Multi-Leg-Ladder-Backtest
-  - dashboard_analog.py  Modus 2: Analog-Tage-Matching
+  - dashboard_common.py    Daten laden, Candlestick-Uebersicht, kleine UI-Helfer
+                            (von ALLEN Modi genutzt)
+  - dashboard_ladder.py    Modus 1: Iron-Condor-/Multi-Leg-Ladder-Backtest
+  - dashboard_analog.py    Modus 2: Analog-Tage-Matching
+  - dashboard_livechain.py Modus 3: Heutige Kette + Analog-Tabelle + Condor-Suche
+  - dashboard_depot.py     Modus 4: Depot-Analyse (eigene Positionen, dauerhaft
+                            gespeichert in data/depot.json)
 
 Diese Datei selbst tut nur drei Dinge:
   1. Daten laden + die immer sichtbare Candlestick-Uebersicht rendern
      (dashboard_common.render_overview).
-  2. Eine Reiterleiste oben anzeigen, mit der zwischen den zwei Modi
-     gewechselt wird.
+  2. Eine Reiterleiste oben anzeigen, mit der zwischen den Modi gewechselt wird.
   3. Je nach gewaehltem Modus GENAU EIN render()-Modul aufrufen.
 
 WICHTIG zur Reiterleiste: es wird bewusst KEIN st.tabs() verwendet. Bei
 st.tabs() fuehrt Streamlit den Code in JEDEM Tab bei jedem Rerun aus (auch
-im nicht sichtbaren Tab) - das wuerde dazu fuehren, dass BEIDE Modi ihre
+im nicht sichtbaren Tab) - das wuerde dazu fuehren, dass ALLE Modi ihre
 Sidebar-Abschnitte gleichzeitig rendern und sich dort vermischen. Ein
 horizontales st.radio() sieht optisch wie eine Reiterleiste aus, aktiviert
 aber pro Rerun nur den Code des gewaehlten Modus - dadurch bleibt auch die
@@ -36,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dashboard_common import load_data, render_overview
 import dashboard_ladder
 import dashboard_analog
+import dashboard_depot
 
 st.set_page_config(page_title="SPX Options Dashboard", layout="wide")
 
@@ -61,6 +64,7 @@ MODES = {
     "📊 Iron Condor Backtest": dashboard_ladder,
     "🔍 Analog-Tage-Matching": dashboard_analog,
     "⚡ Heutige Kette": dashboard_livechain,
+    "💼 Depot-Analyse": dashboard_depot,
 }
 active_mode_label = st.radio(
     "Modus", list(MODES.keys()), horizontal=True, label_visibility="collapsed",

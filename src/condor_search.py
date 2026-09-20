@@ -28,7 +28,6 @@ from analog_matching import _hac_se_weighted_mean
 class CondorConfig:
     price_basis: str = "bidask"        # "bidask" (echt) | "mid" (Naeherung)
     t_min: float = 3.0                 # min. HAC-t-Stat (Gesamtset) - nur SCHWELLE, kein Ranking
-    max_loss_budget: float = 0.0       # max. Verlust in Punkten pro Condor (0 = unbegrenzt)
     max_full_loss_share: float = 0.03  # max. gewichteter Anteil Tage mit vollem Max-Loss
     tail_quantile: float = 0.05
     tail_floor: float = -0.75          # min. gewichtetes 5%-Quantil von pnl/max_loss
@@ -80,8 +79,12 @@ def _stats(x: np.ndarray, w: np.ndarray, ctx: dict, max_loss: float, cfg: Condor
 
 
 def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: float,
-                         cfg: CondorConfig | None = None):
+                         cfg: CondorConfig | None = None, short_valid: dict | None = None):
     """Bewertet ALLE Paare (Short-Zeile i, Fluegel-Zeile j>i) der Distanz-Tabelle.
+    short_valid: optional {distance_pct: bool} - Gueltigkeit der Short-Zeilen
+    laut Analog-Tabelle (Short-Strangle, siehe dashboard_livechain). Ist es
+    gesetzt, ersetzt es die eigene Short-Pruefung, damit Short-Kriterium und
+    Plateau exakt mit den sichtbaren gruenen Zeilen dieser Tabelle uebereinstimmen.
     Rueckgabe: (condor_df, side_df, meta)
       condor_df: symmetrische Condors, mit Kriterien-Flags und 'passes'
       side_df:   Put- und Call-Spreads einzeln (zeigt, welche Seite den Edge traegt)"""
@@ -129,6 +132,8 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
             e_tr = float(w[trm] @ x[trm] / w[trm].sum()) if w[trm].sum() > 0 else np.nan
             e_va = float(w[~trm] @ x[~trm] / w[~trm].sum()) if w[~trm].sum() > 0 else np.nan
             ok_i = bool(mean_s > 0 and e_tr > 0 and e_va > 0 and t_s > cfg.t_min)
+        if short_valid is not None:
+            ok_i = bool(short_valid.get(float(dist[i]), False))
         short_ok[i] = ok_i
         short_rows.append({"i": i, "distance": dist[i], "strike_put": Kp[i], "strike_call": Kc[i],
                            "credit": credit_s, "mean": mean_s, "tstat": t_s,
@@ -191,7 +196,6 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
     cdf["c_val"] = cdf["e_val"] > 0
     cdf["c_t"] = cdf["tstat"] > cfg.t_min
     cdf["c_tail"] = (cdf["full_loss_share"] <= cfg.max_full_loss_share) & (cdf["q_tail"] >= cfg.tail_floor)
-    cdf["c_budget"] = True if cfg.max_loss_budget <= 0 else (cdf["max_loss"] <= cfg.max_loss_budget)
     # Basis-Kriterien des Condors selbst (Train, Val, t, Tail)
     cdf["c_base"] = cdf[["c_train", "c_val", "c_t", "c_tail"]].all(axis=1)
     # Short-Kriterium: die Short-Zeile i (nur Short-Strangle) muss selbst gueltig sein
@@ -205,7 +209,7 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
         return (i - 1 >= 0 and short_ok.get(i - 1, False)) and (i + 1 < n and short_ok.get(i + 1, False))
 
     cdf["c_plateau"] = ([plateau(int(i)) for i in cdf["i"]] if cfg.require_plateau else True)
-    cdf["passes"] = cdf[["c_base", "c_budget", "c_short", "c_plateau"]].all(axis=1)
+    cdf["passes"] = cdf[["c_base", "c_short", "c_plateau"]].all(axis=1)
 
     # Ranking: HOECHSTER Erwartungswert in Punkten unter allen Kandidaten.
     cdf = cdf.sort_values(["passes", "mean"], ascending=[False, False]).reset_index(drop=True)

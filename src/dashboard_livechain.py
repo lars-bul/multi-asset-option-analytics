@@ -374,7 +374,7 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
         "Jedes Paar (Short-Zeile i, Fluegel-Zeile j mit groesserem Abstand) wird auf DENSELBEN "
         "Analog-Tagen bewertet: Kredit = heutige Bid/Ask-Preise, Payout = historische %-Bewegung "
         "auf den heutigen Spot projiziert. Short und Fluegel gemeinsam pro Tag (korrelationsrichtig), "
-        "kein Vola-Modell. RANKING: hoechster Erwartungswert in Punkten unter allen Kandidaten. "
+        "kein Vola-Modell. RANKING: unter allen Kandidaten nach der gewaehlten Sortierung (Standard: Rendite/Risiko %). "
         "Kandidat = Condor mit Erwartungswert in Train UND Val > 0, HAC-t-Stat > Schwelle (nur Schwelle, "
         "kein Ranking), Tail-Kriterien erfuellt, UND die Short-Zeile ist in der Analog-Tabelle oben GRUEN "
         "(= 'Short gueltig', eine gemeinsame Definition) UND Plateau: die Zeilen DIREKT ueber und "
@@ -385,7 +385,7 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
         st.error("Distanz-Tabelle hat keine Bid/Ask-Spalten - Kette neu laden.")
         return
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         basis = st.radio("Preisbasis", ["Bid/Ask (echt)", "Mid (Näherung)"], key="condor_basis",
                          help="Ausserhalb der Handelszeit liefert Yahoo oft Bid/Ask=0 - dann Mid waehlen.")
@@ -397,6 +397,13 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
     with c4:
         tail_floor = st.number_input("Min. 5%-Quantil (Rendite/Max-Loss)", -1.0, 0.0, -0.75, 0.05,
                                      key="condor_tail")
+    with c5:
+        sort_label = st.selectbox(
+            "Sortierung", ["Rendite/Risiko %", "E[P&L] (Pkt)", "t (HAC)"], index=0, key="condor_sort",
+            help="Standard: Rendite/Risiko % (= E[P&L] / Max-Loss). Achtung: bevorzugt schmale Fluegel, "
+                 "weil der Max-Loss im Nenner steht - Voll-Verlust-Haeufigkeit und 5%-Quantil in der "
+                 "Tabelle mitlesen.",
+        )
 
     # Short-Gueltigkeit aus der Analog-Tabelle oben (Short-Strangle je Zeile) - identisch
     # zu dem, was dort gruen/robust angezeigt wird.
@@ -419,9 +426,12 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
             moves = analog_moves(ctx["analogs"], ctx["training_table"], ctx["T_days_used"], ctx["query_date"])
             cfg = CondorConfig(price_basis="mid" if basis.startswith("Mid") else "bidask",
                                t_min=float(t_min), max_full_loss_share=max_full / 100.0,
-                               tail_floor=float(tail_floor))
+                               tail_floor=float(tail_floor),
+                               sort_by={"Rendite/Risiko %": "ror", "E[P&L] (Pkt)": "mean", "t (HAC)": "tstat"}[sort_label])
+            meta_sort = sort_label
             cdf, sdf, meta = evaluate_condor_grid(table, moves, spot, cfg, short_valid)
             meta["T_days_used"] = ctx["T_days_used"]
+            meta["sort_label"] = meta_sort
             st.session_state["livechain_condor"] = dict(key=distance_key, cdf=cdf, sdf=sdf, meta=meta)
 
     res = st.session_state.get("livechain_condor")
@@ -445,7 +455,7 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
     else:
         b = cdf.iloc[0]
         st.success(
-            f"Optimum (hoechster E[P&L] unter allen Kriterien): Short {b['strike_put_short']:.0f}P / {b['strike_call_short']:.0f}C, "
+            f"Optimum (beste Zeile nach '{meta.get('sort_label', 'Rendite/Risiko %')}' unter allen Kriterien): Short {b['strike_put_short']:.0f}P / {b['strike_call_short']:.0f}C, "
             f"Fluegel {b['strike_put_wing']:.0f}P / {b['strike_call_wing']:.0f}C · Kredit {b['credit']:.2f}, "
             f"Max-Loss {b['max_loss']:.2f} · E[P&L] {b['mean']:+.2f} Pkt = {b['ror']*100:+.1f}% auf Risikokapital "
             f"(t={b['tstat']:.2f}, Val-E {b['e_val']:+.2f})."
@@ -519,7 +529,7 @@ def render(df, daily_df, has_resolution) -> None:
         st.caption("Abstands-Raster (Ziel-% vom Spot) fuer die Zeilen:")
         distance_grid_input = st.text_input(
             "Ziel-Abstaende (%, kommagetrennt)",
-            "0.25,0.5,0.75,1.0,1.25,1.5,1.75,2.0,2.25,2.5,2.75,3.0,3.5,4,5,6,8,10",
+            "0,0.01,0.1,0.2,0.25,0.3,0.4,0.5,0.75,1.0,1.25,1.5,1.75,2.0,2.25,2.5,2.75,3.0,3.5,4,5,6,8,10",
         )
         rank_lookback = st.number_input(
             "Lookback fuer HV-Min/Max-Rangfenster (Tage)", 30, 5000, 252,

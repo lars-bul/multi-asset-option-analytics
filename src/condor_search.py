@@ -32,6 +32,7 @@ class CondorConfig:
     tail_quantile: float = 0.05
     tail_floor: float = -0.75          # min. gewichtetes 5%-Quantil von pnl/max_loss
     require_plateau: bool = True
+    sort_by: str = "ror"              # Ranking der Kandidaten: "ror" (Rendite/Risiko, Standard) | "mean" (E[P&L] in Punkten) | "tstat"
 
 
 def analog_moves(analogs: pd.DataFrame, training_table: pd.DataFrame, T_days: int,
@@ -211,8 +212,10 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
     cdf["c_plateau"] = ([plateau(int(i)) for i in cdf["i"]] if cfg.require_plateau else True)
     cdf["passes"] = cdf[["c_base", "c_short", "c_plateau"]].all(axis=1)
 
-    # Ranking: HOECHSTER Erwartungswert in Punkten unter allen Kandidaten.
-    cdf = cdf.sort_values(["passes", "mean"], ascending=[False, False]).reset_index(drop=True)
+    # Ranking der Kandidaten nach cfg.sort_by (Standard: Rendite/Risiko %).
+    if cfg.sort_by not in ("ror", "mean", "tstat"):
+        raise ValueError(f"sort_by muss 'ror', 'mean' oder 'tstat' sein (erhalten: {cfg.sort_by!r}).")
+    cdf = cdf.sort_values(["passes", cfg.sort_by], ascending=[False, False]).reset_index(drop=True)
     meta["n_pass"] = int(cdf["passes"].sum())
     meta["n_base"] = int(cdf["c_base"].sum())
     meta["short_df"] = pd.DataFrame(short_rows)

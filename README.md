@@ -140,12 +140,7 @@ Zeitraum ab 1927-12-30, nicht die monatlich interpolierten Daten davor (HV-
 Berechnung auf kuenstlich flach fortgeschriebenen Monatswerten waere
 bedeutungslos).
 
-## Naechste Ausbaustufen (noch nicht enthalten)
 
-- `src/features.py` - Feature-Engineering fuer das ML-Modell (Marktzustand
-  am Entry-Tag: Kurs-Returns, Abstand 200-Tage-Linie, Regime-Merkmale etc.)
-- `src/train.py` - Walk-Forward-Training des Klassifikationsmodells
-  (4 Klassen: stark negativ / negativ / positiv / stark positiv, quantil-
   basiert um 0 zentriert), speichert Modell nach `models/`
 - Options-Preis-Abruf (Polygon/Tradier) als zweite Datenquelle fuer den
   Live-Marktpreis-Vergleich

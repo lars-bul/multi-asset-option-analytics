@@ -3,7 +3,8 @@ MODUS 4: Depot-Analyse.
 
 Eigene Optionspositionen als Kombos aus 1 bis 4 Beinen erfassen (gemeinsamer Verfall),
 dauerhaft speichern (data/depot.json, wird beim Start automatisch wieder geladen) und
-mit derselben Logik bewerten wie die Iron-Condor-Suche ("Rechnung 2"):
+mit DERSELBEN Statistik bewerten wie die Iron-Condor-Suche (Teil C in
+dashboard_livechain.py / condor_search.py):
 
   BEWERTUNG (Analog-Tage-Simulation):
     Historische PROZENTUALE Kursbewegungen der Analog-Tage (gewichtet, siehe
@@ -12,9 +13,32 @@ mit derselben Logik bewerten wie die Iron-Condor-Suche ("Rechnung 2"):
       P&L_d (seit Einstieg)  = entry_net + V(S_d)
       Restgewinn_d (ab jetzt) = V(S_d) - Marktwert_heute      (Marktwert = Mid je Bein)
     V(S) = Summe: long +intrinsic*qty, short -intrinsic*qty.
-    Kennzahlen: E[P&L bis Verfall], Wahrscheinlichkeit im Plus, gewichtetes 5%-Quantil,
-    E[Restgewinn] mit HAC-t-Stat (Vergleich 'halten' gegen 'heute zum Mid schliessen').
-    Kein Vola-Modell in dieser Bewertung.
+
+    KORREKTUR (Kennzahlen-Angleichung an die Iron-Condor-Suche): frueher nutzte
+    dieser Modus analog_matching.weighted_reliability_summary() - eine andere
+    Formel/Spaltenmenge als condor_search.py. Jetzt wird dieselbe Funktion wie dort
+    verwendet (condor_search.weighted_pnl_stats(): E[P&L], Rendite/Risiko %
+    ('ror'), HAC-t-Stat (Bartlett, Kalenderzeit), Train/Val-Split, Voll-Verlust-
+    Anteil/-Tage, 5%-Quantil relativ zum Max-Loss, Gewinnrate).
+
+    WICHTIG - Risikobezug muss zur P&L-Basis passen: die Iron-Condor-Suche bezieht
+    'Kredit'/'Max-Loss' auf HEUTIGE Preise. Im Depot gibt es zwei moegliche P&L-
+    Basen (P&L seit historischem Einstieg vs. Restgewinn ab heutigem Mid) - wird
+    'Rendite/Risiko %' aus dem Restgewinn (Zaehler, heutiger Bezug) aber dem
+    Max-Loss der TATSAECHLICHEN, historisch eroeffneten Kombo (Nenner) gebildet,
+    mischen sich zwei verschiedene Bezugspunkte. Deshalb wird der Max-Loss hier IMMER
+    aus derselben Basis wie der P&L genommen: liegt ein Marktpreis vor (Basis =
+    Restgewinn), aus einer HYPOTHETISCHEN, HEUTE-zum-Mid-eroeffneten Kombo
+    (_hypothetical_today_combo); sonst (Basis = P&L seit Einstieg) aus der
+    tatsaechlichen Kombo.
+
+    UNBEGRENZTES RISIKO: anders als bei der Iron-Condor-Suche (dort durch die
+    Fluegel immer endlich) koennen Depot-Kombos frei zusammengestellt werden (z.B.
+    ein nackter Short Call ohne Long-Fluegel) - dann ist max_loss = inf. Fuer diese
+    Kombos sind 'Rendite/Risiko %', 'Voll-Verlust %/-Tage' und '5%-Quantil (R/R)'
+    nicht definierbar (n/a, siehe weighted_pnl_stats()); E[P&L], t-Stat, Train/Val
+    und Gewinnrate bleiben davon unabhaengig gueltig. Eine Warnung listet betroffene
+    Kombos, analog zur 'n_unlimited_risk'-Warnung in dashboard_ladder.py.
 
   AUSSTIEGSPREISE HEUTE ("ab welchem Kurs wird die Kombo heute unrentabel?"):
     Hier BRAUCHT es ein Modell, denn heute ist noch Zeitwert im Spiel: jedes Bein wird
@@ -23,7 +47,9 @@ mit derselben Logik bewerten wie die Iron-Condor-Suche ("Rechnung 2"):
     Vola-Aenderung bei Kursbewegung. Gesucht: Spotwerte S mit
       P&L_heute(S) = entry_net + Marktwert_modell(S) = 0        (Break-even heute)
       P&L_heute(S) = -X% * |entry_net|                            (Stop-Level, X einstellbar)
-    Zusaetzlich exakt und modellfrei: Break-even und Max-Gewinn/-Verlust BEI VERFALL.
+    Zusaetzlich exakt und modellfrei: Break-even und Max-Gewinn/-Verlust BEI VERFALL
+    (immer bezogen auf die TATSAECHLICHE, historisch eroeffnete Kombo - unveraendert
+    gegenueber der Analog-Bewertung oben).
     Ohne Chain-Vola (Strike fehlt in der Kette) wird die 'Ersatz-Vola' aus der Sidebar
     genommen und die Zeile entsprechend markiert.
 """
@@ -43,8 +69,8 @@ import dashboard_livechain
 from black76 import forward_price
 from chain_delta import ChainDeltaConfig, enrich_chain_with_delta, black76_price
 from fetch_today_chain import fetch_today_chain, fetch_today_spot
-from analog_matching import weighted_reliability_summary, available_t_days
-from condor_search import analog_moves
+from analog_matching import available_t_days
+from condor_search import analog_moves, weighted_pnl_stats
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DEPOT_FILE = DATA_DIR / "depot.json"
@@ -53,6 +79,7 @@ _NY = "America/New_York"
 _IC_DEFAULTS = [("put", "long"), ("put", "short"), ("call", "short"), ("call", "long")]
 _GENERIC_DEFAULTS = [("put", "short"), ("call", "short"), ("put", "long"), ("call", "long")]
 _LEVEL_LO, _LEVEL_HI = 0.5, 1.5     # Suchbereich der Ausstiegspreise: +-50 % um den Spot
+_TAIL_QUANTILE = 0.05
 
 
 # ───────────────────────── Hilfsfunktionen ─────────────────────────
@@ -132,6 +159,18 @@ def _make_pnl_today(combo: dict, ivs: list[float], dte: float, r: float, q: floa
             total = total + dl._sign(leg) * leg["qty"] * p
         return total
     return f
+
+
+def _hypothetical_today_combo(combo: dict, mids: list[float]) -> dict | None:
+    """Kopie der Kombo mit entry_price je Bein = HEUTIGER Mid-Preis - der
+    Risikobezugspunkt fuer 'Restgewinn' (P&L ab heute bis Verfall), analog zu
+    'Kredit'/'Max-Loss' in der Iron-Condor-Suche (condor_search.py), die ebenfalls
+    auf heutigen Preisen basieren statt auf dem historischen Einstieg. Gibt None
+    zurueck, wenn fuer mindestens ein Bein kein Mid-Preis vorliegt."""
+    if any(m is None for m in mids):
+        return None
+    legs = [{**leg, "entry_price": mid} for leg, mid in zip(combo["legs"], mids)]
+    return {**combo, "legs": legs}
 
 
 def _zone_info(f, target: float, spot: float) -> dict:
@@ -332,6 +371,7 @@ def _analyze(daily_df: pd.DataFrame, combos: list[dict], market: dict, p: dict) 
         return None
     valid_t = available_t_days(ctx["training_table"])
     moves_cache: dict[int, pd.DataFrame] = {}
+    n_unbounded = 0
 
     results = []
     for c, dte in todo:
@@ -361,19 +401,46 @@ def _analyze(daily_df: pd.DataFrame, combos: list[dict], market: dict, p: dict) 
                 iv, fallback_iv = p["fallback_vol"], True
             ivs.append(max(iv, 0.01))
         mark = None
+        today_combo = None
         if all(m is not None for m in mids):
             mark = float(sum(dl._sign(l) * l["qty"] * m for l, m in zip(c["legs"], mids)))
+            today_combo = _hypothetical_today_combo(c, mids)
         if mark is None:
             notes.append("kein Marktpreis in der Kette -> Marktwert/Restgewinn n/a")
         if fallback_iv:
             notes.append("Ersatz-Vola fuer mind. ein Bein")
 
         rest = (V_d - mark) if mark is not None else None
-        basis = rest if rest is not None else pnl_entry
-        ev = moves[["entry_date", "hold_days", "weight"]].copy()
-        ev["pnl_depot_combo"] = basis
-        rel = weighted_reliability_summary(ev, "combo", 6, "pnl_depot")
 
+        # Basis + Risikobezug MUESSEN zusammenpassen (siehe Moduldokstring oben):
+        # mit Marktpreis -> Restgewinn ab heute, Risiko aus der HEUTE eroeffneten
+        # Kombo; ohne Marktpreis -> P&L seit historischem Einstieg, Risiko aus der
+        # tatsaechlichen Kombo.
+        if today_combo is not None:
+            basis = rest
+            risk_profile = dl.payoff_profile(today_combo)
+        else:
+            basis = pnl_entry
+            risk_profile = dl.payoff_profile(c)
+        max_loss_basis = risk_profile["max_loss"]
+
+        if not np.isfinite(max_loss_basis):
+            n_unbounded += 1
+            notes.append(
+                "unbegrenztes Verlustrisiko (ab dem aktuellen Bezugspunkt) -> 'Rendite/"
+                "Risiko %', 'Voll-Verlust %/-Tage' und '5%-Quantil (R/R)' nicht definiert (n/a)"
+            )
+
+        train_mask = (moves["entry_date"] < moves["entry_date"].median()).to_numpy()
+        hold_days = int(moves["hold_days"].max())
+        stats = weighted_pnl_stats(
+            basis, w, moves["entry_date"].to_numpy(), hold_days, train_mask,
+            max_loss_basis, tail_quantile=_TAIL_QUANTILE,
+        )
+
+        # Exakte Verfallskennzahlen (Max-Verlust/-Gewinn, Breakevens) IMMER bezogen
+        # auf die TATSAECHLICHE, historisch eroeffnete Kombo - unveraendert
+        # gegenueber dem Risikobezug der Analog-Statistik oben.
         prof = dl.payoff_profile(c)
         f_today = _make_pnl_today(c, ivs, dte, market["r_free"], market["dividend_yield"])
         stop_target = -p["stop_pct"] / 100.0 * abs(net) if abs(net) > 0 else None
@@ -390,20 +457,22 @@ def _analyze(daily_df: pd.DataFrame, combos: list[dict], market: dict, p: dict) 
             "id": c["id"], "name": _combo_label(c), "expiry": c["expiry"], "dte": dte, "T_used": T_used,
             "net": net, "mark": mark,
             "unreal": (net + mark) if mark is not None else None,
-            "E_entry": float(np.sum(w * pnl_entry) / w.sum()),
-            "p_plus": float(w[pnl_entry >= 0].sum() / w.sum() * 100.0),
-            "q5": dl.weighted_quantile(pnl_entry, w, 0.05),
-            "E_rest": float(np.sum(w * rest) / w.sum()) if rest is not None else None,
-            "t_rest": rel["tstat"], "n_eff_hac": rel["n_eff_hac"],
-            "t_basis": "Restgewinn" if rest is not None else "P&L seit Einstieg",
+            "t_basis": "Restgewinn" if today_combo is not None else "P&L seit Einstieg",
+            "mean": stats["mean"], "ror": stats["ror"], "tstat": stats["tstat"],
+            "e_train": stats["e_train"], "e_val": stats["e_val"],
+            "full_loss_share": stats["full_loss_share"], "n_full_loss": stats["n_full_loss"],
+            "q_tail": stats["q_tail"], "win_rate_pct": stats["win_rate_pct"],
             "max_loss": prof["max_loss"], "max_profit": prof["max_profit"],
             "be_expiry": prof["breakevens"],
             "zi_be": zi_be, "zi_stop": zi_stop, "stop_target": stop_target,
             "pnl_now_model": float(f_today(np.array([spot]))[0]),
             "chart": chart_df, "notes": notes,
         })
-    return {"results": results, "skipped": skipped, "spot": spot, "n_days": {t: len(m) for t, m in moves_cache.items()},
-            "sig": dl_signature(combos), "stop_pct": p["stop_pct"]}
+    return {
+        "results": results, "skipped": skipped, "spot": spot,
+        "n_days": {t: len(m) for t, m in moves_cache.items()},
+        "sig": dl_signature(combos), "stop_pct": p["stop_pct"], "n_unbounded": n_unbounded,
+    }
 
 
 def dl_signature(combos: list[dict]) -> str:
@@ -418,32 +487,57 @@ def _render_results(res: dict) -> None:
         st.caption(f"⚠️ Uebersprungen - {s}")
 
     tot_unreal = sum(r["unreal"] for r in rows if r["unreal"] is not None)
-    tot_e = sum(r["E_entry"] for r in rows)
-    tot_rest = sum(r["E_rest"] for r in rows if r["E_rest"] is not None)
-    m1, m2, m3 = st.columns(3)
+    tot_mean = sum(r["mean"] for r in rows)
+    m1, m2 = st.columns(2)
     m1.metric("Summe unrealisiert heute ($)", f"{tot_unreal * dl.MULTIPLIER:+,.0f}")
-    m2.metric("Summe E[P&L bis Verfall] ($)", f"{tot_e * dl.MULTIPLIER:+,.0f}")
-    m3.metric("Summe E[Restgewinn] ($)", f"{tot_rest * dl.MULTIPLIER:+,.0f}")
-    st.caption("Erwartungswerte sind additiv ueber Kombos (auch bei unterschiedlichem Verfall). "
-               "Positives E[Restgewinn] = im Schnitt lohnt Halten mehr als heute zum Mid zu schliessen "
-               "(vor Spread/Kosten).")
+    m2.metric("Summe E[P&L] ($)", f"{tot_mean * dl.MULTIPLIER:+,.0f}")
+    st.caption(
+        "E[P&L] nutzt dieselbe Rechnung wie die Iron-Condor-Suche (Teil C in 'Heutige "
+        "Kette'): gewichteter Mittelwert ueber die Analog-Tage, HAC-t-Stat (Bartlett-"
+        "Kernel, Kalenderzeit), Train/Val-Split, Voll-Verlust-Anteil/-Tage und 5%-"
+        "Quantil relativ zum Max-Verlust. Basis siehe Spalte 'Basis': 'Restgewinn' "
+        "(Marktpreis vorhanden, Bezugspunkt = heutiger Mid-Preis, wie 'Kredit' bei "
+        "der Condor-Suche) oder 'P&L seit Einstieg' (kein Marktpreis verfuegbar, "
+        "Bezugspunkt = tatsaechlicher historischer Einstieg). Additiv ueber Kombos, "
+        "auch bei unterschiedlichem Verfall/T_used."
+    )
+    if res.get("n_unbounded", 0) > 0:
+        st.warning(
+            f"{res['n_unbounded']} von {len(rows)} Kombo(s) haben unbegrenztes "
+            "Verlustrisiko ab dem jeweiligen Risikobezugspunkt (z.B. mehr Short- als "
+            "Long-Calls/-Puts ohne passenden Fluegel) - fuer diese sind 'Rendite/"
+            "Risiko %', 'Voll-Verlust %/-Tage' und '5%-Quantil (R/R)' n/a (siehe "
+            "Spalte 'Hinweise' unten)."
+        )
 
     tbl = pd.DataFrame([{
         "Kombo": r["name"], "Rest (Tage)": r["dte"], "T (Analog)": r["T_used"],
+        "Basis": r["t_basis"],
         "Netto-Einstieg (Pkt)": r["net"], "Marktwert heute (Pkt)": r["mark"],
         "Unrealisiert (Pkt)": r["unreal"],
-        "E[P&L bis Verfall] (Pkt)": r["E_entry"], "Im Plus bei Verfall %": r["p_plus"],
-        "5%-Quantil P&L (Pkt)": r["q5"],
-        "E[Restgewinn] (Pkt)": r["E_rest"], "t (HAC)": r["t_rest"],
-        "Max-Verlust bei Verfall (Pkt)": r["max_loss"],
+        "E[P&L] (Pkt)": r["mean"],
+        "Rendite/Risiko %": r["ror"] * 100.0 if pd.notna(r["ror"]) else np.nan,
+        "t (HAC)": r["tstat"],
+        "E Train": r["e_train"], "E Val": r["e_val"],
+        "Voll-Verlust %": r["full_loss_share"] * 100.0 if pd.notna(r["full_loss_share"]) else np.nan,
+        "Voll-Verlust-Tage (n)": r["n_full_loss"] if r["n_full_loss"] is not None else np.nan,
+        "5%-Quantil (R/R)": r["q_tail"],
+        "Gewinnrate %": r["win_rate_pct"],
+        "Max-Verlust bei Verfall (Pkt)": r["max_loss"] if np.isfinite(r["max_loss"]) else np.nan,
         "Break-even Verfall": " / ".join(f"{b:,.0f}" for b in r["be_expiry"]) or "-",
     } for r in rows])
-    fmt = {"Rest (Tage)": "{:.1f}", "T (Analog)": "{:.0f}", "Netto-Einstieg (Pkt)": "{:+.2f}",
-           "Marktwert heute (Pkt)": "{:+.2f}", "Unrealisiert (Pkt)": "{:+.2f}",
-           "E[P&L bis Verfall] (Pkt)": "{:+.2f}", "Im Plus bei Verfall %": "{:.1f}",
-           "5%-Quantil P&L (Pkt)": "{:+.2f}", "E[Restgewinn] (Pkt)": "{:+.2f}", "t (HAC)": "{:.2f}",
-           "Max-Verlust bei Verfall (Pkt)": "{:,.1f}"}
+    fmt = {
+        "Rest (Tage)": "{:.1f}", "T (Analog)": "{:.0f}",
+        "Netto-Einstieg (Pkt)": "{:+.2f}", "Marktwert heute (Pkt)": "{:+.2f}",
+        "Unrealisiert (Pkt)": "{:+.2f}",
+        "E[P&L] (Pkt)": "{:+.2f}", "Rendite/Risiko %": "{:+.1f}",
+        "t (HAC)": "{:.2f}", "E Train": "{:+.2f}", "E Val": "{:+.2f}",
+        "Voll-Verlust %": "{:.1f}", "Voll-Verlust-Tage (n)": "{:.0f}",
+        "5%-Quantil (R/R)": "{:.2f}", "Gewinnrate %": "{:.1f}",
+        "Max-Verlust bei Verfall (Pkt)": "{:,.1f}",
+    }
     st.dataframe(tbl.style.format(fmt, na_rep="n/a"), use_container_width=True, hide_index=True)
+    st.caption("Netto-Einstieg: positiv = Kredit erhalten, negativ = Debit bezahlt.")
 
     st.subheader("Ausstiegspreise HEUTE")
     st.caption(
@@ -476,8 +570,11 @@ def _render_results(res: dict) -> None:
     spot_rule = alt.Chart(pd.DataFrame({"Spot": [spot]})).mark_rule(color="gray", strokeDash=[4, 4]).encode(x="Spot:Q")
     zero_rule = alt.Chart(pd.DataFrame({"y": [0.0]})).mark_rule(color="gray").encode(y="y:Q")
     st.altair_chart((base + spot_rule + zero_rule).properties(height=350).interactive(), use_container_width=True)
-    st.caption(f"Basis des t-Stats ('{r['t_basis']}'): HAC-korrigiert, n_eff(HAC)={r['n_eff_hac']:.0f}. "
-               "Die Analog-Bewertung ist eine historische Ruecksimulation, keine Prognose.")
+    st.caption(
+        f"Basis des t-Stats ('{r['t_basis']}'): HAC-korrigiert (Bartlett-Kernel, Kalenderzeit) - "
+        "dieselbe Methode wie in der Iron-Condor-Suche (condor_search.weighted_pnl_stats()). "
+        "Die Analog-Bewertung ist eine historische Ruecksimulation, keine Prognose."
+    )
 
 
 # ───────────────────────── Einstiegspunkt ─────────────────────────

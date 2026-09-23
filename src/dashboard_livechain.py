@@ -30,7 +30,7 @@ gilt nur fuer den Condor selbst.
 
 Gemeinsame Bausteine: Analog-Suche mit Kernel-Gewichten (analog_matching.
 find_analogs), einmalig pro Klick und in st.session_state gecacht
-(_find_today_analogs); T_days = naechstgelegener Wert der training_table (1..30,
+(_find_today_analogs); T_days = naechstgelegener Wert der training_table (1..90,
 fehlende Laufzeiten -> Button in _ensure_training_table()); 'Heute' =
 synthetischer Balken mit heutigem Eroeffnungskurs; Staleness-Warnung
 (Quote-Alter) ab _QUOTE_AGE_WARNING_MINUTES.
@@ -70,7 +70,7 @@ _ANALOG_MIN_CANDIDATES = 20
 _LOW_N_EFF_WARNING = 10.0
 _ROBUST_TSTAT_THRESHOLD = 2.0
 _ROBUST_MIN_PERIODS_MATCH = 5   # mindestens 5 von 6 Teilperioden
-_REQUIRED_T_DAYS = list(range(1, 31))
+_REQUIRED_T_DAYS = list(range(1, 91))
 
 _ROW_STYLE = {
     "green": "background-color: rgba(46, 160, 67, 0.30)",
@@ -133,7 +133,7 @@ def _bounds_cached(daily_df: pd.DataFrame, hv_length: int, lookback: int) -> pd.
 
 
 def _ensure_training_table() -> None:
-    """Prueft, ob die training_table alle Laufzeiten 1..30 enthaelt. Falls
+    """Prueft, ob die training_table alle Laufzeiten 1..90 enthaelt. Falls
     nicht (alte Tabelle), wird ein Hinweis + Button angezeigt, der
     build_dataset.py in einem Subprozess ausfuehrt (dauert einige Minuten).
     Die Seite bleibt bis dahin mit den vorhandenen Laufzeiten nutzbar."""
@@ -145,9 +145,9 @@ def _ensure_training_table() -> None:
         return
     st.warning(
         f"Die Trainingstabelle enthaelt nur die Laufzeiten {sorted(have)} - es fehlen "
-        f"{len(missing)} von 30 (T_days 1..30). Einmal neu bauen (dauert einige Minuten)."
+        f"{len(missing)} von 90 (T_days 1..90). Einmal neu bauen (dauert laenger, siehe unten)."
     )
-    if st.button("Trainingstabelle jetzt neu bauen (T_days 1-30)"):
+    if st.button("Trainingstabelle jetzt neu bauen (T_days 1-90)"):
         script = Path(__file__).resolve().parent / "build_dataset.py"
         with st.spinner("Baue Trainingstabelle - bitte warten, das kann mehrere Minuten dauern..."):
             proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
@@ -568,6 +568,48 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
         sd["ror"] *= 100
         st.dataframe(sd.style.format({c: "{:.2f}" for c in sd.select_dtypes("number").columns}, na_rep="n/a"),
                      use_container_width=True, hide_index=True)
+
+    # ── Condor aus dieser Zeile ins Depot uebernehmen ──
+    st.markdown("**Condor aus einer Zeile zum Depot hinzufuegen**")
+    st.caption(
+        "Legt den 4-beinigen Iron Condor der gewaehlten Zeile (Short Put/Call + Long-Fluegel, "
+        "gemeinsamer Verfall) als neue Kombo im Depot an - dauerhaft gespeichert, erscheint "
+        "danach im Tab 'Depot-Analyse'. Auswahl aus ALLEN getesteten Paaren, nicht nur Kandidaten."
+    )
+    cdf_sorted = cdf.sort_values(["distance_short", "distance_wing"]).reset_index(drop=True)
+    condor_opts = [
+        f"{'✅' if r.passes else '❌'} Short {r.distance_short:g}% / Fluegel {r.distance_wing:g}% "
+        f"({r.strike_put_wing:.0f}P/{r.strike_put_short:.0f}P .. {r.strike_call_short:.0f}C/{r.strike_call_wing:.0f}C)"
+        for r in cdf_sorted.itertuples()
+    ]
+    cc1, cc2 = st.columns([3, 1])
+    with cc1:
+        condor_pick_label = st.selectbox("Paar", condor_opts, key="livechain_add_condor_row")
+    with cc2:
+        condor_qty = st.number_input("Menge", min_value=0.01, value=1.0, step=1.0, key="livechain_add_condor_qty")
+    picked_c = cdf_sorted.iloc[condor_opts.index(condor_pick_label)]
+    default_condor_name = (
+        f"IC {picked_c.strike_put_wing:.0f}/{picked_c.strike_put_short:.0f}/"
+        f"{picked_c.strike_call_short:.0f}/{picked_c.strike_call_wing:.0f} {pd.Timestamp(chosen_expiry).date()}"
+    )
+    condor_name = st.text_input("Name der Kombo", value=default_condor_name, key="livechain_add_condor_name")
+    if st.button("Zum Depot hinzufuegen", key="livechain_add_condor_btn"):
+        import dashboard_depot
+        legs = [
+            {"option_type": "put", "side": "long", "strike": float(picked_c.strike_put_wing), "qty": float(condor_qty)},
+            {"option_type": "put", "side": "short", "strike": float(picked_c.strike_put_short), "qty": float(condor_qty)},
+            {"option_type": "call", "side": "short", "strike": float(picked_c.strike_call_short), "qty": float(condor_qty)},
+            {"option_type": "call", "side": "long", "strike": float(picked_c.strike_call_wing), "qty": float(condor_qty)},
+        ]
+        try:
+            dashboard_depot.add_combo_to_depot(
+                condor_name, pd.Timestamp(chosen_expiry).strftime("%Y-%m-%d"), legs,
+                note="Aus Iron-Condor-Suche (Heutige Kette)",
+            )
+        except ValueError as e:
+            st.error(f"Nicht hinzugefuegt: {e}")
+        else:
+            st.success(f"'{condor_name}' zum Depot hinzugefuegt (siehe Tab 'Depot-Analyse').")
 
 
 def render(df, daily_df, has_resolution) -> None:
@@ -990,6 +1032,48 @@ def render(df, daily_df, has_resolution) -> None:
             }, na_rep="n/a"),
             use_container_width=True, hide_index=True,
         )
+
+        # ── Position aus dieser Zeile ins Depot uebernehmen ──
+        addable = merged.dropna(subset=["strike_put", "strike_call"])
+        if not addable.empty:
+            st.markdown("**Position aus einer Zeile zum Depot hinzufuegen**")
+            st.caption(
+                "Legt einen Short- oder Long-Strangle (Put + Call der gewaehlten Zeile, "
+                "gemeinsamer Verfall) als neue Kombo im Depot an - dauerhaft gespeichert, "
+                "erscheint danach im Tab 'Depot-Analyse'."
+            )
+            opts = [
+                f"{r.distance_pct:g} % ({r.strike_put:.0f}P / {r.strike_call:.0f}C)"
+                for r in addable.itertuples()
+            ]
+            ac1, ac2, ac3 = st.columns([2, 1, 1])
+            with ac1:
+                pick_label = st.selectbox("Zeile", opts, key="livechain_add_analog_row")
+            with ac2:
+                add_side = st.selectbox("Richtung", ["Short Strangle", "Long Strangle"],
+                                        key="livechain_add_analog_side")
+            with ac3:
+                add_qty = st.number_input("Menge", min_value=0.01, value=1.0, step=1.0,
+                                          key="livechain_add_analog_qty")
+            picked = addable.iloc[opts.index(pick_label)]
+            side = "short" if add_side.startswith("Short") else "long"
+            default_name = f"{add_side} {picked.distance_pct:g}% {pd.Timestamp(chosen_expiry).date()}"
+            add_name = st.text_input("Name der Kombo", value=default_name, key="livechain_add_analog_name")
+            if st.button("Zum Depot hinzufuegen", key="livechain_add_analog_btn"):
+                import dashboard_depot
+                legs = [
+                    {"option_type": "put", "side": side, "strike": float(picked.strike_put), "qty": float(add_qty)},
+                    {"option_type": "call", "side": side, "strike": float(picked.strike_call), "qty": float(add_qty)},
+                ]
+                try:
+                    dashboard_depot.add_combo_to_depot(
+                        add_name, pd.Timestamp(chosen_expiry).strftime("%Y-%m-%d"), legs,
+                        note="Aus Analog-Tage-Simulation je Zeile (Heutige Kette)",
+                    )
+                except ValueError as e:
+                    st.error(f"Nicht hinzugefuegt: {e}")
+                else:
+                    st.success(f"'{add_name}' zum Depot hinzugefuegt (siehe Tab 'Depot-Analyse').")
     elif stored is not None:
         st.info("Die Analog-Tabelle wird fuer die geaenderte Tabelle/Einstellung neu berechnet oder ist fehlgeschlagen - siehe Meldungen oben; ggf. 'Analog-Läufe neu berechnen' klicken.")
 

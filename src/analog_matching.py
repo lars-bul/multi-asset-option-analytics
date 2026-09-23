@@ -14,7 +14,7 @@ historischen "Analog-Tagen" gearbeitet:
      Split (siehe leg_pair_grid_search()).
 
 WICHTIG - Kausalitaet: find_analogs() beruecksichtigt NUR Kandidaten mit
-Datum < Query-Datum. Bei langen Laufzeiten (T bis 30 Tage) kann ein Analog-
+Datum < Query-Datum. Bei langen Laufzeiten (T bis 90 Tage) kann ein Analog-
 Tag jedoch einen Exit NACH dem Query-Datum haben - evaluate_analog_set() hat
 dafuer den optionalen Parameter `query_date` (filtert exit_date <= query_date).
 

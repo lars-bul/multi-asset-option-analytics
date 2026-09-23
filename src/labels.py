@@ -6,7 +6,7 @@ REFERENZ-INSTRUMENT: 25-Delta Short Strangle (Short Put 25d + Short Call
 das Label soll ein sauberes, reproduzierbares Mass fuer "wurde die
 eingesammelte Praemie durch die tatsaechliche Bewegung gerechtfertigt" sein).
 
-LAUFZEITEN: T_days = 1..30 (alle ganzen Tage). Exit-Tag ist der erste spaetere
+LAUFZEITEN: T_days = 1..90 (alle ganzen Tage). Exit-Tag ist der erste spaetere
 Handelstag mit mindestens T_days KALENDERTAGEN Abstand (identisch zum
 Ladder-Backtest). Bei T=1 ist das freitags der Montag (3 Kalendertage
 Bewegung) - dieselbe Konvention wie im Backtest.
@@ -29,7 +29,7 @@ from backtest import compute_hv, solve_strike_delta_consistent
 
 @dataclass
 class StrangleLabelConfig:
-    T_days_list: list[int] = field(default_factory=lambda: list(range(1, 31)))
+    T_days_list: list[int] = field(default_factory=lambda: list(range(1, 91)))
     delta: float = 0.25            # Put UND Call, symmetrisch (klassischer 25d Strangle)
     hv_length: int = 30            # IV-Quelle fuer Strike-Wahl + Bewertung: HV(hv_length)
     r_free: float = 0.0

@@ -185,6 +185,24 @@ def _commit(combos: list[dict]) -> None:
                  "Schliessen des Programms!")
 
 
+def add_combo_to_depot(name: str, expiry: str, legs: list[dict], note: str = "") -> dict:
+    """OEFFENTLICHE Schnittstelle fuer ANDERE Module (z.B. die 'Zum Depot hinzufuegen'-Buttons in
+    der Analog-Tabelle und der Iron-Condor-Suche in dashboard_livechain.py): legt eine neue Kombo
+    an, haengt sie an das AKTUELLE Depot an und speichert sofort. Liest das Depot dafuer frisch von
+    der Platte statt blind aus st.session_state - der Aufrufer muss diesen Modus in der laufenden
+    Sitzung nicht vorher geoeffnet haben. Gibt die gespeicherte Kombo zurueck; wirft ValueError bei
+    einer ungueltigen Kombo (dann wird NICHTS gespeichert)."""
+    combo = dl.make_combo(name, expiry, legs, note)
+    errs = dl.validate_combo(combo)
+    if errs:
+        raise ValueError(" ".join(errs))
+    combos, _warn = dl.load_depot(DEPOT_FILE)
+    combos = combos + [combo]
+    _commit(combos)
+    st.session_state.pop("depot_results", None)   # alte Analyse bezieht sich nicht auf die neue Kombo
+    return combo
+
+
 def _init_state() -> None:
     if "depot_combos" not in st.session_state:
         combos, warn = dl.load_depot(DEPOT_FILE)

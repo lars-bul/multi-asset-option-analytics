@@ -11,7 +11,7 @@ WAS HIER PASSIERT (siehe features.py/labels.py fuer die Details je Schritt):
   1. Kursdaten laden, auf echte Tagesdaten filtern.
   2. Feature-Matrix bauen (eine Zeile je Handelstag).
   3. Strangle-Labels generieren (eine Zeile je Handelstag x Laufzeit,
-     T_days = 1..30, 25-Delta Short Strangle bis Verfall gehalten).
+     T_days = 1..90, 25-Delta Short Strangle bis Verfall gehalten).
      Jede Laufzeit laeuft in einem eigenen Prozess (Python-Loop dominiert).
   4. Beides ueber das Entry-Datum zusammenfuehren.
   5. Feature-Spalten als float32, Ergebnis als data/training_table.parquet.

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "saved_at": "2026-09-21T23:19:22",
+  "saved_at": "2026-09-22T13:35:46",
   "combos": [
     {
       "id": "c1880d4b60",
@@ -71,6 +71,59 @@
           "option_type": "call",
           "side": "long",
           "strike": 7820.0,
+          "qty": 1.0,
+          "entry_price": 0.0
+        }
+      ]
+    },
+    {
+      "id": "f22d897d77",
+      "name": "reverse Condor 23 Sep",
+      "expiry": "2026-09-29",
+      "note": "",
+      "created": "2026-09-21T23:23:04",
+      "legs": [
+        {
+          "option_type": "put",
+          "side": "long",
+          "strike": 7745.0,
+          "qty": 1.0,
+          "entry_price": 0.0
+        },
+        {
+          "option_type": "put",
+          "side": "short",
+          "strike": 7515.0,
+          "qty": 1.0,
+          "entry_price": 0.0
+        },
+        {
+          "option_type": "call",
+          "side": "short",
+          "strike": 7975.0,
+          "qty": 1.0,
+          "entry_price": 0.0
+        },
+        {
+          "option_type": "call",
+          "side": "long",
+          "strike": 7745.0,
+          "qty": 1.0,
+          "entry_price": 0.0
+        }
+      ]
+    },
+    {
+      "id": "f6250fea31",
+      "name": "Kombo",
+      "expiry": "2026-09-29",
+      "note": "",
+      "created": "2026-09-22T13:35:46",
+      "legs": [
+        {
+          "option_type": "put",
+          "side": "short",
+          "strike": 7710.0,
           "qty": 1.0,
           "entry_price": 0.0
         }

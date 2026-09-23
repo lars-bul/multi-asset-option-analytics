@@ -36,6 +36,11 @@ synthetischer Balken mit heutigem Eroeffnungskurs; Staleness-Warnung
 (Quote-Alter) ab _QUOTE_AGE_WARNING_MINUTES.
 
 TEIL C: Iron-Condor-Suche (condor_search.py) mit Bid/Ask-Preisen der Kette.
+
+AUTOMATISCHER ABLAUF: Sobald dieser Tab geoeffnet wird, laedt die Kette (Auto-Load), danach
+rechnet Teil B (Analog-Tabelle) und anschliessend Teil C (Condor-Suche) von selbst. Neu gerechnet
+wird nur bei geaenderter Kette/Verfall/Raster/Einstellungen (Schluessel in st.session_state);
+ein Tab-Wechsel loescht nichts. Die Buttons 'neu berechnen' erzwingen eine Neuberechnung.
 """
 import subprocess
 import sys
@@ -48,16 +53,17 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fetch_today_chain import fetch_today_chain, fetch_today_spot, fetch_today_open
-from chain_delta import ChainDeltaConfig, enrich_chain_with_delta, build_symmetric_distance_table
+import market_data
+from fetch_today_chain import fetch_today_open
+from chain_delta import build_symmetric_distance_table
 from analog_matching import (
     AnalogConfig, SimilaritySpaceConfig, hv_rank_bounds, fit_similarity_space,
-    transform_query, find_analogs, weighted_reliability_summary,
+    transform_query, find_analogs,
     effective_sample_size, available_t_days,
 )
 from features import FeatureConfig, build_feature_matrix
 from dashboard_common import load_training_table
-from condor_search import CondorConfig, analog_moves, evaluate_condor_grid
+from condor_search import CondorConfig, analog_moves, evaluate_condor_grid, analog_robustness
 
 _QUOTE_AGE_WARNING_MINUTES = 60.0
 _ANALOG_MIN_CANDIDATES = 20
@@ -72,18 +78,68 @@ _ROW_STYLE = {
 }
 
 
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_TT_FILE = _DATA_DIR / "training_table.parquet"
+
+# MODULWEITE CACHES (gelten fuer ALLE Modi und Browser-Sitzungen, ueberleben Reruns/Tab-Wechsel):
+_ANALOG_CORE: dict = {}    # Analog-Suche (PCA-Fit + Analog-Tage), unabhaengig von Restlaufzeit/Modus
+_TT_DAYS: dict = {}        # vorhandene T_days der Trainingstabelle je Dateisignatur
+_BOUNDS_CACHE: dict = {}   # HV-Min/Max-Fenster je (Datenstand, HV-Laenge, Lookback)
+_RESULT_CACHE: dict = {}   # letzte Ergebnisse von Teil B ('analog') und Teil C ('condor') samt Schluessel
+
+
+def _training_table_signature():
+    """(mtime, Groesse) der Trainingstabelle - aendert sich nur beim Neubau. None, falls die Datei fehlt."""
+    try:
+        s = _TT_FILE.stat()
+        return (s.st_mtime_ns, s.st_size)
+    except OSError:
+        return None
+
+
+def _training_days() -> set | None:
+    """Vorhandene T_days, OHNE die ganze Tabelle (hunderttausende Zeilen) zu laden: es wird nur die
+    Spalte T_days gelesen und je Dateisignatur einmal gemerkt. None, falls nicht bestimmbar."""
+    sig = _training_table_signature()
+    if sig is not None and sig in _TT_DAYS:
+        return _TT_DAYS[sig]
+    days = None
+    if sig is not None:
+        try:
+            days = set(pd.read_parquet(_TT_FILE, columns=["T_days"])["T_days"].unique().tolist())
+        except Exception:
+            days = None
+    if days is None:
+        try:
+            tt = load_training_table()
+            if tt is None or tt.empty:
+                return None
+            days = set(available_t_days(tt))
+        except Exception:
+            return None
+    if sig is not None:
+        _TT_DAYS.clear()
+        _TT_DAYS[sig] = days
+    return days
+
+
+def _bounds_cached(daily_df: pd.DataFrame, hv_length: int, lookback: int) -> pd.DataFrame:
+    key = (len(daily_df), daily_df["date"].max(), int(hv_length), int(lookback))
+    if key not in _BOUNDS_CACHE:
+        if len(_BOUNDS_CACHE) > 24:
+            _BOUNDS_CACHE.clear()
+        _BOUNDS_CACHE[key] = hv_rank_bounds(daily_df, hv_length, lookback)
+    return _BOUNDS_CACHE[key]
+
+
 def _ensure_training_table() -> None:
     """Prueft, ob die training_table alle Laufzeiten 1..30 enthaelt. Falls
     nicht (alte Tabelle), wird ein Hinweis + Button angezeigt, der
     build_dataset.py in einem Subprozess ausfuehrt (dauert einige Minuten).
     Die Seite bleibt bis dahin mit den vorhandenen Laufzeiten nutzbar."""
-    try:
-        tt = load_training_table()
-    except Exception:
+    have = _training_days()
+    if not have:
         return
-    if tt is None or tt.empty:
-        return
-    have = set(available_t_days(tt))
     missing = [t for t in _REQUIRED_T_DAYS if t not in have]
     if not missing:
         return
@@ -100,7 +156,8 @@ def _ensure_training_table() -> None:
                 st.cache_data.clear()
             except Exception:
                 pass
-            st.session_state.pop("livechain_analog_ctx", None)
+            _ANALOG_CORE.clear()
+            _TT_DAYS.clear()
             st.success("Trainingstabelle neu gebaut. Seite wird neu geladen.")
             st.rerun()
         else:
@@ -212,53 +269,61 @@ def _build_daily_df_with_today(daily_df: pd.DataFrame):
 
 
 def _find_today_analogs(daily_df, chosen_dte_exact, max_distance, bandwidth, min_gap):
-    """Analog-Suche fuer 'heute' (von Teil B und Teil C gemeinsam genutzt,
-    in st.session_state gecacht)."""
-    training_table = load_training_table()
-    if training_table.empty:
-        st.error("Keine Trainingstabelle gefunden - `python src/build_dataset.py` ausfuehren.")
-        return None
-    valid_t_days = available_t_days(training_table)
-    key = (round(chosen_dte_exact, 4), float(max_distance), float(bandwidth), int(min_gap),
-           date.today(), len(training_table), tuple(valid_t_days))
-    cached = st.session_state.get("livechain_analog_ctx")
-    if cached is not None and cached["key"] == key:
-        return cached
+    """Analog-Suche fuer 'heute' (von Teil B, Teil C und der Depot-Analyse gemeinsam genutzt).
 
+    CACHE: die teure Arbeit (Feature-Matrix, PCA-Fit, Analog-Tage) haengt NICHT von der Restlaufzeit
+    ab und wird deshalb einmal je (Parameter, Tag, Datenstand) gerechnet und modulweit gehalten -
+    alle Modi und Browser-Sitzungen arbeiten auf demselben Bestand. Die Restlaufzeit bestimmt nur
+    T_days_used (billig). Bei einem Cache-Treffer wird die grosse Trainingstabelle NICHT neu geladen."""
+    sig = _training_table_signature()
+    core_key = (float(max_distance), float(bandwidth), int(min_gap), date.today(), sig,
+                len(daily_df), daily_df["date"].max())
+    core = _ANALOG_CORE.get("core") if (sig is not None and _ANALOG_CORE.get("key") == core_key) else None
+
+    if core is None:
+        training_table = load_training_table()
+        if training_table.empty:
+            st.error("Keine Trainingstabelle gefunden - `python src/build_dataset.py` ausfuehren.")
+            return None
+        valid_t_days = available_t_days(training_table)
+
+        daily_df_today, query_date, used_fallback = _build_daily_df_with_today(daily_df)
+        if used_fallback:
+            st.warning(f"Kein heutiger Eroeffnungskurs verfuegbar - Analog-Suche nutzt "
+                       f"{pd.Timestamp(query_date).date()}.")
+
+        with st.spinner("Baue Aehnlichkeits-Raum und suche Analog-Tage..."):
+            try:
+                feature_df = build_feature_matrix(daily_df_today, FeatureConfig())
+                if query_date not in set(feature_df["date"]):
+                    st.error(f"{pd.Timestamp(query_date).date()} hat keine vollstaendigen Features "
+                             "(Warmup-Fenster noch nicht voll?).")
+                    return None
+                space = fit_similarity_space(feature_df, SimilaritySpaceConfig(),
+                                             max_date=query_date + pd.Timedelta(days=1))
+                query_score = transform_query(space, feature_df.loc[feature_df["date"] == query_date].iloc[0])
+                analogs = find_analogs(
+                    query_date, query_score, space,
+                    AnalogConfig(max_distance=max_distance, min_gap_days=min_gap,
+                                 use_kernel_weighting=True, bandwidth=bandwidth,
+                                 min_candidates=_ANALOG_MIN_CANDIDATES),
+                )
+            except ValueError as e:
+                st.error(f"Analog-Suche fehlgeschlagen: {e}")
+                return None
+
+        core = dict(analogs=analogs, training_table=training_table, daily_df_today=daily_df_today,
+                    query_date=query_date, valid_t_days=valid_t_days)
+        if sig is not None:
+            _ANALOG_CORE.clear()
+            _ANALOG_CORE.update(key=core_key, core=core)
+
+    valid_t_days = core["valid_t_days"]
     T_days_used = min(valid_t_days, key=lambda t: abs(t - chosen_dte_exact))
     if abs(T_days_used - chosen_dte_exact) > 1.0:
         st.info(f"Restlaufzeit {chosen_dte_exact:.2f} Tage wird auf T_days={T_days_used} gerundet "
                 f"(verfuegbar: {valid_t_days}).")
-
-    daily_df_today, query_date, used_fallback = _build_daily_df_with_today(daily_df)
-    if used_fallback:
-        st.warning(f"Kein heutiger Eroeffnungskurs verfuegbar - Analog-Suche nutzt "
-                   f"{pd.Timestamp(query_date).date()}.")
-
-    with st.spinner("Baue Aehnlichkeits-Raum und suche Analog-Tage..."):
-        try:
-            feature_df = build_feature_matrix(daily_df_today, FeatureConfig())
-            if query_date not in set(feature_df["date"]):
-                st.error(f"{pd.Timestamp(query_date).date()} hat keine vollstaendigen Features "
-                         "(Warmup-Fenster noch nicht voll?).")
-                return None
-            space = fit_similarity_space(feature_df, SimilaritySpaceConfig(),
-                                         max_date=query_date + pd.Timedelta(days=1))
-            query_score = transform_query(space, feature_df.loc[feature_df["date"] == query_date].iloc[0])
-            analogs = find_analogs(
-                query_date, query_score, space,
-                AnalogConfig(max_distance=max_distance, min_gap_days=min_gap,
-                             use_kernel_weighting=True, bandwidth=bandwidth,
-                             min_candidates=_ANALOG_MIN_CANDIDATES),
-            )
-        except ValueError as e:
-            st.error(f"Analog-Suche fehlgeschlagen: {e}")
-            return None
-
-    ctx = dict(key=key, analogs=analogs, T_days_used=T_days_used, training_table=training_table,
-               daily_df_today=daily_df_today, query_date=query_date)
-    st.session_state["livechain_analog_ctx"] = ctx
-    return ctx
+    return {**core, "T_days_used": T_days_used, "key": core_key}
 
 
 def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
@@ -289,7 +354,6 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
     w_sum = float(w.sum())
     S_d = spot_today * (1.0 + moves["ret"].to_numpy(dtype=float))
     n_eff = effective_sample_size(w)
-    median_date = moves["entry_date"].median()
 
     progress = st.progress(0.0)
     status = st.empty()
@@ -318,18 +382,7 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
                   + np.maximum(S_d - float(row.strike_call), 0.0))
         pnl = premium - payout                       # Gewinn je Analog-Tag, in heutigen Punkten
 
-        ev = moves[["entry_date", "hold_days", "weight"]].copy()
-        ev["pnl_today_short"] = pnl
-        rel_full = weighted_reliability_summary(ev, "short", 6, "pnl_today")
-        train_rel = weighted_reliability_summary(ev[ev["entry_date"] < median_date], "short", 4, "pnl_today")
-        val_rel = weighted_reliability_summary(ev[ev["entry_date"] >= median_date], "short", 4, "pnl_today")
-
-        robust, robust_neg = False, False
-        if train_rel["n_eff_hac"] >= 2.0 and val_rel["n_eff_hac"] >= 2.0:
-            same_sign = np.sign(train_rel["mean_pnl_norm"]) == np.sign(val_rel["mean_pnl_norm"])
-            both_sig = train_rel["ci_excludes_zero"] and val_rel["ci_excludes_zero"]
-            robust = bool(both_sig and same_sign and np.sign(train_rel["mean_pnl_norm"]) > 0.0)
-            robust_neg = bool(both_sig and same_sign and np.sign(train_rel["mean_pnl_norm"]) < 0.0)
+        rb = analog_robustness(moves, pnl)     # gleiche Funktion wie in der Depot-Analyse
 
         mean_pnl = float(np.sum(w * pnl) / w_sum)
         win = pnl >= 0.0
@@ -340,20 +393,20 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
             "distance_pct": row.distance_pct,
             "analog_n": len(moves),
             "analog_n_eff": n_eff,
-            "analog_n_eff_hac": rel_full["n_eff_hac"],
+            "analog_n_eff_hac": rb["n_eff_hac"],
             "win_rate_pct": float(w[win].sum() / w_sum * 100.0),
             "profit_factor": (gross_profit / gross_loss) if gross_loss > 0.0 else np.nan,
             "avg_pnl_norm_pct": (mean_pnl / premium * 100.0) if premium > 0.0 else None,
             "entry_premium_today": premium,
             "expected_profit_short": mean_pnl,
             "required_premium_pf3": _required_premium_for_profit_factor(payout, w, target_pf=3.0),
-            "tstat_full": rel_full["tstat"],
-            "ci_excludes_zero_full": rel_full["ci_excludes_zero"],
-            "subperiod_matching": rel_full["subperiod_matching"],
-            "subperiod_nonempty": rel_full["subperiod_nonempty"],
-            "tstat_val": val_rel["tstat"],
-            "robust_train_val": robust,
-            "robust_train_val_neg": robust_neg,
+            "tstat_full": rb["tstat_full"],
+            "ci_excludes_zero_full": rb["ci_excludes_zero_full"],
+            "subperiod_matching": rb["subperiod_matching"],
+            "subperiod_nonempty": rb["subperiod_nonempty"],
+            "tstat_val": rb["tstat_val"],
+            "robust_train_val": rb["robust_train_val"],
+            "robust_train_val_neg": rb["robust_train_val_neg"],
         })
 
     status.empty()
@@ -417,22 +470,38 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
                                state.eq("green").astype(bool).tolist()))
 
     if short_valid is None:
-        st.info("Bitte zuerst oben 'Analog-Läufe für alle Zeilen starten' - das Short-Kriterium "
-                "und das Plateau der Condor-Suche stützen sich auf diese Tabelle.")
+        st.info("Die Condor-Suche startet automatisch, sobald die Analog-Tabelle oben berechnet ist "
+                "(sie liefert das Short-Kriterium und das Plateau). Steht oben eine Fehlermeldung, "
+                "zuerst diese beheben.")
 
-    if st.button("Iron-Condor-Suche starten") and short_valid is not None:
-        ctx = _find_today_analogs(daily_df, chosen_dte_exact, max_distance, bandwidth, min_gap)
-        if ctx is not None:
-            moves = analog_moves(ctx["analogs"], ctx["training_table"], ctx["T_days_used"], ctx["query_date"])
-            cfg = CondorConfig(price_basis="mid" if basis.startswith("Mid") else "bidask",
-                               t_min=float(t_min), max_full_loss_share=max_full / 100.0,
-                               tail_floor=float(tail_floor),
-                               sort_by={"Rendite/Risiko %": "ror", "E[P&L] (Pkt)": "mean", "t (HAC)": "tstat"}[sort_label])
-            meta_sort = sort_label
-            cdf, sdf, meta = evaluate_condor_grid(table, moves, spot, cfg, short_valid)
-            meta["T_days_used"] = ctx["T_days_used"]
-            meta["sort_label"] = meta_sort
-            st.session_state["livechain_condor"] = dict(key=distance_key, cdf=cdf, sdf=sdf, meta=meta)
+    # AUTO-LAUF: die Suche startet von selbst, sobald die Analog-Tabelle vorliegt und sich Tabelle
+    # oder Einstellungen geaendert haben. Der Versuch wird MIT SCHLUESSEL gemerkt - ein Fehlschlag
+    # wird deshalb nicht bei jedem Rerun wiederholt. Der Button erzwingt eine Neuberechnung.
+    cparams = (basis, float(t_min), float(max_full), float(tail_floor), sort_label)
+    st.session_state["shared_condor_criteria"] = dict(basis=basis, t_min=float(t_min), max_full=float(max_full),
+                                                      tail_floor=float(tail_floor))
+    if st.session_state.get("livechain_condor_attempt") != (distance_key, cparams):
+        cached_c = _RESULT_CACHE.get("condor")            # z.B. neue Browser-Sitzung, gleicher Datenstand
+        if cached_c is not None and cached_c[0] == (distance_key, cparams):
+            st.session_state["livechain_condor"] = cached_c[1]
+            st.session_state["livechain_condor_attempt"] = (distance_key, cparams)
+    rerun_btn = st.button("Iron-Condor-Suche neu berechnen")
+    auto_c = st.session_state.get("livechain_condor_attempt") != (distance_key, cparams)
+    if (rerun_btn or auto_c) and short_valid is not None:
+        st.session_state["livechain_condor_attempt"] = (distance_key, cparams)
+        with st.spinner("Berechne Iron-Condor-Suche..."):
+            ctx = _find_today_analogs(daily_df, chosen_dte_exact, max_distance, bandwidth, min_gap)
+            if ctx is not None:
+                moves = analog_moves(ctx["analogs"], ctx["training_table"], ctx["T_days_used"], ctx["query_date"])
+                cfg = CondorConfig(price_basis="mid" if basis.startswith("Mid") else "bidask",
+                                   t_min=float(t_min), max_full_loss_share=max_full / 100.0,
+                                   tail_floor=float(tail_floor),
+                                   sort_by={"Rendite/Risiko %": "ror", "E[P&L] (Pkt)": "mean", "t (HAC)": "tstat"}[sort_label])
+                cdf, sdf, meta = evaluate_condor_grid(table, moves, spot, cfg, short_valid)
+                meta["T_days_used"] = ctx["T_days_used"]
+                meta["sort_label"] = sort_label
+                st.session_state["livechain_condor"] = dict(key=distance_key, params=cparams, cdf=cdf, sdf=sdf, meta=meta)
+                _RESULT_CACHE["condor"] = ((distance_key, cparams), st.session_state["livechain_condor"])
 
     res = st.session_state.get("livechain_condor")
     if res is None:
@@ -546,41 +615,33 @@ def render(df, daily_df, has_resolution) -> None:
                  "Aenderung von DTE-Filter/Delta-Filter oder fuer einen aktuelleren Snapshot.",
         )
 
-    needs_initial_load = "livechain_enriched" not in st.session_state
-    if reload_chain or needs_initial_load:
+    # GEMEINSAMER DATENBESTAND (siehe market_data.py): die Kette wird einmal je Programmstart/Tag
+    # geladen und von allen Modi genutzt. DTE-/Delta-Filter wirken nur auf der Ansicht (kein Neuladen).
+    snap = market_data.current(float(max_dte))
+    if reload_chain or snap is None:
         with st.spinner("Lade heutige Kette und berechne Delta/IV je Serie..."):
             try:
-                fetch_ts = pd.Timestamp.now(tz="UTC")
-                spot = fetch_today_spot()
-                chain = fetch_today_chain(min_dte=float(min_dte), max_dte=float(max_dte))
-                enriched = enrich_chain_with_delta(
-                    chain, spot,
-                    ChainDeltaConfig(min_abs_delta=float(min_abs_delta),
-                                      r_free=float(r_free), dividend_yield=float(dividend_yield)),
-                    as_of=fetch_ts,
-                )
+                snap = market_data.get(float(r_free), float(dividend_yield), float(max_dte),
+                                       force=bool(reload_chain))
             except Exception as e:
                 st.error(f"Laden fehlgeschlagen: {e}")
-                if needs_initial_load:
+                snap = market_data.current(0.0)
+                if snap is None:
+                    st.info("Kette konnte noch nicht geladen werden - siehe Fehlermeldung oben.")
                     return
-            else:
-                st.session_state["livechain_spot"] = spot
-                st.session_state["livechain_enriched"] = enriched
-                st.session_state["livechain_r_free"] = float(r_free)
-                st.session_state["livechain_dividend_yield"] = float(dividend_yield)
-                st.session_state["livechain_rank_lookback"] = int(rank_lookback)
-                st.session_state["livechain_fetch_ts"] = fetch_ts
 
-    if "livechain_enriched" not in st.session_state:
-        st.info("Kette konnte noch nicht geladen werden - siehe Fehlermeldung oben.")
-        return
-
-    spot = st.session_state["livechain_spot"]
-    enriched = st.session_state["livechain_enriched"]
-    r_free = st.session_state["livechain_r_free"]
-    dividend_yield = st.session_state["livechain_dividend_yield"]
-    rank_lookback = st.session_state["livechain_rank_lookback"]
-    fetch_ts = st.session_state.get("livechain_fetch_ts")
+    spot = snap["spot"]
+    r_free = snap["r_free"]
+    dividend_yield = snap["dividend_yield"]
+    fetch_ts = snap["fetch_ts"]
+    enriched_all = snap["enriched"]
+    if enriched_all.empty:
+        enriched = enriched_all
+    else:
+        dcol = "dte_exact" if "dte_exact" in enriched_all.columns else "dte"
+        dvals = enriched_all[dcol].astype(float)
+        enriched = enriched_all[(dvals >= float(min_dte)) & (dvals <= float(max_dte))
+                                & (enriched_all["delta_mkt"] >= float(min_abs_delta))]
     st.metric("Aktueller Spot (SPX)", f"{spot:,.2f}")
     if fetch_ts is not None:
         st.caption(
@@ -628,7 +689,7 @@ def render(df, daily_df, has_resolution) -> None:
         f"(gerundete Restlaufzeit von {chosen_dte_exact:.2f} Tagen)."
     )
 
-    bounds = hv_rank_bounds(daily_df, hv_length, int(rank_lookback))
+    bounds = _bounds_cached(daily_df, hv_length, int(rank_lookback))
     if bounds.empty or bounds["hv"].dropna().empty:
         st.error(
             f"HV({hv_length}) konnte nicht berechnet werden - zu wenig Historie "
@@ -808,8 +869,26 @@ def render(df, daily_df, has_resolution) -> None:
             "Mindestabstand zu heute (Handelstage)", min_value=0, max_value=60, value=5,
         )
 
-    run_bulk = st.button("Analog-Läufe für alle Zeilen starten")
-    if run_bulk:
+    st.session_state["shared_analog_params"] = dict(
+        max_distance=float(analog_max_distance), bandwidth=float(analog_bandwidth), min_gap=int(analog_min_gap))
+
+    # SCHLUESSEL: aendert sich bei neuer Kette (fetch_ts), anderem Verfall/Raster, anderen
+    # Analog-Parametern oder neuem Tag. Nur dann wird NEU gerechnet - sonst bleibt das Ergebnis
+    # aus st.session_state (auch nach einem Tab-Wechsel) stehen.
+    analog_key = (chosen_expiry, tuple(distance_targets_pct), fetch_ts, float(analog_max_distance),
+                  float(analog_bandwidth), int(analog_min_gap), date.today(),
+                  float(min_dte), float(max_dte), float(min_abs_delta))
+    if st.session_state.get("livechain_analog_key") != analog_key:
+        cached_b = _RESULT_CACHE.get("analog")            # z.B. neue Browser-Sitzung, gleicher Datenstand
+        if cached_b is not None and cached_b[0] == analog_key:
+            st.session_state["livechain_analog_results"] = cached_b[1]
+            st.session_state["livechain_analog_key"] = analog_key
+            st.session_state["livechain_analog_attempt"] = analog_key
+    run_bulk = st.button("Analog-Läufe neu berechnen")
+    auto_run = st.session_state.get("livechain_analog_attempt") != analog_key
+    if run_bulk or auto_run:
+        # Versuch VOR dem Lauf merken: schlaegt er fehl, wird er nicht bei jedem Rerun wiederholt.
+        st.session_state["livechain_analog_attempt"] = analog_key
         analog_results = _run_bulk_analog(
             table, daily_df, chosen_dte_exact, r_free, dividend_yield,
             hv_length, int(rank_lookback), float(analog_max_distance), float(analog_bandwidth),
@@ -817,11 +896,12 @@ def render(df, daily_df, has_resolution) -> None:
         )
         if analog_results is not None:
             st.session_state["livechain_analog_results"] = analog_results
-            st.session_state["livechain_analog_key"] = (chosen_expiry, tuple(distance_targets_pct))
+            st.session_state["livechain_analog_key"] = analog_key
+            _RESULT_CACHE["analog"] = (analog_key, analog_results)
 
     stored = st.session_state.get("livechain_analog_results")
     stored_key = st.session_state.get("livechain_analog_key")
-    if stored is not None and stored_key == (chosen_expiry, tuple(distance_targets_pct)):
+    if stored is not None and stored_key == analog_key:
         merged = table.merge(stored, on="distance_pct", how="left")
 
         if "analog_n_eff_hac" in merged.columns:
@@ -911,11 +991,11 @@ def render(df, daily_df, has_resolution) -> None:
             use_container_width=True, hide_index=True,
         )
     elif stored is not None:
-        st.info("Tabelle/Expiry hat sich seit dem letzten Analog-Lauf geaendert - bitte erneut starten.")
+        st.info("Die Analog-Tabelle wird fuer die geaenderte Tabelle/Einstellung neu berechnet oder ist fehlgeschlagen - siehe Meldungen oben; ggf. 'Analog-Läufe neu berechnen' klicken.")
 
     # ── TEIL C: Iron-Condor-Suche ──
     _render_condor_section(
         table, daily_df, chosen_expiry, chosen_dte_exact, spot,
         float(analog_max_distance), float(analog_bandwidth), int(analog_min_gap),
-        (chosen_expiry, tuple(distance_targets_pct)),
+        analog_key,
     )

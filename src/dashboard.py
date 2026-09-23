@@ -29,6 +29,7 @@ aber pro Rerun nur den Code des gewaehlten Modus - dadurch bleibt auch die
 Sidebar sauber getrennt (siehe render()-Aufruf unten).
 """
 import sys
+import time
 from pathlib import Path
 
 import streamlit as st
@@ -55,7 +56,9 @@ if df.empty:
     st.stop()
 
 has_resolution = "resolution" in df.columns
+_t0 = time.perf_counter()
 daily_df = render_overview(df, has_resolution)
+_t_overview = time.perf_counter() - _t0
 
 st.divider()
 
@@ -66,11 +69,20 @@ MODES = {
     "⚡ Heutige Kette": dashboard_livechain,
     "💼 Depot-Analyse": dashboard_depot,
 }
+# Standard-Modus beim Oeffnen der App: "Heutige Kette" - dadurch starten Kette, Analog-Tabelle und
+# Condor-Suche automatisch beim Start. Anderen Standard-Tab waehlen: DEFAULT_MODE aendern.
+DEFAULT_MODE = "⚡ Heutige Kette"
 active_mode_label = st.radio(
     "Modus", list(MODES.keys()), horizontal=True, label_visibility="collapsed",
+    index=list(MODES.keys()).index(DEFAULT_MODE),
 )
 st.divider()
 
 # Nur der aktive Modus rendert - dadurch bekommt auch nur er einen eigenen
 # Sidebar-Abschnitt (siehe Modulbeschreibung oben).
+_t1 = time.perf_counter()
 MODES[active_mode_label].render(df, daily_df, has_resolution)
+_t_mode = time.perf_counter() - _t1
+
+# Diagnose: wie lange hat dieser Seitenaufbau gedauert? (Uebersicht laeuft bei JEDEM Klick, egal welcher Modus.)
+st.caption(f"⏱ Seitenaufbau: Kursuebersicht {_t_overview:.1f} s · Modus '{active_mode_label}' {_t_mode:.1f} s")

@@ -8,6 +8,16 @@ Candlestick-Uebersicht (samt ihrem eigenen Sidebar-Abschnitt "Ansicht"),
 und kleine Anzeige-Helfer. Modus-spezifische Logik gehoert NICHT hierher -
 wer nur einen Modus lesen/aendern will, muss dieses Modul zwar importieren,
 aber nie inhaltlich anfassen.
+
+KORREKTUR (NaN-Schutz): Die letzte(n) Zeile(n) von df/daily_df koennen einen
+NaN-Schlusskurs haben (z.B. ein heutiger Balken, der noch nicht befuellt ist,
+ein Feiertag ohne echten Handel, oder ein fehlgeschlagener data_fetch-Lauf).
+Vorher fuehrte das zu 'Letzter Schlusskurs nan' und - weil NaN kein gueltiges
+JSON ist - zu einem SyntaxError im Candlestick-Chart. Jetzt:
+  - Die Kopfkennzahlen (Schlusskurs, Tagesveraenderung) nehmen den letzten
+    GUELTIGEN (nicht-NaN) Schlusskurs, nicht blind die letzte Zeile.
+  - to_candles() laesst Zeilen mit NaN in open/high/low/close aus - eine
+    einzelne kaputte Zeile blockiert nicht mehr den ganzen Chart.
 """
 from pathlib import Path
 
@@ -75,15 +85,28 @@ def load_training_table() -> pd.DataFrame:
 
 
 def to_candles(df: pd.DataFrame) -> list[dict]:
-    """Konvertiert in das von lightweight-charts erwartete Candle-Format."""
+    """Konvertiert in das von lightweight-charts erwartete Candle-Format.
+
+    Zeilen mit NaN in open/high/low/close werden ausgelassen: NaN ist kein
+    gueltiges JSON (weder 'NaN' noch 'null' passt zum Zahlenfeld, das die
+    Chart-Bibliothek erwartet) - eine einzelne solche Zeile hat vorher den
+    kompletten Chart mit einem JSON-SyntaxError zum Absturz gebracht."""
+    valid = df.dropna(subset=["open", "high", "low", "close"])
     return [
         {
             "time": row.date.strftime("%Y-%m-%d"),
             "open": float(row.open), "high": float(row.high),
             "low": float(row.low), "close": float(row.close),
         }
-        for row in df.itertuples()
+        for row in valid.itertuples()
     ]
+
+
+def _last_valid_closes(view: pd.DataFrame, n: int = 2) -> pd.Series:
+    """Die letzten n GUELTIGEN (nicht-NaN) Schlusskurse in 'view', chronologisch
+    aufsteigend - Grundlage fuer Kopfkennzahlen, die nicht blind auf die
+    zuletzt vorhandene ZEILE (die NaN sein kann) zugreifen duerfen."""
+    return view["close"].dropna().tail(n)
 
 
 def render_overview(df: pd.DataFrame, has_resolution: bool) -> pd.DataFrame:
@@ -132,11 +155,34 @@ def render_overview(df: pd.DataFrame, has_resolution: bool) -> pd.DataFrame:
                 f"Checkbox in der Sidebar."
             )
 
+    # KORREKTUR: letzter GUELTIGER Schlusskurs statt blind view['close'].iloc[-1] - die zuletzt
+    # vorhandene ZEILE kann NaN sein (unvollstaendiger heutiger Balken, Feiertag ohne echten
+    # Handel, fehlgeschlagener data_fetch-Lauf). Fehlen ganz gueltige Werte (z.B. n_days sehr
+    # klein und ausgerechnet die sichtbaren Tage sind alle NaN), wird eine Warnung gezeigt statt
+    # eines Absturzes/„nan“ in der Anzeige.
+    last_valid = _last_valid_closes(view, n=2)
     col1, col2, col3 = st.columns(3)
-    col1.metric("Letzter Schlusskurs", f"{view['close'].iloc[-1]:,.2f}")
-    day_change = view["close"].iloc[-1] - view["close"].iloc[-2]
-    day_change_pct = day_change / view["close"].iloc[-2] * 100
-    col2.metric("Veraenderung (1 Tag)", f"{day_change:+.2f}", f"{day_change_pct:+.2f}%")
+    if len(last_valid) >= 1:
+        last_close = float(last_valid.iloc[-1])
+        last_date = view.loc[last_valid.index[-1], "date"]
+        stale = last_date != view["date"].iloc[-1]
+        col1.metric("Letzter Schlusskurs", f"{last_close:,.2f}")
+        if stale:
+            col1.caption(f"⚠️ Stand {last_date.date()} - neuere Tage ohne Kurs.")
+        if len(last_valid) >= 2:
+            prev_close = float(last_valid.iloc[-2])
+            day_change = last_close - prev_close
+            day_change_pct = day_change / prev_close * 100 if prev_close else float("nan")
+            col2.metric("Veraenderung (1 Tag)", f"{day_change:+.2f}", f"{day_change_pct:+.2f}%")
+        else:
+            col2.metric("Veraenderung (1 Tag)", "n/a")
+    else:
+        col1.metric("Letzter Schlusskurs", "n/a")
+        col2.metric("Veraenderung (1 Tag)", "n/a")
+        st.warning(
+            "Keine gueltigen Schlusskurse im angezeigten Zeitraum (alle Werte NaN) - "
+            "'Anzahl Tage anzeigen' vergroessern oder data_fetch.py pruefen/neu ausfuehren."
+        )
     col3.metric("Angezeigter Zeitraum", f"{view['date'].iloc[0].date()} bis {view['date'].iloc[-1].date()}")
 
     chart_options = {
@@ -149,9 +195,16 @@ def render_overview(df: pd.DataFrame, has_resolution: bool) -> pd.DataFrame:
         "timeScale": {"borderColor": "rgba(197, 203, 206, 0.4)"},
         "rightPriceScale": {"borderColor": "rgba(197, 203, 206, 0.4)"},
     }
+    candles = to_candles(view)
+    n_dropped = len(view) - len(candles)
+    if n_dropped > 0:
+        st.caption(
+            f"⚠️ {n_dropped} von {len(view)} angezeigten Tagen haben einen unvollstaendigen "
+            "Kurs (NaN in Open/High/Low/Close) und wurden im Chart ausgelassen."
+        )
     series = [{
         "type": "Candlestick",
-        "data": to_candles(view),
+        "data": candles,
         "options": {
             "upColor": "#26a69a", "downColor": "#ef5350", "borderVisible": False,
             "wickUpColor": "#26a69a", "wickDownColor": "#ef5350",

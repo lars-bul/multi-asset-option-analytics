@@ -2,7 +2,21 @@
 MODUS 3: Heutige Kette - symmetrische Abstands-Ansicht + Analog-Tage-Tabelle
 + modellfreie Iron-Condor-Suche.
 
-TEIL A: aktuelle SPX-Optionskette als EINE Tabelle, je Ziel-ABSTAND vom Spot
+MULTI-INSTRUMENT-UMBAU: dieses Modul bekommt jetzt zusaetzlich das oben
+gewaehlte Instrument (siehe dashboard.py) und ist vollstaendig darauf
+umgestellt:
+  - Optionskette kommt ueber die Provider-Registry (chain_providers.base.
+    get_provider(instr)) statt fest ueber fetch_today_chain - Instrumente ohne
+    Live-Kette (aktuell: Nikkei, EuroStoxx50 - siehe instruments.py) zeigen
+    hier einen Hinweis statt abzustuerzen.
+  - Trainingstabelle/Marktdaten-Snapshot/alle internen Caches sind pro
+    Instrument getrennt (Schluessel enthaelt instr.key bzw. den
+    instrumentenspezifischen Dateipfad), damit ein Wechsel des Instruments
+    NICHT versehentlich Ergebnisse eines anderen Instruments anzeigt.
+  - Die 'Zum Depot hinzufuegen'-Buttons schreiben das aktive Instrument mit
+    in die neue Kombo (gemeinsames Depot, siehe depot_engine.py).
+
+TEIL A: aktuelle Optionskette als EINE Tabelle, je Ziel-ABSTAND vom Spot
 (in %) eine Zeile, Put/Call-Strike unabhaengig auf den naechstgelegenen real
 vorhandenen Strike gerundet (chain_delta.build_symmetric_distance_table).
 
@@ -17,30 +31,28 @@ Erw. Gewinn (= gewichteter Mittelwert von pnl_d), t-Stat (HAC, Kalenderzeit),
 Konfidenzintervall, Perioden-Konsistenz, Train/Val, Robust und 'Preis fuer
 PF=3'. KEIN Black-76-Modell, keine Vola/HV-Rang-Umrechnung, keine Deltas mehr
 in dieser Tabelle (die Spalten aus Teil A dienen nur der Anzeige).
-Nebeneffekt: schneller (kein Strike-Solve je Analog-Tag) und ohne die
-Division durch winzige Modellpraemien.
 
 ZEILENFARBE = 'SHORT GUELTIG': Gruen (alle Kriterien positiv, siehe
 _robustness_row_state) ist die EINZIGE Definition einer gueltigen Short-Zeile.
 Die Condor-Suche (Teil C) nutzt genau diese Gruen-Markierung fuer das
 Short-Kriterium und das Plateau (Zeile darueber und darunter muessen ebenfalls
-gruen sein). Die Long-Fluegel muessen nichts erfuellen. Die Zeilenfarbe nutzt
-die feste Schwelle _ROBUST_TSTAT_THRESHOLD; die Condor-Schwelle (Min. t-Stat)
-gilt nur fuer den Condor selbst.
+gruen sein). Die Long-Fluegel muessen nichts erfuellen.
 
 Gemeinsame Bausteine: Analog-Suche mit Kernel-Gewichten (analog_matching.
 find_analogs), einmalig pro Klick und in st.session_state gecacht
-(_find_today_analogs); T_days = naechstgelegener Wert der training_table (1..90,
-fehlende Laufzeiten -> Button in _ensure_training_table()); 'Heute' =
-synthetischer Balken mit heutigem Eroeffnungskurs; Staleness-Warnung
+(_find_today_analogs); T_days = naechstgelegener Wert der training_table
+DIESES INSTRUMENTS (1..90, fehlende Laufzeiten -> Button in
+_ensure_training_table(), aktuell nur fuer SPX automatisiert, siehe dort);
+'Heute' = synthetischer Balken mit heutigem Eroeffnungskurs; Staleness-Warnung
 (Quote-Alter) ab _QUOTE_AGE_WARNING_MINUTES.
 
 TEIL C: Iron-Condor-Suche (condor_search.py) mit Bid/Ask-Preisen der Kette.
 
 AUTOMATISCHER ABLAUF: Sobald dieser Tab geoeffnet wird, laedt die Kette (Auto-Load), danach
 rechnet Teil B (Analog-Tabelle) und anschliessend Teil C (Condor-Suche) von selbst. Neu gerechnet
-wird nur bei geaenderter Kette/Verfall/Raster/Einstellungen (Schluessel in st.session_state);
-ein Tab-Wechsel loescht nichts. Die Buttons 'neu berechnen' erzwingen eine Neuberechnung.
+wird nur bei geaenderter Kette/Verfall/Raster/Einstellungen/Instrument (Schluessel in
+st.session_state); ein Tab-Wechsel loescht nichts. Die Buttons 'neu berechnen' erzwingen eine
+Neuberechnung.
 """
 import subprocess
 import sys
@@ -54,7 +66,8 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import market_data
-from fetch_today_chain import fetch_today_open
+from instruments import InstrumentConfig, INSTRUMENTS
+from chain_providers.base import get_provider, UnsupportedChainError
 from chain_delta import build_symmetric_distance_table
 from analog_matching import (
     AnalogConfig, SimilaritySpaceConfig, hv_rank_bounds, fit_similarity_space,
@@ -79,52 +92,59 @@ _ROW_STYLE = {
 
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-_TT_FILE = _DATA_DIR / "training_table.parquet"
 
 # MODULWEITE CACHES (gelten fuer ALLE Modi und Browser-Sitzungen, ueberleben Reruns/Tab-Wechsel):
-_ANALOG_CORE: dict = {}    # Analog-Suche (PCA-Fit + Analog-Tage), unabhaengig von Restlaufzeit/Modus
-_TT_DAYS: dict = {}        # vorhandene T_days der Trainingstabelle je Dateisignatur
-_BOUNDS_CACHE: dict = {}   # HV-Min/Max-Fenster je (Datenstand, HV-Laenge, Lookback)
+_ANALOG_CORE: dict = {}    # Analog-Suche (PCA-Fit + Analog-Tage), Schluessel enthaelt instr.key
+_TT_DAYS: dict = {}        # vorhandene T_days der Trainingstabelle je (instr.key, Dateisignatur)
+_BOUNDS_CACHE: dict = {}   # HV-Min/Max-Fenster je (instr.key, Datenstand, HV-Laenge, Lookback)
 _RESULT_CACHE: dict = {}   # letzte Ergebnisse von Teil B ('analog') und Teil C ('condor') samt Schluessel
 
 
-def _training_table_signature():
-    """(mtime, Groesse) der Trainingstabelle - aendert sich nur beim Neubau. None, falls die Datei fehlt."""
+def _tt_file(instr: InstrumentConfig) -> Path:
+    """Instrumentenspezifischer Pfad zur Trainingstabelle, z.B.
+    data/gold_training_table.parquet statt eines einzigen globalen SPX-Pfads."""
+    from instruments import data_file
+    return data_file(instr, "training_table", _DATA_DIR)
+
+
+def _training_table_signature(instr: InstrumentConfig):
+    """(mtime, Groesse) der Trainingstabelle DIESES Instruments - aendert sich
+    nur beim Neubau. None, falls die Datei fehlt."""
     try:
-        s = _TT_FILE.stat()
+        s = _tt_file(instr).stat()
         return (s.st_mtime_ns, s.st_size)
     except OSError:
         return None
 
 
-def _training_days() -> set | None:
-    """Vorhandene T_days, OHNE die ganze Tabelle (hunderttausende Zeilen) zu laden: es wird nur die
-    Spalte T_days gelesen und je Dateisignatur einmal gemerkt. None, falls nicht bestimmbar."""
-    sig = _training_table_signature()
-    if sig is not None and sig in _TT_DAYS:
-        return _TT_DAYS[sig]
+def _training_days(instr: InstrumentConfig) -> set | None:
+    """Vorhandene T_days DIESES Instruments, OHNE die ganze Tabelle
+    (hunderttausende Zeilen) zu laden. None, falls nicht bestimmbar."""
+    sig = _training_table_signature(instr)
+    cache_key = (instr.key, sig)
+    if sig is not None and cache_key in _TT_DAYS:
+        return _TT_DAYS[cache_key]
     days = None
     if sig is not None:
         try:
-            days = set(pd.read_parquet(_TT_FILE, columns=["T_days"])["T_days"].unique().tolist())
+            days = set(pd.read_parquet(_tt_file(instr), columns=["T_days"])["T_days"].unique().tolist())
         except Exception:
             days = None
     if days is None:
         try:
-            tt = load_training_table()
+            tt = load_training_table(instr)
             if tt is None or tt.empty:
                 return None
             days = set(available_t_days(tt))
         except Exception:
             return None
     if sig is not None:
-        _TT_DAYS.clear()
-        _TT_DAYS[sig] = days
+        _TT_DAYS[cache_key] = days
     return days
 
 
-def _bounds_cached(daily_df: pd.DataFrame, hv_length: int, lookback: int) -> pd.DataFrame:
-    key = (len(daily_df), daily_df["date"].max(), int(hv_length), int(lookback))
+def _bounds_cached(daily_df: pd.DataFrame, hv_length: int, lookback: int, instr: InstrumentConfig) -> pd.DataFrame:
+    key = (instr.key, len(daily_df), daily_df["date"].max(), int(hv_length), int(lookback))
     if key not in _BOUNDS_CACHE:
         if len(_BOUNDS_CACHE) > 24:
             _BOUNDS_CACHE.clear()
@@ -132,21 +152,44 @@ def _bounds_cached(daily_df: pd.DataFrame, hv_length: int, lookback: int) -> pd.
     return _BOUNDS_CACHE[key]
 
 
-def _ensure_training_table() -> None:
-    """Prueft, ob die training_table alle Laufzeiten 1..90 enthaelt. Falls
-    nicht (alte Tabelle), wird ein Hinweis + Button angezeigt, der
-    build_dataset.py in einem Subprozess ausfuehrt (dauert einige Minuten).
-    Die Seite bleibt bis dahin mit den vorhandenen Laufzeiten nutzbar."""
-    have = _training_days()
+def _ensure_training_table(instr: InstrumentConfig) -> None:
+    """Prueft, ob die Trainingstabelle DIESES Instruments alle Laufzeiten
+    1..90 enthaelt. Falls nicht (fehlt komplett oder alte/unvollstaendige
+    Tabelle), wird ein Hinweis + ggf. Button angezeigt.
+
+    WICHTIG: der automatisierte Neubau ('Trainingstabelle jetzt neu bauen')
+    ruft build_dataset.py als Subprozess auf - build_dataset.py ist bisher
+    NICHT auf mehrere Instrumente umgestellt (haengt noch fest an
+    data/spx_daily.parquet -> data/training_table.parquet). Fuer alle
+    Instrumente AUSSER SPX wird der Button deshalb aktuell nicht angeboten,
+    um nicht versehentlich die SPX-Tabelle statt der des gewaehlten
+    Instruments neu zu bauen. Naechster offener Umbauschritt."""
+    have = _training_days(instr)
     if not have:
+        if instr.key != "spx":
+            st.info(
+                f"Noch keine Trainingstabelle fuer {instr.label} gefunden "
+                f"(`{_tt_file(instr).name}`). build_dataset.py ist aktuell noch "
+                "SPX-spezifisch fest verdrahtet - das ist der naechste offene "
+                "Umbauschritt, um es fuer beliebige Instrumente lauffaehig zu "
+                "machen. Bis dahin funktionieren Teil B (Analog-Tabelle) und "
+                "Teil C (Condor-Suche) fuer dieses Instrument nicht."
+            )
         return
     missing = [t for t in _REQUIRED_T_DAYS if t not in have]
     if not missing:
         return
     st.warning(
-        f"Die Trainingstabelle enthaelt nur die Laufzeiten {sorted(have)} - es fehlen "
-        f"{len(missing)} von 90 (T_days 1..90). Einmal neu bauen (dauert laenger, siehe unten)."
+        f"Die Trainingstabelle fuer {instr.label} enthaelt nur die Laufzeiten {sorted(have)} - "
+        f"es fehlen {len(missing)} von 90 (T_days 1..90). Einmal neu bauen (dauert laenger, siehe unten)."
     )
+    if instr.key != "spx":
+        st.info(
+            f"Automatischer Neubau ist aktuell nur fuer SPX verfuegbar (siehe Hinweis oben zu "
+            f"build_dataset.py) - fuer {instr.label} bitte, sobald build_dataset.py generalisiert "
+            "ist, nachziehen."
+        )
+        return
     if st.button("Trainingstabelle jetzt neu bauen (T_days 1-90)"):
         script = Path(__file__).resolve().parent / "build_dataset.py"
         with st.spinner("Baue Trainingstabelle - bitte warten, das kann mehrere Minuten dauern..."):
@@ -244,17 +287,25 @@ def _payout_at_todays_scale(entry_S: np.ndarray, exit_S: np.ndarray, weights: np
     return payout, weights
 
 
-def _build_daily_df_with_today(daily_df: pd.DataFrame):
+def _build_daily_df_with_today(daily_df: pd.DataFrame, instr: InstrumentConfig):
     """Haengt einen synthetischen 'Heute'-Tagesbalken (open=high=low=close=
     heutiger Eroeffnungskurs) an eine KOPIE von daily_df an. Faellt auf den
     letzten echten Schlusskurs zurueck (used_fallback=True), falls kein
-    Eroeffnungskurs verfuegbar ist.
+    Eroeffnungskurs verfuegbar ist (auch wenn das Instrument gar keinen
+    chain_provider hat - dann ist ein Eroeffnungskurs prinzipiell nicht
+    abrufbar, siehe UnsupportedChainError unten).
     Rueckgabe: (daily_df_erweitert, query_date, used_fallback)."""
     today = pd.Timestamp(date.today())
     if (daily_df["date"] == today).any():
         return daily_df.copy(), today, False
 
-    open_price = fetch_today_open()
+    open_price = None
+    try:
+        provider = get_provider(instr)
+        open_price = provider.fetch_today_open(instr)
+    except UnsupportedChainError:
+        open_price = None
+
     if open_price is None:
         return daily_df.copy(), daily_df["date"].max(), True
 
@@ -268,26 +319,35 @@ def _build_daily_df_with_today(daily_df: pd.DataFrame):
     return out, today, False
 
 
-def _find_today_analogs(daily_df, chosen_dte_exact, max_distance, bandwidth, min_gap):
-    """Analog-Suche fuer 'heute' (von Teil B, Teil C und der Depot-Analyse gemeinsam genutzt).
+def _find_today_analogs(daily_df, chosen_dte_exact, max_distance, bandwidth, min_gap, instr: InstrumentConfig):
+    """Analog-Suche fuer 'heute' (von Teil B, Teil C und der Depot-Analyse
+    gemeinsam genutzt) - jetzt FUER EIN BESTIMMTES INSTRUMENT.
 
-    CACHE: die teure Arbeit (Feature-Matrix, PCA-Fit, Analog-Tage) haengt NICHT von der Restlaufzeit
-    ab und wird deshalb einmal je (Parameter, Tag, Datenstand) gerechnet und modulweit gehalten -
-    alle Modi und Browser-Sitzungen arbeiten auf demselben Bestand. Die Restlaufzeit bestimmt nur
-    T_days_used (billig). Bei einem Cache-Treffer wird die grosse Trainingstabelle NICHT neu geladen."""
-    sig = _training_table_signature()
-    core_key = (float(max_distance), float(bandwidth), int(min_gap), date.today(), sig,
+    CACHE: die teure Arbeit (Feature-Matrix, PCA-Fit, Analog-Tage) haengt NICHT
+    von der Restlaufzeit ab und wird deshalb einmal je (Instrument, Parameter,
+    Tag, Datenstand) gerechnet und modulweit gehalten - alle Modi und
+    Browser-Sitzungen arbeiten fuer DIESES Instrument auf demselben Bestand.
+    Die Restlaufzeit bestimmt nur T_days_used (billig). Bei einem Cache-Treffer
+    wird die grosse Trainingstabelle NICHT neu geladen."""
+    sig = _training_table_signature(instr)
+    core_key = (instr.key, float(max_distance), float(bandwidth), int(min_gap), date.today(), sig,
                 len(daily_df), daily_df["date"].max())
     core = _ANALOG_CORE.get("core") if (sig is not None and _ANALOG_CORE.get("key") == core_key) else None
 
     if core is None:
-        training_table = load_training_table()
+        training_table = load_training_table(instr)
         if training_table.empty:
-            st.error("Keine Trainingstabelle gefunden - `python src/build_dataset.py` ausfuehren.")
+            st.error(
+                f"Keine Trainingstabelle fuer {instr.label} gefunden - "
+                + ("`python src/build_dataset.py` ausfuehren."
+                   if instr.key == "spx" else
+                   "build_dataset.py ist fuer dieses Instrument noch nicht generalisiert "
+                   "(siehe Hinweis weiter oben).")
+            )
             return None
         valid_t_days = available_t_days(training_table)
 
-        daily_df_today, query_date, used_fallback = _build_daily_df_with_today(daily_df)
+        daily_df_today, query_date, used_fallback = _build_daily_df_with_today(daily_df, instr)
         if used_fallback:
             st.warning(f"Kein heutiger Eroeffnungskurs verfuegbar - Analog-Suche nutzt "
                        f"{pd.Timestamp(query_date).date()}.")
@@ -330,7 +390,7 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
                       chosen_dte_exact: float, r_free: float, dividend_yield: float,
                       hv_length: int, rank_lookback: int,
                       analog_max_distance: float, analog_bandwidth: float, analog_min_gap: int,
-                      spot_today: float) -> pd.DataFrame | None:
+                      spot_today: float, instr: InstrumentConfig) -> pd.DataFrame | None:
     """Analog-Tabelle je Zeile (siehe Moduldokstring, TEIL B): heutige reale
     Strikes + heutige Mid-Praemie gegen die historischen prozentualen
     Kursbewegungen der Analog-Tage. Keine Modellbewertung. (r_free,
@@ -339,7 +399,7 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
     Gibt None zurueck (mit st.error) bei Abbruch, sonst ein DataFrame mit einer
     Zeile je distance_pct."""
     ctx = _find_today_analogs(daily_df, chosen_dte_exact, analog_max_distance,
-                              analog_bandwidth, analog_min_gap)
+                              analog_bandwidth, analog_min_gap, instr)
     if ctx is None:
         return None
     analogs, T_days_used, training_table = ctx["analogs"], ctx["T_days_used"], ctx["training_table"]
@@ -419,7 +479,7 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
 
 
 def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spot,
-                           max_distance, bandwidth, min_gap, distance_key) -> None:
+                           max_distance, bandwidth, min_gap, distance_key, instr: InstrumentConfig) -> None:
     """TEIL C: modellfreie Iron-Condor-Suche (siehe condor_search.py)."""
     st.divider()
     st.subheader("Iron-Condor-Suche (modellfrei, tagesgenau)")
@@ -441,7 +501,7 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         basis = st.radio("Preisbasis", ["Bid/Ask (echt)", "Mid (Näherung)"], key="condor_basis",
-                         help="Ausserhalb der Handelszeit liefert Yahoo oft Bid/Ask=0 - dann Mid waehlen.")
+                         help="Ausserhalb der Handelszeit liefert die Kette oft Bid/Ask=0 - dann Mid waehlen.")
     with c2:
         t_min = st.number_input("Min. t-Stat (HAC)", 0.0, 10.0, 3.0, 0.1, key="condor_tmin3")
     with c3:
@@ -490,7 +550,7 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
     if (rerun_btn or auto_c) and short_valid is not None:
         st.session_state["livechain_condor_attempt"] = (distance_key, cparams)
         with st.spinner("Berechne Iron-Condor-Suche..."):
-            ctx = _find_today_analogs(daily_df, chosen_dte_exact, max_distance, bandwidth, min_gap)
+            ctx = _find_today_analogs(daily_df, chosen_dte_exact, max_distance, bandwidth, min_gap, instr)
             if ctx is not None:
                 moves = analog_moves(ctx["analogs"], ctx["training_table"], ctx["T_days_used"], ctx["query_date"])
                 cfg = CondorConfig(price_basis="mid" if basis.startswith("Mid") else "bidask",
@@ -507,7 +567,7 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
     if res is None:
         return
     if res["key"] != distance_key:
-        st.info("Tabelle/Expiry hat sich geaendert - Suche erneut starten.")
+        st.info("Tabelle/Expiry/Instrument hat sich geaendert - Suche erneut starten.")
         return
     cdf, sdf, meta = res["cdf"], res["sdf"], res["meta"]
     if cdf.empty:
@@ -572,9 +632,10 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
     # ── Condor aus dieser Zeile ins Depot uebernehmen ──
     st.markdown("**Condor aus einer Zeile zum Depot hinzufuegen**")
     st.caption(
-        "Legt den 4-beinigen Iron Condor der gewaehlten Zeile (Short Put/Call + Long-Fluegel, "
-        "gemeinsamer Verfall) als neue Kombo im Depot an - dauerhaft gespeichert, erscheint "
-        "danach im Tab 'Depot-Analyse'. Auswahl aus ALLEN getesteten Paaren, nicht nur Kandidaten."
+        f"Legt den 4-beinigen Iron Condor der gewaehlten Zeile (Short Put/Call + Long-Fluegel, "
+        f"gemeinsamer Verfall) als neue Kombo im Depot an, fuer das Instrument **{instr.label}** - "
+        "dauerhaft gespeichert, erscheint danach im Tab 'Depot-Analyse'. Auswahl aus ALLEN "
+        "getesteten Paaren, nicht nur Kandidaten."
     )
     cdf_sorted = cdf.sort_values(["distance_short", "distance_wing"]).reset_index(drop=True)
     condor_opts = [
@@ -604,18 +665,19 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
         try:
             dashboard_depot.add_combo_to_depot(
                 condor_name, pd.Timestamp(chosen_expiry).strftime("%Y-%m-%d"), legs,
-                note="Aus Iron-Condor-Suche (Heutige Kette)",
+                note="Aus Iron-Condor-Suche (Heutige Kette)", instrument=instr.key,
             )
         except ValueError as e:
             st.error(f"Nicht hinzugefuegt: {e}")
         else:
-            st.success(f"'{condor_name}' zum Depot hinzugefuegt (siehe Tab 'Depot-Analyse').")
+            st.success(f"'{condor_name}' ({instr.label}) zum Depot hinzugefuegt (siehe Tab 'Depot-Analyse').")
 
 
-def render(df, daily_df, has_resolution) -> None:
+def render(df, daily_df, has_resolution, instr: InstrumentConfig) -> None:
     st.header("Heutige Kette - symmetrische Abstands-Ansicht")
     st.caption(
-        "Laedt die aktuelle SPX-Kette (Yahoo, ~15 Min. verzoegert). Put- und "
+        f"Aktives Instrument: **{instr.label}**. Laedt die aktuelle Optionskette "
+        "(Anbieter je Instrument, siehe instruments.py; bei Yahoo ~15 Min. verzoegert). Put- und "
         "Call-Strike werden je Zeile unabhaengig auf den naechstgelegenen realen "
         "Strike im gleichen prozentualen Abstand vom Spot gerundet - dadurch "
         "IMMER symmetrisch um den Spot. Die HV-Periode fuer Modell-Delta und "
@@ -623,7 +685,17 @@ def render(df, daily_df, has_resolution) -> None:
         "(z.B. 7.5 Tage Restlaufzeit -> HV(7.5)-Fenster)."
     )
 
-    _ensure_training_table()
+    if instr.chain_provider is None:
+        st.info(
+            f"Fuer {instr.label} ist keine Live-Optionskette konfiguriert (instruments.py, "
+            "chain_provider=None) - 'Heutige Kette' steht fuer dieses Instrument nicht zur "
+            "Verfuegung. Nutze 'Iron Condor Backtest' oder 'Analog-Tage-Matching' fuer die "
+            "historische Auswertung dieses Instruments, oder aktiviere - falls vorhanden und "
+            "erreichbar - einen Chain-Provider in instruments.py (z.B. 'ib' fuer EuroStoxx50)."
+        )
+        return
+
+    _ensure_training_table(instr)
 
     with st.sidebar:
         st.divider()
@@ -649,25 +721,29 @@ def render(df, daily_df, has_resolution) -> None:
                  "backtest.FixedRankConfig.lookback_days.",
         )
         r_free = st.number_input("Risikoloser Zins", 0.0, 0.20, 0.0, 0.005, format="%.3f")
-        dividend_yield = st.number_input("Dividendenrendite", 0.0, 0.10, 0.015, 0.001, format="%.3f")
+        dividend_yield = st.number_input(
+            "Dividenden-/Convenience-Yield", 0.0, 0.10, float(instr.dividend_yield), 0.001,
+            format="%.3f", key=f"livechain_q_{instr.key}",
+            help="Voreingestellt aus instruments.py fuer dieses Instrument.",
+        )
         reload_chain = st.button(
             "Heutige Kette neu laden", type="primary",
-            help="Beim ERSTEN Oeffnen dieses Tabs wird die Kette automatisch geladen - "
-                 "dieser Button ist nur fuer ein manuelles Neuladen noetig, z.B. nach "
-                 "Aenderung von DTE-Filter/Delta-Filter oder fuer einen aktuelleren Snapshot.",
+            help="Beim ERSTEN Oeffnen dieses Tabs (bzw. nach Instrumentenwechsel) wird die Kette "
+                 "automatisch geladen - dieser Button ist nur fuer ein manuelles Neuladen noetig, "
+                 "z.B. nach Aenderung von DTE-Filter/Delta-Filter oder fuer einen aktuelleren Snapshot.",
         )
 
-    # GEMEINSAMER DATENBESTAND (siehe market_data.py): die Kette wird einmal je Programmstart/Tag
-    # geladen und von allen Modi genutzt. DTE-/Delta-Filter wirken nur auf der Ansicht (kein Neuladen).
-    snap = market_data.current(float(max_dte))
+    # GEMEINSAMER DATENBESTAND (siehe market_data.py): die Kette wird einmal je Programmstart/Tag UND
+    # INSTRUMENT geladen und von allen Modi genutzt. DTE-/Delta-Filter wirken nur auf der Ansicht.
+    snap = market_data.current(instr, float(max_dte))
     if reload_chain or snap is None:
-        with st.spinner("Lade heutige Kette und berechne Delta/IV je Serie..."):
+        with st.spinner(f"Lade heutige Kette fuer {instr.label} und berechne Delta/IV je Serie..."):
             try:
-                snap = market_data.get(float(r_free), float(dividend_yield), float(max_dte),
+                snap = market_data.get(instr, float(r_free), float(dividend_yield), float(max_dte),
                                        force=bool(reload_chain))
             except Exception as e:
                 st.error(f"Laden fehlgeschlagen: {e}")
-                snap = market_data.current(0.0)
+                snap = market_data.current(instr, 0.0)
                 if snap is None:
                     st.info("Kette konnte noch nicht geladen werden - siehe Fehlermeldung oben.")
                     return
@@ -684,7 +760,7 @@ def render(df, daily_df, has_resolution) -> None:
         dvals = enriched_all[dcol].astype(float)
         enriched = enriched_all[(dvals >= float(min_dte)) & (dvals <= float(max_dte))
                                 & (enriched_all["delta_mkt"] >= float(min_abs_delta))]
-    st.metric("Aktueller Spot (SPX)", f"{spot:,.2f}")
+    st.metric(f"Aktueller Spot ({instr.label})", f"{spot:,.2f} {instr.currency}")
     if fetch_ts is not None:
         st.caption(
             f"Kette abgerufen um {fetch_ts.tz_convert('America/New_York').strftime('%Y-%m-%d %H:%M:%S')} ET "
@@ -700,8 +776,7 @@ def render(df, daily_df, has_resolution) -> None:
 
     if "dte_exact" not in enriched.columns:
         st.warning(
-            "Spalte 'dte_exact' fehlt - alte fetch_today_chain.py? App neu starten "
-            "und 'Heutige Kette laden' erneut klicken. Bis dahin Fallback auf 'dte'."
+            "Spalte 'dte_exact' fehlt - 'Heutige Kette' neu laden."
         )
         enriched = enriched.copy()
         enriched["dte_exact"] = enriched["dte"].astype(float)
@@ -720,9 +795,9 @@ def render(df, daily_df, has_resolution) -> None:
     chosen_dte_exact = float(expiry_info.iloc[expiry_labels.index(chosen_label)]["dte_exact"])
     T_years = chosen_dte_exact / 365.0
     st.caption(
-        f"Exakte Restlaufzeit: **{chosen_dte_exact:.2f} Tage** (Annahme "
-        "PM-Settlement 16:00 ET - bei klassischen monatlichen AM-settled "
-        "Serien ca. 6.5h zu hoch)."
+        f"Exakte Restlaufzeit: **{chosen_dte_exact:.2f} Tage** (Naeherung: PM-Settlement 16:00 "
+        "lokal fuer US-Instrumente; bei einem spaeter aktivierten Eurex/IB-Provider gilt "
+        "stattdessen die dortige AM-Settlement-Naeherung, siehe chain_providers/ib_provider.py)."
     )
 
     hv_length = max(2, round(chosen_dte_exact))
@@ -731,7 +806,7 @@ def render(df, daily_df, has_resolution) -> None:
         f"(gerundete Restlaufzeit von {chosen_dte_exact:.2f} Tagen)."
     )
 
-    bounds = _bounds_cached(daily_df, hv_length, int(rank_lookback))
+    bounds = _bounds_cached(daily_df, hv_length, int(rank_lookback), instr)
     if bounds.empty or bounds["hv"].dropna().empty:
         st.error(
             f"HV({hv_length}) konnte nicht berechnet werden - zu wenig Historie "
@@ -862,7 +937,7 @@ def render(df, daily_df, has_resolution) -> None:
                 ["strike", "option_type", "bid", "ask", "mid", "implied_vol_mkt", "delta_mkt",
                  "last_trade_date", "quote_age_minutes"]
             ].rename(columns={
-                "last_trade_date": "Letzter Trade (yfinance)",
+                "last_trade_date": "Letzter Trade",
                 "quote_age_minutes": "Quote-Alter (Min.)",
             }).sort_values(["option_type", "strike"]),
             use_container_width=True, hide_index=True,
@@ -915,9 +990,9 @@ def render(df, daily_df, has_resolution) -> None:
         max_distance=float(analog_max_distance), bandwidth=float(analog_bandwidth), min_gap=int(analog_min_gap))
 
     # SCHLUESSEL: aendert sich bei neuer Kette (fetch_ts), anderem Verfall/Raster, anderen
-    # Analog-Parametern oder neuem Tag. Nur dann wird NEU gerechnet - sonst bleibt das Ergebnis
-    # aus st.session_state (auch nach einem Tab-Wechsel) stehen.
-    analog_key = (chosen_expiry, tuple(distance_targets_pct), fetch_ts, float(analog_max_distance),
+    # Analog-Parametern, neuem Tag ODER anderem Instrument. Nur dann wird NEU gerechnet - sonst
+    # bleibt das Ergebnis aus st.session_state (auch nach einem Tab-Wechsel) stehen.
+    analog_key = (instr.key, chosen_expiry, tuple(distance_targets_pct), fetch_ts, float(analog_max_distance),
                   float(analog_bandwidth), int(analog_min_gap), date.today(),
                   float(min_dte), float(max_dte), float(min_abs_delta))
     if st.session_state.get("livechain_analog_key") != analog_key:
@@ -934,7 +1009,7 @@ def render(df, daily_df, has_resolution) -> None:
         analog_results = _run_bulk_analog(
             table, daily_df, chosen_dte_exact, r_free, dividend_yield,
             hv_length, int(rank_lookback), float(analog_max_distance), float(analog_bandwidth),
-            int(analog_min_gap), spot,
+            int(analog_min_gap), spot, instr,
         )
         if analog_results is not None:
             st.session_state["livechain_analog_results"] = analog_results
@@ -997,9 +1072,7 @@ def render(df, daily_df, has_resolution) -> None:
             "Vorzeichen in BEIDEN chronologischen Haelften. 'Preis für PF=3' = welcher "
             "einheitliche Entry-Preis auf dem Analog-Set (gewichtet, gegen die historischen "
             "Payouts auf heutiger Skala) einen Profit Factor von genau 3 ergeben haette - rein "
-            "historische Rueckrechnung, keine Zukunftsgarantie. Alle Kennzahlen dieser Tabelle "
-            "(Gewinnrate, Profit Factor, t-Stat, Robust) nutzen dieselbe Rechnung: heutige "
-            "Mid-Praemie minus historischer Payout."
+            "historische Rueckrechnung, keine Zukunftsgarantie."
         )
         st.caption(
             "**Zeilenfarben:** 🟩 grün = alle Robustheitskriterien positiv erfüllt "
@@ -1038,9 +1111,9 @@ def render(df, daily_df, has_resolution) -> None:
         if not addable.empty:
             st.markdown("**Position aus einer Zeile zum Depot hinzufuegen**")
             st.caption(
-                "Legt einen Short- oder Long-Strangle (Put + Call der gewaehlten Zeile, "
-                "gemeinsamer Verfall) als neue Kombo im Depot an - dauerhaft gespeichert, "
-                "erscheint danach im Tab 'Depot-Analyse'."
+                f"Legt einen Short- oder Long-Strangle (Put + Call der gewaehlten Zeile, "
+                f"gemeinsamer Verfall) als neue Kombo im Depot an, fuer das Instrument "
+                f"**{instr.label}** - dauerhaft gespeichert, erscheint danach im Tab 'Depot-Analyse'."
             )
             opts = [
                 f"{r.distance_pct:g} % ({r.strike_put:.0f}P / {r.strike_call:.0f}C)"
@@ -1068,18 +1141,19 @@ def render(df, daily_df, has_resolution) -> None:
                 try:
                     dashboard_depot.add_combo_to_depot(
                         add_name, pd.Timestamp(chosen_expiry).strftime("%Y-%m-%d"), legs,
-                        note="Aus Analog-Tage-Simulation je Zeile (Heutige Kette)",
+                        note="Aus Analog-Tage-Simulation je Zeile (Heutige Kette)", instrument=instr.key,
                     )
                 except ValueError as e:
                     st.error(f"Nicht hinzugefuegt: {e}")
                 else:
-                    st.success(f"'{add_name}' zum Depot hinzugefuegt (siehe Tab 'Depot-Analyse').")
+                    st.success(f"'{add_name}' ({instr.label}) zum Depot hinzugefuegt (siehe Tab 'Depot-Analyse').")
     elif stored is not None:
-        st.info("Die Analog-Tabelle wird fuer die geaenderte Tabelle/Einstellung neu berechnet oder ist fehlgeschlagen - siehe Meldungen oben; ggf. 'Analog-Läufe neu berechnen' klicken.")
+        st.info("Die Analog-Tabelle wird fuer die geaenderte Tabelle/Einstellung/Instrument neu berechnet "
+                "oder ist fehlgeschlagen - siehe Meldungen oben; ggf. 'Analog-Läufe neu berechnen' klicken.")
 
     # ── TEIL C: Iron-Condor-Suche ──
     _render_condor_section(
         table, daily_df, chosen_expiry, chosen_dte_exact, spot,
         float(analog_max_distance), float(analog_bandwidth), int(analog_min_gap),
-        analog_key,
+        analog_key, instr,
     )

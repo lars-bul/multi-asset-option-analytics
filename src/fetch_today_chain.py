@@ -1,192 +1,88 @@
 """
-Holt die AKTUELLE (heutige) SPX-Optionskette - Bid/Ask/Mid je Strike/Expiry,
-gefiltert auf DTE zwischen 0 und 90 Tagen. Keine Historie, nur der heutige
-Snapshot (Yahoo-Daten sind ca. 15 Minuten verzoegert, aber kostenlos und
-ohne Account nutzbar).
+KOMPATIBILITAETSSCHICHT (Multi-Instrument-Umbau).
 
-Nutzung:
-    pip install yfinance --break-system-packages
-    python fetch_today_chain.py
+Dies war urspruenglich die komplette SPX-Options-Abruflogik. Die eigentliche
+Implementierung lebt jetzt instrumentenunabhaengig in
+chain_providers/yfinance_provider.py (YFinanceChainProvider) - diese Datei
+ruft sie mit dem SPX-Instrument (instruments.INSTRUMENTS['spx']) auf, damit
+bestehender Code, der
 
-Ausgabe: eine CSV-Datei 'spx_chain_<heutiges_datum>.csv' mit Spalten
-date, expiry, dte, strike, option_type, bid, ask, mid, last, volume,
-open_interest, implied_vol (von Yahoo, falls vorhanden - kann von eurer
-eigenen black76.py-Berechnung abweichen, dient nur als Referenz).
+    from fetch_today_chain import fetch_today_chain, fetch_today_spot, fetch_today_open
 
-HINWEISE / GRENZEN dieses kostenlosen Wegs:
-- Nur "heute" - Yahoo speichert keine Bid/Ask-Historie, das laesst sich
-  damit nicht rueckwirkend abrufen.
-- 15 Minuten Verzoegerung, keine Garantie auf Vollstaendigkeit aller
-  Strikes/Serien (v.a. sehr illiquide, weit OTM Serien koennen bid=ask=0
-  zeigen).
-- Yahoo fasst SPX und SPXW (wöchentliche/0DTE-Serien) unter demselben
-  Ticker "^SPX" zusammen - dieses Skript unterscheidet die Roots NICHT
-  extra, sondern nimmt einfach alle von Yahoo gelisteten Expiries im
-  gewuenschten DTE-Fenster.
+importiert (market_data.py, dashboard_depot.py, dashboard_livechain.py),
+UNVERAENDERT weiterlaeuft - Verhalten und Rueckgabeformat sind exakt wie vorher.
 
-NEU - Staleness-Diagnose (last_trade_date/age): "15 Minuten verzoegert"
-gilt fuer den GESAMTEN Feed pauschal, sagt aber NICHTS darueber aus, wie alt
-die Bid/Ask-Quote EINES EINZELNEN, wenig gehandelten Strikes tatsaechlich
-ist - ein Market Maker aktualisiert eine kaum gehandelte Serie u.U. seit
-Stunden nicht, auch ohne dass der Gesamtfeed "veraltet" waere. yfinance
-liefert dafuer KEINEN offiziellen Bid/Ask-Zeitstempel, aber `lastTradeDate`
-(Zeitpunkt des letzten tatsaechlichen Trades dieses Kontrakts) als besten
-verfuegbaren Naeherungswert - vorher wurde dieses Feld beim Spalten-Select
-stillschweigend verworfen. Jetzt wird es durchgereicht (siehe
-fetch_today_chain()) und in enrich_chain_with_delta()/dashboard_livechain.py
-als `last_trade_date`/`quote_age_minutes` sichtbar gemacht. WICHTIG: das ist
-ein NAEHERUNGSWERT, kein Beweis - ein aktueller `lastTradeDate` bedeutet
-nicht zwingend eine frische Quote (der MM kann die Quote seit dem letzten
-Trade trotzdem bewegt haben), und ein alter `lastTradeDate` bedeutet nicht
-zwingend eine falsche Quote (bei ruhigem Markt kann eine alte Quote noch
-gueltig sein). Es ist trotzdem der beste Hinweis, den yfinance bietet, um
-einen Verdacht wie "dieser Put-Preis wirkt zu hoch" objektiv zu pruefen,
-statt ihn nur aus dem Preisvergleich selbst zu vermuten.
+NEUER CODE FUER NEUE INSTRUMENTE sollte NICHT mehr diese Datei importieren,
+sondern direkt ueber die Provider-Registry gehen:
+
+    from chain_providers.base import get_provider
+    from instruments import INSTRUMENTS
+    instr = INSTRUMENTS["gold"]
+    provider = get_provider(instr)
+    provider.fetch_chain(instr, min_dte=0.0, max_dte=90.0)
+
+market_data.py wurde bereits auf diesen Weg umgestellt (siehe dort); diese
+Datei bleibt nur fuer Abwaertskompatibilitaet mit den beiden Dashboard-Modulen
+erhalten, die noch direkt fetch_today_chain()/fetch_today_spot()/
+fetch_today_open() importieren, bis sie im naechsten Schritt ebenfalls
+generalisiert werden.
 """
 import sys
-from datetime import date, datetime
-from zoneinfo import ZoneInfo
 
 import pandas as pd
-import yfinance as yf
+
+from instruments import INSTRUMENTS, InstrumentConfig
+from chain_providers.yfinance_provider import YFinanceChainProvider, _dte_exact, ET
 
 TICKER = "^SPX"
 MIN_DTE = 0.0
 MAX_DTE = 90.0
-ET = ZoneInfo("America/New_York")
+
+_SPX = INSTRUMENTS["spx"]
+_provider = YFinanceChainProvider()
 
 
-def _now_et() -> datetime:
-    return datetime.now(ET)
+def dte_exact(expiry: pd.Timestamp, now_et=None) -> float:
+    """Re-Export der Original-Formel (jetzt in chain_providers/yfinance_provider.py),
+    damit ein direkter Import `from fetch_today_chain import dte_exact` weiter
+    funktioniert."""
+    return _dte_exact(expiry, now_et)
 
 
-def dte_exact(expiry: pd.Timestamp, now_et: datetime | None = None) -> float:
-    """Praezise Resttage bis zum SPX-Verfall (fraktional, z.B. 5.5 statt 5) -
-    Restlaufzeit spielt bei Black-76 v.a. bei kurzen DTEs (0DTE!) eine
-    spuerbare Rolle, ganze Kalendertage waeren hier zu ungenau.
-
-    ANNAHME: Settlement um 16:00 ET (PM-Settlement) - trifft exakt auf die
-    SPXW-Wochenserien/0DTE-Serien zu, die den Grossteil des DTE-0-90-Fensters
-    ausmachen. Die klassischen monatlichen AM-settled Serien (dritter Freitag,
-    Ticker-Root reines 'SPX') verfallen tatsaechlich schon zum Handelsstart
-    (~6.5h frueher) - fuer diese Serien ist dte_exact folglich leicht ZU HOCH.
-    Yahoo unterscheidet die Roots in den zurueckgegebenen Expiries nicht
-    explizit, daher wird hier bewusst einheitlich PM-Settlement angenommen
-    und diese Ungenauigkeit fuer die Monats-Serien in Kauf genommen (im
-    Dashboard als Hinweis vermerkt)."""
-    if now_et is None:
-        now_et = _now_et()
-    settle = datetime(expiry.year, expiry.month, expiry.day, 16, 0, 0, tzinfo=ET)
-    return (settle - now_et).total_seconds() / 86400.0
+def _ad_hoc_instrument(ticker: str) -> InstrumentConfig:
+    """Fuer den (seltenen) Fall, dass der urspruengliche Ticker-Parameter mit
+    einem anderen Wert als TICKER='^SPX' aufgerufen wird - baut spontan eine
+    minimale InstrumentConfig, damit der Provider trotzdem funktioniert."""
+    return InstrumentConfig(
+        key="_adhoc", label=ticker, price_ticker=ticker, currency="USD",
+        multiplier=100.0, dividend_yield=0.0, has_shiller_history=False,
+        settlement="cash_index", chain_provider="yfinance", chain_ticker=ticker,
+    )
 
 
 def fetch_today_spot(ticker: str = TICKER) -> float:
-    """Aktueller (15 Min. verzoegerter) Spot-Preis - wird fuer die
-    Forward-Umrechnung und damit fuer Delta/IV je Serie benoetigt
-    (siehe chain_delta.enrich_chain_with_delta)."""
-    tk = yf.Ticker(ticker)
-    fast = tk.fast_info
-    price = fast.get("lastPrice") or fast.get("last_price")
-    if price is None:
-        raise RuntimeError(f"Konnte aktuellen Spot-Preis fuer {ticker} nicht ermitteln.")
-    return float(price)
+    instr = _SPX if ticker == TICKER else _ad_hoc_instrument(ticker)
+    return _provider.fetch_spot(instr)
 
 
 def fetch_today_open(ticker: str = TICKER) -> float | None:
-    """Heutiger Eroeffnungskurs, FALLS die Sitzung bereits eroeffnet hat -
-    wird fuer den synthetischen 'Heute'-Tagesbalken in der Analog-Tage-
-    Simulation benoetigt (siehe dashboard_livechain._build_daily_df_with_today).
-
-    HINTERGRUND: daily_df enthaelt nur ABGESCHLOSSENE Handelstage. Ohne
-    diesen Eroeffnungskurs wuerde eine Abfrage waehrend eines laufenden
-    Handelstags fuer 'heute' auf den letzten abgeschlossenen Tag zurueckfallen
-    - montags waere das der Freitag (3 Tage alt). Der Eroeffnungskurs
-    schliesst diese Luecke ohne auf den EOD-Abschluss warten zu muessen.
-
-    Gibt None zurueck, wenn kein Eroeffnungskurs verfuegbar ist (vor
-    Handelsbeginn, Wochenende, Feiertag) - Aufrufer soll dann auf den
-    letzten echten Schlusskurs zurueckfallen (mit Warnhinweis)."""
-    tk = yf.Ticker(ticker)
-    fast = tk.fast_info
-    open_price = fast.get("open") or fast.get("regularMarketOpen")
-    if open_price is None or open_price <= 0:
-        return None
-    return float(open_price)
+    instr = _SPX if ticker == TICKER else _ad_hoc_instrument(ticker)
+    return _provider.fetch_today_open(instr)
 
 
 def fetch_today_chain(ticker: str = TICKER, min_dte: float = MIN_DTE, max_dte: float = MAX_DTE) -> pd.DataFrame:
-    tk = yf.Ticker(ticker)
-    now_et = _now_et()
-    today = pd.Timestamp(date.today())
-
-    try:
-        expiries = tk.options
-    except Exception as e:
-        raise RuntimeError(
-            f"Konnte Expiries fuer {ticker} nicht laden - Yahoo-Endpoint nicht "
-            f"erreichbar oder Ticker falsch? Fehler: {e}"
-        )
-
-    if not expiries:
-        raise RuntimeError(f"Keine Expiries fuer {ticker} gefunden.")
-
-    rows = []
-    for exp_str in expiries:
-        exp = pd.Timestamp(exp_str)
-        dte_precise = dte_exact(exp, now_et)
-        if dte_precise < min_dte or dte_precise > max_dte:
-            continue
-
-        try:
-            chain = tk.option_chain(exp_str)
-        except Exception as e:
-            print(f"  Warnung: Expiry {exp_str} uebersprungen ({e})", file=sys.stderr)
-            continue
-
-        for option_type, df_leg in (("call", chain.calls), ("put", chain.puts)):
-            if df_leg.empty:
-                continue
-            sub = df_leg.copy()
-            sub["date"] = today
-            sub["expiry"] = exp
-            sub["dte"] = round(dte_precise)
-            sub["dte_exact"] = dte_precise
-            sub["option_type"] = option_type
-            sub["mid"] = (sub["bid"] + sub["ask"]) / 2.0
-            # NEU: lastTradeDate durchreichen statt verwerfen (siehe
-            # Moduldokstring "Staleness-Diagnose") - fehlt die Spalte bei
-            # einer aelteren yfinance-Version, wird NaT eingesetzt, damit
-            # der Rest der Pipeline (enrich_chain_with_delta) nicht bricht.
-            if "lastTradeDate" in sub.columns:
-                sub["last_trade_date"] = sub["lastTradeDate"]
-            else:
-                sub["last_trade_date"] = pd.NaT
-            rows.append(sub[[
-                "date", "expiry", "dte", "dte_exact", "strike", "option_type",
-                "bid", "ask", "mid", "lastPrice", "volume", "openInterest", "impliedVolatility",
-                "last_trade_date",
-            ]].rename(columns={
-                "lastPrice": "last", "openInterest": "open_interest", "impliedVolatility": "implied_vol",
-            }))
-
-    if not rows:
-        raise RuntimeError(
-            f"Keine Serien im DTE-Fenster [{min_dte}, {max_dte}] gefunden - "
-            "Fenster erweitern oder Handelstag pruefen (Wochenende/Feiertag?)."
-        )
-
-    return pd.concat(rows, ignore_index=True).sort_values(["expiry", "option_type", "strike"]).reset_index(drop=True)
+    instr = _SPX if ticker == TICKER else _ad_hoc_instrument(ticker)
+    return _provider.fetch_chain(instr, min_dte, max_dte)
 
 
 def compare_to_model(chain: pd.DataFrame, spot: float, r_free: float, dividend_yield: float,
                       current_iv: float, vol_surface) -> pd.DataFrame:
     """SYSTEMATISCHER Abgleich: fuer JEDE Serie der heutigen Kette wird der
     theoretische Preis aus eurer eigenen black76.leg_price() berechnet und
-    der Differenz zum echten Markt-Mid gegenuebergestellt. Das ist der
-    eigentliche Zweck - nicht nur Daten anschauen, sondern automatisiert
-    pruefen, wie gut euer HV-/Skew-Modell (VolSurfaceConfig) die reale
-    heutige Kette trifft, als Programm-Output (DataFrame), nicht als
-    manueller Blick auf eine Webseite."""
+    der Differenz zum echten Markt-Mid gegenuebergestellt. Unveraendert
+    gegenueber dem Original - instrumentenunabhaengig, da nur mit dem
+    uebergebenen 'chain'-DataFrame und den explizit uebergebenen Parametern
+    gerechnet wird."""
     from black76 import forward_price, leg_price
 
     rows = chain.copy()
@@ -207,13 +103,3 @@ if __name__ == "__main__":
     chain = fetch_today_chain()
     print(f"{len(chain)} Serien in der heutigen Kette (DTE {MIN_DTE}-{MAX_DTE}).")
     print(chain.head(10))
-
-    # Beispiel-Abgleich gegen euer eigenes Modell (current_iv hier grob per
-    # HV(30) ersetzen - siehe backtest.compute_hv() fuer den echten Wert aus
-    # euren Kursdaten):
-    #
-    # from black76 import VolSurfaceConfig
-    # spot = chain.iloc[0]["strike"]  # besser: echten Spot separat holen
-    # checked = compare_to_model(chain, spot, r_free=0.0, dividend_yield=0.015,
-    #                             current_iv=0.13, vol_surface=VolSurfaceConfig())
-    # print(checked[["expiry", "strike", "option_type", "mid", "model_price", "model_minus_mid_pct"]])

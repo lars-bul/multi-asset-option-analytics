@@ -2,13 +2,24 @@
 Rechenlogik + Speicherung fuer die Depot-Analyse (ohne Streamlit, damit testbar).
 
 DATENMODELL (JSON in data/depot.json):
-  {"version": 1, "saved_at": "...", "combos": [
-      {"id": "a1b2c3d4e5", "name": "IC 7300/7350/7900/7950", "expiry": "2026-10-02",
-       "note": "", "created": "...",
+  {"version": 2, "saved_at": "...", "combos": [
+      {"id": "a1b2c3d4e5", "name": "IC 7300/7350/7900/7950", "instrument": "spx",
+       "expiry": "2026-10-02", "note": "", "created": "...",
        "legs": [{"option_type": "put"|"call", "side": "long"|"short",
                  "strike": 7300.0, "qty": 1.0, "entry_price": 3.2}, ...]}]}
-  Eine Kombo hat 1 bis 4 Beine mit GEMEINSAMEM Verfall. entry_price = Optionspreis
-  beim Einstieg in Indexpunkten je Bein (nicht mal 100).
+  Eine Kombo hat 1 bis 4 Beine mit GEMEINSAMEM Verfall UND GEMEINSAMEM Instrument.
+  entry_price = Optionspreis beim Einstieg in Indexpunkten je Bein (nicht mal
+  Multiplikator).
+
+  NEU (Multi-Instrument): jede Kombo traegt ein 'instrument'-Feld (Schluessel
+  aus instruments.INSTRUMENTS, z.B. "spx", "rut", "ndx", "sx5e", "gold") - EIN
+  gemeinsames Depot fuer alle Instrumente, keine getrennten Dateien. Der
+  Punkt-zu-Geld-Multiplikator (frueher die globale Konstante MULTIPLIER) wird
+  jetzt PRO KOMBO ueber multiplier_for()/instruments.py nachgeschlagen, da er
+  je Instrument unterschiedlich ist (z.B. 10 bei EuroStoxx50 statt 100).
+  MIGRATION: beim Laden einer aelteren depot.json ohne 'instrument'-Feld wird
+  automatisch "spx" angenommen (das bisherige, einzige unterstuetzte
+  Instrument) - bestehende Depots bleiben dadurch ohne manuellen Eingriff lauffaehig.
 
 VORZEICHEN-KONVENTION:
   entry_net  = Summe ueber Beine: short +preis*qty (Kredit), long -preis*qty (Debit)
@@ -33,8 +44,13 @@ from pathlib import Path
 import numpy as np
 from scipy.optimize import brentq
 
-MULTIPLIER = 100          # SPX: 1 Indexpunkt = 100 USD je Kontrakt
-SCHEMA_VERSION = 1
+from instruments import INSTRUMENTS, DEFAULT_INSTRUMENT, get_instrument
+
+MULTIPLIER = 100          # LEGACY-Fallback (= SPX-Kontraktgroesse). Fuer instrumenten-
+                          # spezifische Rechnungen bitte multiplier_for(combo) verwenden -
+                          # diese Konstante bleibt nur, falls altes Aufrufer-Coding sie
+                          # noch direkt importiert (z.B. unmigrierte Dashboard-Stellen).
+SCHEMA_VERSION = 2
 OPTION_TYPES = ("put", "call")
 SIDES = ("long", "short")
 
@@ -56,10 +72,11 @@ def clean_leg(leg: dict) -> dict:
 
 
 def make_combo(name: str, expiry, legs: list[dict], note: str = "", combo_id: str | None = None,
-               created: str | None = None) -> dict:
+               created: str | None = None, instrument: str = DEFAULT_INSTRUMENT) -> dict:
     return {
         "id": combo_id or new_id(),
         "name": (name or "").strip() or "Kombo",
+        "instrument": str(instrument or DEFAULT_INSTRUMENT).lower(),
         "expiry": str(expiry),
         "note": note or "",
         "created": created or datetime.now().isoformat(timespec="seconds"),
@@ -67,11 +84,23 @@ def make_combo(name: str, expiry, legs: list[dict], note: str = "", combo_id: st
     }
 
 
+def multiplier_for(combo: dict) -> float:
+    """Punkt-zu-Geld-Multiplikator der Kombo, aus ihrem 'instrument'-Feld
+    (siehe instruments.py). Faellt auf MULTIPLIER (=SPX) zurueck, falls das
+    Feld fehlt (alte Kombo) oder einen unbekannten Schluessel enthaelt."""
+    key = combo.get("instrument", DEFAULT_INSTRUMENT)
+    instr = INSTRUMENTS.get(key)
+    return instr.multiplier if instr is not None else MULTIPLIER
+
+
 def validate_combo(combo: dict) -> list[str]:
     errs: list[str] = []
     legs = combo.get("legs", [])
     if not 1 <= len(legs) <= 4:
         errs.append("Eine Kombo braucht 1 bis 4 Beine.")
+    instrument = combo.get("instrument", DEFAULT_INSTRUMENT)
+    if instrument not in INSTRUMENTS:
+        errs.append(f"Unbekanntes Instrument '{instrument}' (verfuegbar: {sorted(INSTRUMENTS)}).")
     try:
         datetime.strptime(str(combo.get("expiry")), "%Y-%m-%d")
     except ValueError:
@@ -97,7 +126,10 @@ def validate_combo(combo: dict) -> list[str]:
 
 def load_depot(path: Path) -> tuple[list[dict], str | None]:
     """Laedt das Depot. Rueckgabe: (combos, warnung). Bei unlesbarer Datei wird diese
-    gesichert (nicht ueberschrieben) und ein leeres Depot + Warnung geliefert."""
+    gesichert (nicht ueberschrieben) und ein leeres Depot + Warnung geliefert.
+    MIGRATION: Kombos ohne 'instrument'-Feld (Depots aus der Zeit vor der
+    Multi-Instrument-Unterstuetzung) werden automatisch auf 'spx' gesetzt -
+    das war bisher das einzige unterstuetzte Instrument."""
     path = Path(path)
     if not path.exists():
         return [], None
@@ -109,7 +141,8 @@ def load_depot(path: Path) -> tuple[list[dict], str | None]:
         out = []
         for c in combos:
             out.append(make_combo(c.get("name", ""), c.get("expiry", ""), c.get("legs", []),
-                                  c.get("note", ""), c.get("id"), c.get("created")))
+                                  c.get("note", ""), c.get("id"), c.get("created"),
+                                  c.get("instrument", DEFAULT_INSTRUMENT)))
         return out, None
     except Exception as e:                                   # unlesbar/beschaedigt
         stamp = time.strftime("%Y%m%d-%H%M%S")

@@ -299,6 +299,28 @@ def _build_daily_df_with_today(daily_df: pd.DataFrame, instr: InstrumentConfig):
     Eroeffnungskurs verfuegbar ist (auch wenn das Instrument gar keinen
     chain_provider hat - dann ist ein Eroeffnungskurs prinzipiell nicht
     abrufbar, siehe UnsupportedChainError unten).
+
+    SKALEN-KORREKTUR (Bugfix): bei Instrumenten, deren Kette ueber einen
+    ANDEREN Ticker laeuft als die Kurshistorie (instr.chain_ticker !=
+    instr.price_ticker - z.B. Russell 2000: price_ticker='^RUT' (Indexstand,
+    ~2000-3000 Punkte) vs. chain_ticker='IWM' (ETF-Kurs, ~1/10 davon)) liefert
+    provider.fetch_today_open() einen Preis auf der FALSCHEN Skala fuer die
+    Index-Kurshistorie. Ein direktes Anhaengen erzeugt einen kuenstlichen
+    ~90%-Kurssprung im synthetischen 'Heute'-Balken - die Analog-Suche
+    (analog_matching.find_analogs) bewertet 'heute' dadurch als extrem
+    unaehnlich zu JEDEM historischen Tag, die Gaussian-Kernel-Gewichte aller
+    Kandidaten unterlaufen numerisch auf 0.0, und der 'weight > 0'-Filter in
+    condor_search.analog_moves() wirft anschliessend ALLE Analog-Tage raus
+    ('Keine Analog-Tage mit gueltiger Kursbewegung gefunden', obwohl Analog-
+    Tage durchaus gefunden und in der Trainingstabelle vorhanden waren).
+    Fix: statt des absoluten ETF-Preises wird die TAGESRENDITE des ETFs
+    (heutiger Open / letzter ETF-Schlusskurs) auf den letzten echten
+    Index-Schlusskurs der Kurshistorie projiziert - das haelt den
+    synthetischen Balken auf der richtigen Skala. Schlaegt die ETF-Historie
+    dafuer fehl (Netzwerk, kein Handelstag-Match etc.), wird auf den echten
+    letzten Schlusskurs zurueckgefallen (used_fallback=True) statt eine
+    falsche Skala zu riskieren.
+
     Rueckgabe: (daily_df_erweitert, query_date, used_fallback)."""
     today = pd.Timestamp(date.today())
     if (daily_df["date"] == today).any():
@@ -313,6 +335,28 @@ def _build_daily_df_with_today(daily_df: pd.DataFrame, instr: InstrumentConfig):
 
     if open_price is None:
         return daily_df.copy(), daily_df["date"].max(), True
+
+    if instr.chain_ticker and instr.chain_ticker != instr.price_ticker:
+        try:
+            import yfinance as yf
+            etf_hist = yf.Ticker(instr.chain_ticker).history(period="5d")
+            etf_closes = etf_hist["Close"]
+            etf_idx = pd.to_datetime(etf_closes.index)
+            if etf_idx.tz is not None:
+                etf_idx = etf_idx.tz_convert(None)
+            etf_closes.index = etf_idx.normalize()
+
+            last_index_date = pd.Timestamp(daily_df["date"].max()).normalize()
+            match = etf_closes.loc[etf_closes.index == last_index_date]
+            if match.empty or float(match.iloc[-1]) <= 0:
+                return daily_df.copy(), daily_df["date"].max(), True
+
+            ratio = float(daily_df["close"].iloc[-1]) / float(match.iloc[-1])
+            open_price = open_price * ratio
+        except Exception:
+            # Skalierung fehlgeschlagen - lieber sauberer Fallback auf den
+            # letzten echten Schlusskurs als ein Wert auf falscher Skala.
+            return daily_df.copy(), daily_df["date"].max(), True
 
     new_row = pd.DataFrame([{
         "date": today, "open": open_price, "high": open_price,
@@ -407,7 +451,69 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
     analogs, T_days_used, training_table = ctx["analogs"], ctx["T_days_used"], ctx["training_table"]
     moves = analog_moves(analogs, training_table, T_days_used, ctx["query_date"])
     if moves.empty:
-        st.error("Keine Analog-Tage mit gueltiger Kursbewegung (Exit vor heute) gefunden.")
+        # DIAGNOSE statt Blackbox-Fehlermeldung: zeigt, an welcher Stelle die
+        # Analog-Tage verlorengehen - (a) kein Treffer in der Trainingstabelle
+        # fuer dieses T_days (Datums-/Abdeckungs-Mismatch, z.B. weil die
+        # Trainingstabelle mit einem AELTEREN Kursdaten-Stand gebaut wurde als
+        # der aktuell live geladene) oder (b) Treffer vorhanden, aber Exit-Datum
+        # liegt NACH dem Query-Tag (Kausalitaets-Filter).
+        tt_this_T = training_table.loc[training_table["T_days"] == T_days_used]
+        analog_dates = pd.to_datetime(analogs["analog_date"])
+        in_tt = analog_dates.isin(set(tt_this_T["entry_date"]))
+        n_matched = int(in_tt.sum())
+        n_exit_ok = 0
+        n_weight_ok = 0
+        if n_matched > 0:
+            exit_by_date = tt_this_T.set_index("entry_date")["exit_date"]
+            matched_exits = exit_by_date.reindex(analog_dates[in_tt])
+            exit_ok_mask = matched_exits <= pd.Timestamp(ctx["query_date"])
+            n_exit_ok = int(exit_ok_mask.sum())
+            matched_weights = analogs.loc[in_tt.to_numpy(), "weight"].to_numpy()
+            n_weight_ok = int((matched_weights[exit_ok_mask.to_numpy()] > 0).sum()) if n_exit_ok else 0
+        min_w = float(analogs["weight"].min()) if len(analogs) else float("nan")
+        max_w = float(analogs["weight"].max()) if len(analogs) else float("nan")
+        tt_range = (
+            f"{tt_this_T['entry_date'].min().date()} bis {tt_this_T['entry_date'].max().date()}"
+            if len(tt_this_T) else "leer (keine Zeilen fuer dieses T_days)"
+        )
+        if n_matched == 0:
+            hint = (
+                "→ 0 Treffer in der Trainingstabelle trotz gefundener Analog-Tage: die "
+                "Trainingstabelle wurde vermutlich mit einem AELTEREN/ANDEREN Kursdaten-"
+                "Stand gebaut als der, den das Dashboard gerade live laedt. Fix: "
+                f"`python src/build_dataset.py {instr.key}` erneut ausfuehren (oder "
+                "Button oben) und Seite neu laden."
+            )
+        elif n_exit_ok == 0:
+            hint = (
+                "→ Treffer vorhanden, aber alle Exit-Daten liegen nach dem Query-Tag: "
+                "T_days zu gross fuer die verfuegbare Restlaufzeit-Rundung, oder der "
+                "synthetische 'Heute'-Balken liegt zeitlich vor den passenden "
+                "historischen Exit-Terminen."
+            )
+        elif n_weight_ok == 0:
+            hint = (
+                f"→ Treffer und Exit-Daten sind ok, aber ALLE Kernel-Gewichte sind 0 "
+                f"(Gewichte im Analog-Set reichen von {min_w:.3g} bis {max_w:.3g}). Das "
+                "deutet auf eine kaputte/falsch skalierte Feature-Basis fuer den "
+                "synthetischen 'Heute'-Balken hin - z.B. wenn instr.chain_ticker und "
+                "instr.price_ticker auf unterschiedlichen Preis-Skalen liegen (wie bei "
+                "Russell 2000: ^RUT-Indexpunkte vs. IWM-ETF-Preis) und der heutige "
+                "Eroeffnungskurs versehentlich auf der FALSCHEN Skala an die "
+                "Kurshistorie angehaengt wurde (siehe _build_daily_df_with_today())."
+            )
+        else:
+            hint = "→ Unklar - bitte Rohdaten pruefen."
+        st.error(
+            "Keine Analog-Tage mit gueltiger Kursbewegung (Exit vor heute) gefunden.\n\n"
+            f"Diagnose: {len(analogs)} Analog-Tage gefunden "
+            f"({analog_dates.min().date()} bis {analog_dates.max().date()}), davon "
+            f"**{n_matched}** mit passendem Eintrag in der Trainingstabelle fuer "
+            f"T_days={T_days_used} ({len(tt_this_T)} Zeilen dort, Zeitraum {tt_range}), "
+            f"davon **{n_exit_ok}** mit Exit-Datum <= Query-Tag "
+            f"({pd.Timestamp(ctx['query_date']).date()}), davon **{n_weight_ok}** mit "
+            f"Kernel-Gewicht > 0.\n\n" + hint
+        )
         return None
     st.caption(f"{len(moves)} Analog-Tage nutzbar (von {len(analogs)} gefunden; gilt fuer alle Zeilen, "
                "stetige Kernel-Gewichte).")

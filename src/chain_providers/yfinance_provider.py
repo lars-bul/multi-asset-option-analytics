@@ -17,6 +17,20 @@ dte_exact() nimmt fuer ALLE hier bedienten Instrumente PM-Settlement (16:00
 America/New_York) an - im Original SPX-spezifisch (SPXW-Wochenserien/0DTE)
 begruendet, gilt hier als Naeherung ebenso fuer NDX/RUT-Proxy(IWM)/Gold(GLD)/
 Oil(USO), da es sich durchweg um US-boersengehandelte Optionen handelt.
+
+KORREKTUR (yfinance-fast_info-Bug, "KeyError: 'currentTradingPeriod'"):
+yf.Ticker(...).fast_info ist ein Lazy-Objekt - Felder wie 'open'/'lastPrice'
+loesen ERST bei Zugriff einen Netzwerkruf aus (u.a. _get_1y_prices()), und
+Yahoo liefert fuer manche Ticker/Marktzustaende (insbesondere auslaendische
+Indizes wie ^N225/^STOXX50E, aber auch sporadisch bei US-Tickern) ein
+Metadaten-Objekt OHNE den Schluessel 'currentTradingPeriod'. yfinance faengt
+das intern NICHT ab und wirft einen rohen KeyError - das ist ein Bug/eine
+Unzuverlaessigkeit von yfinance/Yahoo, kein Fehler in der eigenen Config.
+fetch_spot()/fetch_today_open() faengt das jetzt ab: fetch_spot() wirft
+stattdessen eine spechende UnsupportedChainError, fetch_today_open() gibt
+None zurueck (das ist laut chain_providers.base.ChainProvider ohnehin der
+vorgesehene 'kein Wert verfuegbar'-Fall - der Aufrufer faellt dann auf den
+letzten echten Schlusskurs zurueck, siehe dashboard_livechain.py).
 """
 from __future__ import annotations
 
@@ -50,20 +64,40 @@ class YFinanceChainProvider(ChainProvider):
     name = "yfinance"
 
     def fetch_spot(self, instr: InstrumentConfig) -> float:
-        tk = yf.Ticker(instr.chain_ticker or instr.price_ticker)
-        fast = tk.fast_info
-        price = fast.get("lastPrice") or fast.get("last_price")
+        ticker = instr.chain_ticker or instr.price_ticker
+        tk = yf.Ticker(ticker)
+        try:
+            fast = tk.fast_info
+            price = fast.get("lastPrice") or fast.get("last_price")
+        except Exception as e:
+            # KEIN gezieltes except KeyError: yfinance's fast_info-Interna sind lazy und
+            # koennen bei fehlenden Yahoo-Metadaten (siehe Modul-Docstring) auch andere
+            # Exceptions werfen (z.B. IndexError/HTTPError je nach yfinance-Version) - hier
+            # zaehlt nur, dass der Spot fuer 'ticker' gerade nicht ermittelbar war.
+            raise UnsupportedChainError(
+                f"Konnte aktuellen Spot-Preis fuer '{ticker}' nicht ermitteln - Yahoo hat kein "
+                f"nutzbares Kurs-Metadatenobjekt geliefert ({type(e).__name__}: {e}). Das ist ein "
+                "bekanntes yfinance/Yahoo-Problem bei manchen Tickern (v.a. auslaendische Indizes) "
+                "und tritt manchmal auch nur voruebergehend auf - erneut versuchen."
+            ) from e
         if price is None:
             raise UnsupportedChainError(
-                f"Konnte aktuellen Spot-Preis fuer '{instr.chain_ticker or instr.price_ticker}' "
-                "nicht ermitteln (yfinance fast_info liefert weder 'lastPrice' noch 'last_price')."
+                f"Konnte aktuellen Spot-Preis fuer '{ticker}' nicht ermitteln (yfinance fast_info "
+                "liefert weder 'lastPrice' noch 'last_price')."
             )
         return float(price)
 
     def fetch_today_open(self, instr: InstrumentConfig) -> float | None:
-        tk = yf.Ticker(instr.chain_ticker or instr.price_ticker)
-        fast = tk.fast_info
-        open_price = fast.get("open") or fast.get("regularMarketOpen")
+        ticker = instr.chain_ticker or instr.price_ticker
+        tk = yf.Ticker(ticker)
+        try:
+            fast = tk.fast_info
+            open_price = fast.get("open") or fast.get("regularMarketOpen")
+        except Exception:
+            # Optionaler Wert (siehe chain_providers.base.ChainProvider.fetch_today_open) - der
+            # Aufrufer faellt bei None auf den letzten echten Schlusskurs zurueck, siehe
+            # dashboard_livechain._build_daily_df_with_today(). Kein Grund, deswegen abzubrechen.
+            return None
         if open_price is None or open_price <= 0:
             return None
         return float(open_price)

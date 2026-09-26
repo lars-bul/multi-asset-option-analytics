@@ -16,6 +16,15 @@ umgestellt:
   - Die 'Zum Depot hinzufuegen'-Buttons schreiben das aktive Instrument mit
     in die neue Kombo (gemeinsames Depot, siehe depot_engine.py).
 
+KORREKTUR (Trainingstabellen-Neubau jetzt fuer JEDES Instrument): build_dataset.py
+ist nicht mehr SPX-spezifisch fest verdrahtet (nimmt jetzt einen Instrument-
+Schluessel als Kommandozeilenargument, siehe dort) - der 'Trainingstabelle
+jetzt (neu) bauen'-Button in _ensure_training_table() steht deshalb jetzt fuer
+ALLE Instrumente zur Verfuegung, nicht mehr nur fuer SPX. Fehlt die Tabelle
+komplett ODER fehlen nur einzelne Laufzeiten (z.B. weil eine gefragte
+Restlaufzeit noch nicht in T_days 1..90 abgedeckt war), wird derselbe Button
+angezeigt.
+
 TEIL A: aktuelle Optionskette als EINE Tabelle, je Ziel-ABSTAND vom Spot
 (in %) eine Zeile, Put/Call-Strike unabhaengig auf den naechstgelegenen real
 vorhandenen Strike gerundet (chain_delta.build_symmetric_distance_table).
@@ -42,7 +51,7 @@ Gemeinsame Bausteine: Analog-Suche mit Kernel-Gewichten (analog_matching.
 find_analogs), einmalig pro Klick und in st.session_state gecacht
 (_find_today_analogs); T_days = naechstgelegener Wert der training_table
 DIESES INSTRUMENTS (1..90, fehlende Laufzeiten -> Button in
-_ensure_training_table(), aktuell nur fuer SPX automatisiert, siehe dort);
+_ensure_training_table(), jetzt fuer jedes Instrument, siehe oben);
 'Heute' = synthetischer Balken mit heutigem Eroeffnungskurs; Staleness-Warnung
 (Quote-Alter) ab _QUOTE_AGE_WARNING_MINUTES.
 
@@ -154,46 +163,42 @@ def _bounds_cached(daily_df: pd.DataFrame, hv_length: int, lookback: int, instr:
 
 def _ensure_training_table(instr: InstrumentConfig) -> None:
     """Prueft, ob die Trainingstabelle DIESES Instruments alle Laufzeiten
-    1..90 enthaelt. Falls nicht (fehlt komplett oder alte/unvollstaendige
-    Tabelle), wird ein Hinweis + ggf. Button angezeigt.
+    1..90 enthaelt. Fehlt sie komplett ODER fehlen nur einzelne Laufzeiten
+    (z.B. eine gerade gefragte Restlaufzeit), wird ein Hinweis + Button zum
+    (Neu-)Bauen angezeigt.
 
-    WICHTIG: der automatisierte Neubau ('Trainingstabelle jetzt neu bauen')
-    ruft build_dataset.py als Subprozess auf - build_dataset.py ist bisher
-    NICHT auf mehrere Instrumente umgestellt (haengt noch fest an
-    data/spx_daily.parquet -> data/training_table.parquet). Fuer alle
-    Instrumente AUSSER SPX wird der Button deshalb aktuell nicht angeboten,
-    um nicht versehentlich die SPX-Tabelle statt der des gewaehlten
-    Instruments neu zu bauen. Naechster offener Umbauschritt."""
+    KORREKTUR (vorher SPX-spezifisch): build_dataset.py nimmt jetzt einen
+    Instrument-Schluessel als Kommandozeilenargument entgegen (statt fest an
+    data/spx_daily.parquet -> data/training_table.parquet zu haengen) - der
+    Button ruft es deshalb mit `instr.key` auf und steht fuer JEDES Instrument
+    zur Verfuegung, nicht mehr nur fuer SPX."""
     have = _training_days(instr)
     if not have:
-        if instr.key != "spx":
-            st.info(
-                f"Noch keine Trainingstabelle fuer {instr.label} gefunden "
-                f"(`{_tt_file(instr).name}`). build_dataset.py ist aktuell noch "
-                "SPX-spezifisch fest verdrahtet - das ist der naechste offene "
-                "Umbauschritt, um es fuer beliebige Instrumente lauffaehig zu "
-                "machen. Bis dahin funktionieren Teil B (Analog-Tabelle) und "
-                "Teil C (Condor-Suche) fuer dieses Instrument nicht."
-            )
-        return
-    missing = [t for t in _REQUIRED_T_DAYS if t not in have]
-    if not missing:
-        return
-    st.warning(
-        f"Die Trainingstabelle fuer {instr.label} enthaelt nur die Laufzeiten {sorted(have)} - "
-        f"es fehlen {len(missing)} von 90 (T_days 1..90). Einmal neu bauen (dauert laenger, siehe unten)."
-    )
-    if instr.key != "spx":
         st.info(
-            f"Automatischer Neubau ist aktuell nur fuer SPX verfuegbar (siehe Hinweis oben zu "
-            f"build_dataset.py) - fuer {instr.label} bitte, sobald build_dataset.py generalisiert "
-            "ist, nachziehen."
+            f"Noch keine Trainingstabelle fuer {instr.label} gefunden "
+            f"(`{_tt_file(instr).name}`)."
         )
-        return
-    if st.button("Trainingstabelle jetzt neu bauen (T_days 1-90)"):
+        missing = list(_REQUIRED_T_DAYS)
+    else:
+        missing = [t for t in _REQUIRED_T_DAYS if t not in have]
+        if not missing:
+            return
+        st.warning(
+            f"Die Trainingstabelle fuer {instr.label} enthaelt nur die Laufzeiten {sorted(have)} - "
+            f"es fehlen {len(missing)} von 90 (T_days 1..90). Einmal (neu) bauen (dauert laenger, siehe unten)."
+        )
+
+    if st.button(
+        f"Trainingstabelle fuer {instr.label} jetzt (neu) bauen (T_days 1-90)",
+        key=f"build_tt_{instr.key}",
+    ):
         script = Path(__file__).resolve().parent / "build_dataset.py"
-        with st.spinner("Baue Trainingstabelle - bitte warten, das kann mehrere Minuten dauern..."):
-            proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
+        with st.spinner(
+            f"Baue Trainingstabelle fuer {instr.label} - bitte warten, das kann mehrere Minuten dauern..."
+        ):
+            proc = subprocess.run(
+                [sys.executable, str(script), instr.key], capture_output=True, text=True,
+            )
         if proc.returncode == 0:
             try:
                 st.cache_data.clear()
@@ -201,7 +206,7 @@ def _ensure_training_table(instr: InstrumentConfig) -> None:
                 pass
             _ANALOG_CORE.clear()
             _TT_DAYS.clear()
-            st.success("Trainingstabelle neu gebaut. Seite wird neu geladen.")
+            st.success(f"Trainingstabelle fuer {instr.label} (neu) gebaut. Seite wird neu geladen.")
             st.rerun()
         else:
             st.error("build_dataset.py ist fehlgeschlagen:")
@@ -338,11 +343,8 @@ def _find_today_analogs(daily_df, chosen_dte_exact, max_distance, bandwidth, min
         training_table = load_training_table(instr)
         if training_table.empty:
             st.error(
-                f"Keine Trainingstabelle fuer {instr.label} gefunden - "
-                + ("`python src/build_dataset.py` ausfuehren."
-                   if instr.key == "spx" else
-                   "build_dataset.py ist fuer dieses Instrument noch nicht generalisiert "
-                   "(siehe Hinweis weiter oben).")
+                f"Keine Trainingstabelle fuer {instr.label} gefunden - siehe Hinweis/Button "
+                "weiter oben ('Trainingstabelle jetzt (neu) bauen')."
             )
             return None
         valid_t_days = available_t_days(training_table)

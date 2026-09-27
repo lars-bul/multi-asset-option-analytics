@@ -13,13 +13,21 @@ MULTI-INSTRUMENT-UMBAU: load_data()/load_training_table()/render_overview()
 nehmen jetzt zusaetzlich ein Instrument (instruments.InstrumentConfig)
 entgegen, statt fest data/spx_daily.parquet bzw. data/training_table.parquet
 zu laden. Der Dateiname kommt ueber instruments.data_file(instr, kind, DATA_DIR) -
-z.B. data/gold_daily.parquet, data/oil_training_table.parquet. Alles andere
-(Chart-Aufbau, NaN-Schutz, Kennzahlen) ist inhaltlich unveraendert gegenueber
-dem Original; lediglich die beiden SPX-spezifischen Hinweise (Shiller-
-Monatsdaten vor 1927-12-30) werden jetzt nur noch angezeigt, wenn
-instr.has_shiller_history True ist (aktuell nur SPX) - fuer alle anderen
-Instrumente waeren sie irrefuehrend, da deren 'resolution'-Spalte (falls
-vorhanden) nie 'monthly_interpolated' enthaelt.
+z.B. data/gold_daily.parquet, data/oil_training_table.parquet.
+
+KORREKTUR (Fruehgeschichte-Anzeige generalisiert, vorher SPX/Shiller-
+hartkodiert): render_overview() zeigte Checkbox/Hinweistext bisher mit fest
+eingebautem Text ("Robert Shillers Monatsdaten (seit 1871)") und einem
+hartkodierten Stichtag ("vor 1927-12-30"/"1928-01-01") - das war falsch/
+irrefuehrend, sobald ein ZWEITES Instrument (Gold) ebenfalls eine monatliche
+Fruehgeschichte bekommt (siehe instruments.py, has_shiller_history jetzt auch
+fuer Gold True, seit 1833, Weltbank-/Timothy-Green-Quelle statt Shiller).
+Jetzt generisch:
+  - Anzeigetext kommt aus instr.long_history_label (frei pro Instrument).
+  - Der Stichtag wird NICHT mehr hartkodiert, sondern aus den tatsaechlich
+    geladenen Daten bestimmt (erster Handelstag mit resolution=='daily').
+Bei allen anderen Instrumenten (has_shiller_history=False) bleibt das
+Verhalten unveraendert (keine Checkbox, kein Hinweistext).
 
 KORREKTUR (NaN-Schutz, unveraendert gegenueber dem Original): Die letzte(n)
 Zeile(n) von df/daily_df koennen einen NaN-Schlusskurs haben (z.B. ein
@@ -130,6 +138,18 @@ def _last_valid_closes(view: pd.DataFrame, n: int = 2) -> pd.Series:
     return view["close"].dropna().tail(n)
 
 
+def _first_real_daily_date(df: pd.DataFrame, has_resolution: bool) -> pd.Timestamp | None:
+    """Erster Handelstag mit ECHTEN Tagesdaten (resolution=='daily') - der
+    tatsaechliche Stichtag, ab dem die monatlich interpolierte Fruehgeschichte
+    (falls vorhanden, siehe instr.has_shiller_history) endet. Generisch statt
+    eines hartkodierten SPX-Datums, damit dieselbe Anzeige auch fuer Gold
+    (Stichtag 2004, nicht 1927) korrekt ist. None, falls nicht bestimmbar."""
+    if not has_resolution or "resolution" not in df.columns:
+        return None
+    real = df.loc[df["resolution"] == "daily", "date"]
+    return pd.Timestamp(real.min()) if len(real) else None
+
+
 def render_overview(df: pd.DataFrame, has_resolution: bool, instr: InstrumentConfig) -> pd.DataFrame:
     """Rendert den Teil, der IMMER sichtbar ist, egal welcher Modus oben
     gewaehlt ist: Sidebar-Abschnitt "Ansicht" (Zeitraum-Slider) + Candlestick-
@@ -142,22 +162,27 @@ def render_overview(df: pd.DataFrame, has_resolution: bool, instr: InstrumentCon
     ist die Datengrundlage, die alle Modi fuer ihre Backtests verwenden
     (unabhaengig vom "Anzahl Tage anzeigen"-Slider, der NUR den Chart hier
     betrifft, nicht die Backtest-Zeitraeume)."""
+    real_daily_start = _first_real_daily_date(df, has_resolution)
+
     with st.sidebar:
         st.header("Ansicht")
         st.caption(f"Instrument: **{instr.label}** ({instr.currency})")
         n_days = st.slider(
             "Anzahl Tage anzeigen", 60, len(df), min(750, len(df)), key=f"n_days_{instr.key}",
         )
-        # Die Shiller-Monatsreihe (vor 1927-12-30) gibt es NUR bei SPX (siehe
-        # instruments.py, has_shiller_history) - bei anderen Instrumenten waere
-        # diese Checkbox/der Hinweis unten irrefuehrend.
-        if has_resolution and instr.has_shiller_history:
+        # Monatliche Fruehgeschichte VOR den echten Tagesdaten - generisch fuer
+        # jedes Instrument mit has_shiller_history=True (aktuell SPX + Gold,
+        # siehe instruments.py). instr.long_history_label liefert den
+        # passenden Anzeigetext je Quelle.
+        if has_resolution and instr.has_shiller_history and real_daily_start is not None:
+            stichtag_label = (real_daily_start - pd.Timedelta(days=1)).date()
             only_real_daily = st.checkbox(
-                "Nur echte Tagesdaten (vor 1927-12-30 ausblenden)", value=False,
+                f"Nur echte Tagesdaten (vor {real_daily_start.date()} ausblenden)", value=False,
                 key=f"only_real_daily_{instr.key}",
-                help="Vor Ende 1927 gibt es keine echten taeglichen OHLC-Daten fuer den "
-                     "S&P - die Reihe davor ist aus Robert Shillers Monatsdaten (seit 1871) "
-                     "auf Handelstage vorwaertsgefuellt (open=high=low=close).",
+                help=f"Vor dem {real_daily_start.date()} gibt es fuer {instr.label} keine echten "
+                     f"taeglichen OHLC-Daten - die Reihe davor ist aus "
+                     f"{instr.long_history_label or 'einer monatlichen Reihe'} auf Handelstage "
+                     "vorwaertsgefuellt (open=high=low=close).",
             )
         else:
             only_real_daily = False
@@ -245,10 +270,12 @@ def render_overview(df: pd.DataFrame, has_resolution: bool, instr: InstrumentCon
     # Chart-Komponente beim Instrumentenwechsel sauber neu aufgebaut wird.
     renderLightweightCharts([{"chart": chart_options, "series": series}], key=f"chart_{instr.key}")
 
-    if has_resolution and instr.has_shiller_history and view["date"].min() < pd.Timestamp("1928-01-01"):
+    if (has_resolution and instr.has_shiller_history and real_daily_start is not None
+            and view["date"].min() < real_daily_start):
         st.caption(
-            "Hinweis: Kerzen vor 1927-12-30 zeigen keine echte Tagesspanne "
-            "(open=high=low=close), da nur monatliche Kursdaten existieren."
+            f"Hinweis: Kerzen vor {real_daily_start.date()} zeigen keine echte Tagesspanne "
+            f"(open=high=low=close), da fuer {instr.label} davor nur monatliche Kursdaten "
+            f"({instr.long_history_label or 'externe Quelle'}) existieren."
         )
 
     daily_df = df[df["resolution"] == "daily"] if has_resolution else df

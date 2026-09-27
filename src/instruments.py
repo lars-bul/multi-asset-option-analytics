@@ -33,12 +33,29 @@ spuerbar ueber laengere Zeitraeume, bei GLD sehr eng aber mit kleiner
 Verwaltungsgebuehr-Drift) - fuer ein Backtest-/Analog-Tool ein akzeptabler
 Kompromiss, aber kein Ersatz fuer eine echte Futures-Kurve.
 
-DATENTIEFE: nur SPX hat die Shiller-Monatsreihe (1871+) als Fallback fuer die
-Fruehgeschichte (siehe data_fetch.py). Die anderen Instrumente starten mit
-ihrer echten Yahoo-Finance-Historie:
+DATENTIEFE: SPX und Gold haben eine zusaetzliche MONATLICHE Fruehgeschichte
+vor Beginn der echten Tagesdaten (siehe has_shiller_history, long_history_label
+und data_fetch.fetch_and_save() / MONTHLY_HISTORY_FETCHERS):
+  - SPX:  Shiller-S&P-500-Monatsreihe (github.com/datasets/s-and-p-500),
+          seit 1871. ^GSPC (Tagesdaten) und die Shiller-Reihe sind BEIDE echte
+          Indexpunkte auf derselben Skala - werden nahtlos aneinandergehaengt,
+          OHNE Skalierung.
+  - Gold: Monatliche Weltbank-/Timothy-Green-Goldpreisreihe (github.com/
+          datasets/gold-prices), seit 1833, in absoluten USD/Feinunze.
+          WICHTIG: das ist NICHT dieselbe Skala wie der GLD-ETF-Kurs (die
+          echten Tagesdaten dieses Projekts fuer Gold, siehe oben) - GLD
+          bildet historisch ca. 1/10 Feinunze Gold ab, nicht exakt konstant
+          ueber die Jahrzehnte. data_fetch.py skaliert die Monatsreihe daher
+          beim Aufbau EINMALIG auf den tatsaechlichen GLD-Kurs am ersten
+          echten GLD-Handelstag (siehe data_fetch.scale_monthly_to_daily()) -
+          sonst entstuende an der Nahtstelle 2004 ein kuenstlicher ~10x-Sprung
+          (dieselbe Fehlerklasse wie ein Skalen-Mismatch zwischen chain_ticker
+          und price_ticker, hier aber in der Historie statt live).
+  Andere Instrumente (Russell 2000, Nasdaq-100, Nikkei, EuroStoxx50, Oel)
+  haben KEINE solche Fruehgeschichte - ihre Historie beginnt schlicht dort,
+  wo yfinance echte Tagesdaten liefert:
   ^RUT   ab ca. 1987/88          ^NDX  ab ca. 1985
-  ^N225  ab ca. 1965 (Yahoo)     GLD   ab 2004 (Auflage des ETF)
-  USO    ab 2006 (Auflage des ETF)
+  ^N225  ab ca. 1965 (Yahoo)     USO   ab 2006 (Auflage des ETF)
   ^STOXX50E ab ca. 1998 (der Index existiert erst seit 1998)
 
 DIVIDEND_YIELD wird bei Rohstoff-ETFs zur Naeherung fuer Verwaltungsgebuehr/
@@ -59,10 +76,15 @@ class InstrumentConfig:
     currency: str                   # "USD" | "EUR" | "JPY" - nur Anzeige, KEINE FX-Umrechnung im Projekt
     multiplier: float                # Punkte -> Geldbetrag je Kontrakt (Options-Kontraktgroesse)
     dividend_yield: float            # Default fuer forward_price(); bei Rohstoff-ETFs Naeherung, siehe oben
-    has_shiller_history: bool        # nur SPX: True
+    has_shiller_history: bool        # True = es gibt eine monatliche Fruehgeschichte (siehe Moduldokstring
+                                      # "DATENTIEFE") - Name aus Zeiten, als das nur fuer SPX/Shiller galt,
+                                      # gilt inzwischen generisch fuer jedes Instrument mit Eintrag in
+                                      # data_fetch.MONTHLY_HISTORY_FETCHERS.
     settlement: str                  # "cash_index" | "etf" | "future" (nur Doku/Info)
     chain_provider: str | None       # "yfinance" | "ib" | None | eigener registrierter Name
     chain_ticker: str | None = None       # yfinance-/Provider-Symbol der Kette, falls != price_ticker
+    long_history_label: str | None = None  # Anzeigetext fuer die monatliche Fruehgeschichte (dashboard_common.py) -
+                                            # None, wenn has_shiller_history False ist.
     ib_index_symbol: str | None = None    # IB-Symbol des Index (z.B. "ESTX50") - nur falls chain_provider="ib"
     ib_exchange: str | None = None        # IB-Boerse (z.B. "EUREX")
     ib_currency: str | None = None        # IB-Kontraktwaehrung, falls != currency
@@ -74,6 +96,7 @@ INSTRUMENTS: dict[str, InstrumentConfig] = {
         key="spx", label="S&P 500", price_ticker="^GSPC", currency="USD",
         multiplier=100.0, dividend_yield=0.015, has_shiller_history=True,
         settlement="cash_index", chain_provider="yfinance", chain_ticker="^SPX",
+        long_history_label="Robert Shillers Monatsdaten (seit 1871)",
         # WICHTIG: Kurshistorie ^GSPC, Kette aber ^SPX - Yahoo fuehrt die
         # SPX-Optionskette (CBOE-Feed) unter einem anderen Ticker als die
         # Index-Kurshistorie. Das war im urspruenglichen fetch_today_chain.py
@@ -84,7 +107,11 @@ INSTRUMENTS: dict[str, InstrumentConfig] = {
         multiplier=100.0, dividend_yield=0.013, has_shiller_history=False,
         settlement="cash_index", chain_provider="yfinance", chain_ticker="IWM",
         # HINWEIS: IWM ist ein ETF (Standard-Equity-Kontraktgroesse 100), NICHT
-        # identisch mit einer echten ^RUT-Indexoption bei CBOE.
+        # identisch mit einer echten ^RUT-Indexoption bei CBOE. price_ticker
+        # (^RUT, Indexpunkte ~2000-3000) und chain_ticker (IWM, ETF-Kurs
+        # ~1/10 davon) sind bewusst UNTERSCHIEDLICH skaliert - siehe
+        # dashboard_livechain._build_daily_df_with_today() fuer die
+        # Skalen-Korrektur beim synthetischen 'Heute'-Balken.
     ),
     "ndx": InstrumentConfig(
         key="ndx", label="Nasdaq-100", price_ticker="^NDX", currency="USD",
@@ -118,9 +145,14 @@ INSTRUMENTS: dict[str, InstrumentConfig] = {
     ),
     "gold": InstrumentConfig(
         key="gold", label="Gold (via GLD)", price_ticker="GLD", currency="USD",
-        multiplier=100.0, dividend_yield=0.0, has_shiller_history=False,
+        multiplier=100.0, dividend_yield=0.0, has_shiller_history=True,
         settlement="etf", chain_provider="yfinance", chain_ticker="GLD",
+        long_history_label="Weltbank-/Timothy-Green-Goldpreise (seit 1833, auf GLD-Skala umgerechnet)",
         # Kurs UND Kette durchgehend GLD (siehe Modul-Docstring) - kein GC=F mehr.
+        # has_shiller_history=True (GEAENDERT): erweitert die Historie ueber
+        # GLDs Auflegung (2004) hinaus mit monatlichen Goldpreisen seit 1833
+        # (siehe Moduldokstring "DATENTIEFE" und data_fetch.fetch_gold_monthly()/
+        # scale_monthly_to_daily() fuer die noetige Skalierung auf GLD-Niveau).
     ),
     "oil": InstrumentConfig(
         key="oil", label="Rohoel WTI (via USO)", price_ticker="USO", currency="USD",

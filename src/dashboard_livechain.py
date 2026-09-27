@@ -517,6 +517,11 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
         return None
     st.caption(f"{len(moves)} Analog-Tage nutzbar (von {len(analogs)} gefunden; gilt fuer alle Zeilen, "
                "stetige Kernel-Gewichte).")
+    # Fuer den Transparenz-Expander in render() (Teil B): zeigt, WELCHE
+    # historischen Tage mit welchem Gewicht/welcher Distanz und welcher
+    # tatsaechlich realisierten Bewegung in die Kennzahlen oben eingeflossen
+    # sind - Nachvollziehbarkeit statt Blackbox-Mittelwert.
+    st.session_state["livechain_analog_moves_debug"] = moves.copy()
 
     w = moves["weight"].to_numpy(dtype=float)
     w_sum = float(w.sum())
@@ -1213,6 +1218,73 @@ def render(df, daily_df, has_resolution, instr: InstrumentConfig) -> None:
             }, na_rep="n/a"),
             use_container_width=True, hide_index=True,
         )
+
+        # ── Transparenz: welche historischen Tage stecken dahinter? ──
+        moves_dbg = st.session_state.get("livechain_analog_moves_debug")
+        if moves_dbg is not None and not moves_dbg.empty:
+            with st.expander(
+                f"Welche historischen Tage stecken hinter der Analog-Bewertung? ({len(moves_dbg)} Tage)"
+            ):
+                st.caption(
+                    "Alle Tage, die in JEDE Zeile der Tabelle oben einfliessen (das Gewicht "
+                    "kommt aus der Aehnlichkeit zu 'heute' im PCA-Raum, NICHT aus dieser "
+                    "Zeile selbst - Put/Call-Strike sind je Zeile unterschiedlich, die "
+                    "Analog-Tage und ihre Gewichte aber gleich). Sortiert nach Gewicht "
+                    "absteigend - die obersten Zeilen dominieren den gewichteten Mittelwert "
+                    "am staerksten. 'Krisen-Fenster' markiert grob bekannte Stress-Perioden "
+                    "(1987-Crash, Finanzkrise 2008/09, Corona-Crash 2020) rein zur Orientierung "
+                    "- keine harte Kategorisierung."
+                )
+                _CRISIS_WINDOWS = [
+                    ("1987-10-01", "1987-11-15", "Crash Okt. 1987"),
+                    ("2008-09-01", "2009-03-31", "Finanzkrise 2008/09"),
+                    ("2020-02-15", "2020-04-15", "Corona-Crash 2020"),
+                ]
+                dbg = moves_dbg.sort_values("weight", ascending=False).copy()
+                dbg["weight_share_pct"] = dbg["weight"] / dbg["weight"].sum() * 100.0
+                dbg["ret_pct"] = dbg["ret"] * 100.0
+
+                def _tag_crisis(d: pd.Timestamp) -> str:
+                    for lo, hi, label in _CRISIS_WINDOWS:
+                        if pd.Timestamp(lo) <= d <= pd.Timestamp(hi):
+                            return label
+                    return ""
+                dbg["krisen_fenster"] = dbg["entry_date"].map(_tag_crisis)
+
+                top_n = min(50, len(dbg))
+                show_dbg = dbg.head(top_n)[[
+                    "entry_date", "exit_date", "distance", "weight", "weight_share_pct",
+                    "ret_pct", "hold_days", "krisen_fenster",
+                ]].rename(columns={
+                    "entry_date": "Entry-Datum", "exit_date": "Exit-Datum",
+                    "distance": "PCA-Distanz", "weight": "Kernel-Gewicht",
+                    "weight_share_pct": "Anteil am Gesamtgewicht %",
+                    "ret_pct": "Realisierte Bewegung %", "hold_days": "Haltedauer (Tage)",
+                    "krisen_fenster": "Krisen-Fenster",
+                })
+                st.dataframe(
+                    show_dbg.assign(**{
+                        "Entry-Datum": show_dbg["Entry-Datum"].dt.date,
+                        "Exit-Datum": show_dbg["Exit-Datum"].dt.date,
+                    }).style.format({
+                        "PCA-Distanz": "{:.4f}", "Kernel-Gewicht": "{:.4f}",
+                        "Anteil am Gesamtgewicht %": "{:.2f}", "Realisierte Bewegung %": "{:+.2f}",
+                        "Haltedauer (Tage)": "{:.0f}",
+                    }, na_rep=""),
+                    use_container_width=True, hide_index=True,
+                )
+
+                crisis_weight_share = float(dbg.loc[dbg["krisen_fenster"] != "", "weight"].sum()
+                                            / dbg["weight"].sum() * 100.0) if dbg["weight"].sum() > 0 else 0.0
+                top10_weight_share = float(dbg.head(min(10, len(dbg)))["weight"].sum()
+                                           / dbg["weight"].sum() * 100.0) if dbg["weight"].sum() > 0 else 0.0
+                st.caption(
+                    f"Anteil der oben markierten Krisen-Fenster am GESAMTGEWICHT: "
+                    f"**{crisis_weight_share:.1f}%**. Anteil der Top-10-Tage (nach Gewicht) am "
+                    f"Gesamtgewicht: **{top10_weight_share:.1f}%** - hoch (z.B. > 30-40%), bedeutet "
+                    "das Ergebnis haengt stark an wenigen Tagen, unabhaengig davon ob diese in "
+                    "einem Krisen-Fenster liegen oder nicht."
+                )
 
         # ── Position aus dieser Zeile ins Depot uebernehmen ──
         addable = merged.dropna(subset=["strike_put", "strike_call"])

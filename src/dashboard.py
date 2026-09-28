@@ -13,6 +13,11 @@ aendern kann, ohne den Rest lesen zu muessen):
   - dashboard_livechain.py Modus 3: Heutige Kette + Analog-Tabelle + Condor-Suche
   - dashboard_depot.py     Modus 4: Depot-Analyse (eigene Positionen, dauerhaft
                             gespeichert in data/depot.json)
+  - dashboard_pair.py      Modus 5: Pair-Trade zwischen zwei Instrumenten
+                            (z.B. Short SPX / Long NDX) - braucht IMMER zwei
+                            Instrumente gleichzeitig, waehlt sie deshalb selbst
+                            in der eigenen Sidebar statt den EINEN oben
+                            gewaehlten 'active_instrument' zu verwenden.
 
 Diese Datei selbst tut vier Dinge:
   1. Instrument-Auswahl oben (SIEHE MULTI-INSTRUMENT-HINWEIS UNTEN) - gilt fuer
@@ -55,16 +60,13 @@ Schritt ebenfalls generalisiert werden:
   2. dashboard_analog.py laedt seine eigene Trainingstabelle - aktuell noch
      der globale SPX-Pfad, unabhaengig vom oben gewaehlten Instrument.
 
-BENOETIGTE AENDERUNG IN dashboard_common.py (lag mir beim Schreiben nicht vor -
-bitte teilen, dann uebernehme ich das praezise statt zu raten):
-    load_data(instr: InstrumentConfig) -> pd.DataFrame
-        # statt load_data() - muss data/{instr.key}_daily.parquet laden
-        # (siehe instruments.data_file(instr, "daily", DATA_DIR)).
-    render_overview(df, has_resolution, instr: InstrumentConfig) -> pd.DataFrame
-        # statt render_overview(df, has_resolution) - instr wird nur fuer die
-        # Anzeige (z.B. Ueberschrift/Waehrung) gebraucht, die Chart-Logik
-        # selbst bleibt unveraendert.
-Bis dashboard_common.py entsprechend angepasst ist, LAEUFT DIESE DATEI NICHT.
+'Pair-Trade' (dashboard_pair.py, NEU) ist ein SONDERFALL: es braucht IMMER
+ZWEI Instrumente gleichzeitig (Lead/Short + Follower/Long) und waehlt beide
+DESHALB SELBST in seiner eigenen Sidebar, unabhaengig vom oben gewaehlten
+'active_instrument' (der nur als Vorauswahl-Vorschlag fuer die Lead-Seite
+dient). Es bekommt deshalb WEDER (df, daily_df, has_resolution) NOCH
+zusaetzlich instr, sondern NUR instr (als Vorschlag) - siehe _PAIR_MODES
+unten.
 """
 import sys
 import time
@@ -80,6 +82,7 @@ import dashboard_ladder
 import dashboard_analog
 import dashboard_livechain
 import dashboard_depot
+import dashboard_pair
 
 st.set_page_config(page_title="Multi-Asset Options Dashboard", layout="wide")
 
@@ -107,6 +110,7 @@ if _active_key != st.session_state["active_instrument"]:
         "livechain_analog_results", "livechain_analog_key", "livechain_analog_attempt",
         "livechain_condor", "livechain_condor_attempt",
         "depot_results",
+        "pair_result",
     ):
         st.session_state.pop(_k, None)
 st.session_state["active_instrument"] = _active_key
@@ -134,11 +138,19 @@ MODES = {
     "🔍 Analog-Tage-Matching": dashboard_analog,
     "⚡ Heutige Kette": dashboard_livechain,
     "💼 Depot-Analyse": dashboard_depot,
+    "🔀 Pair-Trade": dashboard_pair,
 }
 # Modi, die bereits vollstaendig auf Multi-Instrument umgestellt sind (bekommen
 # 'instr' als zusaetzliches Argument). Die anderen laufen unveraendert mit
 # (df, daily_df, has_resolution) - siehe Moduldokstring oben.
 _INSTRUMENT_AWARE_MODES = {"⚡ Heutige Kette", "💼 Depot-Analyse"}
+
+# Pair-Trade ist ein SONDERFALL (siehe Moduldokstring oben): braucht IMMER
+# zwei Instrumente, waehlt beide selbst in der eigenen Sidebar - bekommt
+# deshalb NUR 'instr' (als Vorauswahl-Vorschlag), NICHT (df, daily_df,
+# has_resolution), da die Kursdaten fuer BEIDE beteiligten Instrumente ohnehin
+# separat innerhalb von dashboard_pair.py geladen werden muessen.
+_PAIR_MODES = {"🔀 Pair-Trade"}
 
 # Standard-Modus beim Oeffnen der App: "Heutige Kette" - dadurch starten Kette, Analog-Tabelle und
 # Condor-Suche automatisch beim Start. Anderen Standard-Tab waehlen: DEFAULT_MODE aendern.
@@ -154,6 +166,8 @@ st.divider()
 _t1 = time.perf_counter()
 if active_mode_label in _INSTRUMENT_AWARE_MODES:
     MODES[active_mode_label].render(df, daily_df, has_resolution, instr)
+elif active_mode_label in _PAIR_MODES:
+    MODES[active_mode_label].render(instr)
 else:
     MODES[active_mode_label].render(df, daily_df, has_resolution)
 _t_mode = time.perf_counter() - _t1

@@ -175,6 +175,19 @@ class PairTradeConfig:
     require_lead_plateau: bool = True
     sort_by: str = "ror"
     max_grid_cells: int = 20_000
+    # GROESSEN-ANPASSUNG (Notional): SPX- und NDX-Punkte sind NICHT addierbar
+    # (NDX-Punkte sind ~3-4x groesser). P&L wird deshalb in GELD (Punkte x
+    # Multiplikator) je 1 LEAD-Kontrakt gerechnet; die Follower-Menge ist
+    # Kontrakte je Lead-Kontrakt = notional_ratio * Faktor, notional_ratio =
+    # (Lead-Spot*Lead-Mult)/(Follower-Spot*Follower-Mult). qty_factors ist ein
+    # DURCHSUCHTES Raster (1.0 = notional-neutral). Gleiche Waehrung
+    # vorausgesetzt (keine FX-Umrechnung im Projekt).
+    lead_multiplier: float = 100.0
+    follower_multiplier: float = 100.0
+    qty_factors: tuple = (1.0,)
+    # Optional: nur Kombis mit Netto-Cashflow >= diesem Geldbetrag (0.0 =
+    # 'kein Netto-Debit', verhindert Theta-Burner-Hedges). None = aus.
+    min_net_cashflow: float | None = None
 
 
 def _price_columns(table: pd.DataFrame, price_basis: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -301,51 +314,53 @@ def _plateau_ok(ok: np.ndarray, i: int) -> bool:
     return bool(i - 1 >= 0 and ok[i - 1] and i + 1 < n and ok[i + 1])
 
 
+def dedupe_strike_rows(table: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Entfernt Zeilen, deren (Put-Strike, Call-Strike) identisch zu einer
+    frueheren Zeile ist. build_symmetric_distance_table() rundet je Ziel-
+    Abstand auf den naechsten REAL vorhandenen Strike - bei einer duennen
+    Kette (typisch: NDX, weit entfernte Verfaelle) landen mehrere Abstaende
+    auf demselben Strike. Solche Duplikate wuerden als verschiedene Grid-
+    Punkte gezaehlt UND das Plateau-Kriterium aushebeln (Nachbarzeile =
+    dieselbe Zeile). Rueckgabe: (bereinigte Tabelle, Anzahl entfernt)."""
+    key = table[["strike_put", "strike_call"]].apply(pd.to_numeric, errors="coerce").round(6)
+    dup = key.duplicated(keep="first").to_numpy()
+    return table.loc[~dup].reset_index(drop=True), int(dup.sum())
+
+
 def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame,
                         pair_moves: pd.DataFrame,
                         lead_spot_today: float, follower_spot_today: float,
                         cfg: PairTradeConfig | None = None) -> pd.DataFrame:
     """Durchsucht das VOLLE kartesische Produkt aus Lead-Strike-Paaren
-    (i<j auf lead_table) x Follower-Strike-Paaren (i'<j' auf
-    follower_table) und bewertet DREI moegliche Strukturen je Kombination:
-      'put_spread'  - NUR die Put-Seite (Lead Short Put Spread / Follower
-                       Long Put Spread) - die MINIMALE nutzbare Struktur.
-      'call_spread' - NUR die Call-Seite, analog.
-      'iron_condor' - Put- UND Call-Seite zusammen (Lead = klassischer Iron
-                       Condor, Follower = 'Reverse Iron Condor').
-    Alle drei werden zurueckgegeben (Spalte 'structure') - das Ranking
-    (cfg.sort_by, absteigend nach 'passes' dann nach sort_by) entscheidet,
-    welche Struktur+Strikes am Ende vorne liegt. Es wird also NICHT vorher
-    auf eine Struktur festgelegt.
+    (i<j auf lead_table) x Follower-Strike-Paaren (i'<j' auf follower_table)
+    x Follower-Mengenfaktoren (cfg.qty_factors) und bewertet DREI Strukturen:
+      'put_spread'  - NUR Put-Seite (Lead Short Put Spread / Follower Long
+                       Put Spread) - die MINIMALE nutzbare Struktur.
+      'call_spread' - NUR Call-Seite, analog.
+      'iron_condor' - Put- UND Call-Seite (Lead = Iron Condor, Follower =
+                       'Reverse Iron Condor').
+    Das Ranking (cfg.sort_by) entscheidet, welche Struktur vorne liegt.
 
-    SIMULATIONSTECHNIK (wichtig, siehe Klarstellung vor dieser Implementierung):
-    wie bei condor_search.py und ANDERS als beim reinen Analog-Tage-Matching
-    (analog_matching.evaluate_analog_set, das Strikes PRO Analog-Tag neu
-    ueber ein Ziel-Delta herleitet) werden hier die HEUTIGEN, ECHTEN Strikes/
-    Bid-Ask-Preise aus lead_table/follower_table fest verwendet - NUR die
-    prozentuale Bewegung der Analog-Tage (siehe pair_analog_moves()) wird
-    auf den heutigen Spot projiziert. Es gibt HIER keinerlei Delta-Solve/
-    Black-76-Neubewertung je Analog-Tag.
+    EINHEITEN: alle Geldgroessen in GELD je 1 Lead-Kontrakt (Punkte x
+    Multiplikator). Follower-Menge 'follower_qty' = Kontrakte je Lead-
+    Kontrakt (siehe PairTradeConfig, Notional-Anpassung). Vorher wurden
+    SPX- und NDX-PUNKTE direkt addiert - dimensional falsch, die Seite mit
+    dem groesseren Indexstand dominierte.
+
+    SIMULATIONSTECHNIK wie condor_search.py: HEUTIGE echte Strikes/Bid-Ask
+    fest, nur die %-Bewegung der Analog-Tage wird auf den heutigen Spot
+    projiziert (kein Delta-Solve je Analog-Tag).
 
     Kombinierter Max-Loss = Lead-Max-Loss + Follower-Max-Loss (konservative
-    ADDITIVE Schranke - der wahre gemeinsame Worst-Case waere ein Optimum
-    ueber den gemeinsamen (S_lead, S_follower)-Raum unter Beruecksichtigung
-    der Korrelation, was hier NICHT berechnet wird. Die additive Schranke
-    ist pessimistischer als der reale korrelierte Worst-Case, also
-    konservativ - eine bewusste Modellentscheidung, kein Automatismus aus
-    condor_search.py, wo es dieses Problem bei nur einem Instrument nicht gibt).
+    additive Schranke, kein korreliertes Optimum).
 
-    PERFORMANCE-WARNUNG: die Kosten skalieren mit
-    (n_lead_pairs * n_follower_pairs), n_pairs = n_rows*(n_rows-1)/2 JE
-    Tabelle. Bei den ueblichen ~24 Distanz-Zeilen aus dashboard_livechain.py
-    ergäbe das ~276 Paare je Seite, also ~76.000 Lead-x-Follower-
-    Kombinationen x 3 Strukturen = weit ueber 200.000 HAC-Berechnungen JE
-    getesteter Laufzeit-Paarung - nicht praktikabel. cfg.max_grid_cells
-    bricht deshalb hart ab (ValueError) statt minutenlang zu rechnen. Im
-    Dashboard sollte das Distanz-Raster fuer diesen Modus DEUTLICH groeber
-    sein als bei der Einzel-Instrument-Suche (z.B. 8-12 statt 24 Zeilen je
-    Tabelle - das ergibt bereits ~28-66 Paare je Seite, also ~800-4.400
-    Kombinationen, praktikabel)."""
+    NICHT enthalten: kein Hedge-Wirksamkeits-Kriterium. Das Ranking belohnt
+    Rendite/Risiko der KOMBINATION; ob die Follower-Seite den Lead wirklich
+    absichert, wird nicht geprueft (siehe cfg.min_net_cashflow als grober
+    Schutz gegen Theta-Burner).
+
+    PERFORMANCE: Zellen = Lead-Paare x Follower-Paare x Mengenfaktoren;
+    cfg.max_grid_cells bricht hart ab."""
     if cfg is None:
         cfg = PairTradeConfig()
     if pair_moves.empty:
@@ -353,18 +368,31 @@ def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame,
 
     lead_table = lead_table.sort_values("distance_pct").reset_index(drop=True)
     follower_table = follower_table.sort_values("distance_pct").reset_index(drop=True)
+    lead_table, n_lead_dup = dedupe_strike_rows(lead_table)
+    follower_table, n_foll_dup = dedupe_strike_rows(follower_table)
     n_lead, n_follower = len(lead_table), len(follower_table)
+
+    qty_factors = tuple(cfg.qty_factors) or (1.0,)
+    notional_ratio = (lead_spot_today * cfg.lead_multiplier) / (follower_spot_today * cfg.follower_multiplier)
+    lm, fm = float(cfg.lead_multiplier), float(cfg.follower_multiplier)
+
+    def _finish(df: pd.DataFrame) -> pd.DataFrame:
+        df.attrs["dedupe_dropped"] = (n_lead_dup, n_foll_dup)
+        df.attrs["notional_ratio"] = notional_ratio
+        df.attrs["n_lead_rows"], df.attrs["n_follower_rows"] = n_lead, n_follower
+        return df
 
     n_lead_pairs = n_lead * (n_lead - 1) // 2
     n_follower_pairs = n_follower * (n_follower - 1) // 2
-    n_cells = n_lead_pairs * n_follower_pairs
+    n_cells = n_lead_pairs * n_follower_pairs * len(qty_factors)
     if n_cells > cfg.max_grid_cells:
         raise ValueError(
-            f"Grid zu gross: {n_lead_pairs} Lead-Paare x {n_follower_pairs} "
-            f"Follower-Paare = {n_cells:,} Kombinationen (Grenze: "
-            f"{cfg.max_grid_cells:,}). Distanz-Raster fuer Lead und/oder "
-            "Follower verkleinern (weniger Ziel-Abstaende in der Kette-Tabelle)."
+            f"Grid zu gross: {n_lead_pairs} Lead-Paare x {n_follower_pairs} Follower-Paare x "
+            f"{len(qty_factors)} Mengenfaktoren = {n_cells:,} Kombinationen (Grenze: "
+            f"{cfg.max_grid_cells:,}). Distanz-Raster oder Mengenfaktoren verkleinern."
         )
+    if n_lead_pairs == 0 or n_follower_pairs == 0:
+        return _finish(pd.DataFrame())
 
     w = pair_moves["weight"].to_numpy(float)
     dates = pair_moves["entry_date"].to_numpy()
@@ -388,10 +416,6 @@ def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame,
     lead_ok = _lead_short_validity(lead_bid_p, lead_bid_c, pay_p_lead, pay_c_lead, w, dates, hold, train_mask, cfg.t_min)
 
     def _lead_pairs():
-        # i = innere/nahe Zeile (wird geshortet), j = Fluegel-Zeile (long) -
-        # bei BEIDEN Seiten (Put UND Call) ist i>0 immer die Zeile mit dem
-        # KLEINEREN distance_pct, unabhaengig vom Strike-Vorzeichen (siehe
-        # _vertical_spread-Docstring).
         for i in range(n_lead - 1):
             for j in range(i + 1, n_lead):
                 put = _vertical_spread(lead_Kp[i], lead_Kp[j], lead_bid_p[i], lead_ask_p[i],
@@ -432,32 +456,43 @@ def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame,
             for structure, lead_leg, foll_leg in structures:
                 l_net, l_max, l_pay = lead_leg
                 f_net, f_max, f_pay = foll_leg
-                pnl_d = (l_net - l_pay) + (f_net + f_pay)
-                combined_max_loss = l_max + f_max
-                if combined_max_loss <= 0.0:
-                    continue
+                lead_pnl = lm * (l_net - l_pay)              # GELD je Lead-Kontrakt
+                foll_pnl_pts = f_net + f_pay                 # Follower in PUNKTEN je Follower-Kontrakt
 
-                stats = weighted_pnl_stats(pnl_d, w, dates, hold, train_mask, combined_max_loss, cfg.tail_quantile)
-                flags = criteria_flags(stats, cfg)
+                for factor in qty_factors:
+                    q = notional_ratio * factor              # Follower-Kontrakte je Lead-Kontrakt
+                    f_scale = q * fm
+                    combined_net = lm * l_net + f_scale * f_net
+                    if cfg.min_net_cashflow is not None and combined_net < cfg.min_net_cashflow:
+                        continue
+                    combined_max_loss = lm * l_max + f_scale * f_max
+                    if combined_max_loss <= 0.0:
+                        continue
+                    pnl_d = lead_pnl + f_scale * foll_pnl_pts
 
-                rows.append({
-                    "structure": structure,
-                    "lead_i": li, "lead_j": lj, "follower_i": fi, "follower_j": fj,
-                    "lead_short_distance": float(lead_table["distance_pct"].iloc[li]),
-                    "lead_wing_distance": float(lead_table["distance_pct"].iloc[lj]),
-                    "follower_short_distance": float(follower_table["distance_pct"].iloc[fi]),
-                    "follower_wing_distance": float(follower_table["distance_pct"].iloc[fj]),
-                    "net_cashflow": l_net + f_net, "max_loss": combined_max_loss,
-                    "lead_net_cashflow": l_net, "follower_net_cashflow": f_net,
-                    **stats, **flags,
-                    "c_lead_plateau": lead_plateau_ok,
-                })
+                    stats = weighted_pnl_stats(pnl_d, w, dates, hold, train_mask, combined_max_loss, cfg.tail_quantile)
+                    flags = criteria_flags(stats, cfg)
+
+                    rows.append({
+                        "structure": structure,
+                        "lead_i": li, "lead_j": lj, "follower_i": fi, "follower_j": fj,
+                        "lead_short_distance": float(lead_table["distance_pct"].iloc[li]),
+                        "lead_wing_distance": float(lead_table["distance_pct"].iloc[lj]),
+                        "follower_short_distance": float(follower_table["distance_pct"].iloc[fi]),
+                        "follower_wing_distance": float(follower_table["distance_pct"].iloc[fj]),
+                        "follower_qty": q, "qty_factor": factor,
+                        "net_cashflow": combined_net, "max_loss": combined_max_loss,
+                        "lead_net_cashflow": lm * l_net, "follower_net_cashflow": f_scale * f_net,
+                        **stats, **flags,
+                        "c_lead_plateau": lead_plateau_ok,
+                    })
 
     result = pd.DataFrame(rows)
     if result.empty:
-        return result
+        return _finish(result)
 
     result["passes"] = result["c_base"] & result["c_lead_plateau"]
     if cfg.sort_by not in ("ror", "mean", "tstat"):
         raise ValueError(f"sort_by muss 'ror', 'mean' oder 'tstat' sein (erhalten: {cfg.sort_by!r}).")
-    return result.sort_values(["passes", cfg.sort_by], ascending=[False, False]).reset_index(drop=True)
+    result = result.sort_values(["passes", cfg.sort_by], ascending=[False, False]).reset_index(drop=True)
+    return _finish(result)

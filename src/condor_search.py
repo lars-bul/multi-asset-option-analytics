@@ -13,6 +13,13 @@ Condor(i, j) = Short-Zeile i, Fluegel-Zeile j (groesserer Abstand):
   pnl_d    = credit - payout_d          (additiv: Put-Spread + Call-Spread)
 
 Voraussetzung: analog_matching._hac_se_weighted_mean (kommt mit apply_patches.py).
+
+KORREKTUR (Regression behoben): der Umbau zu weighted_pnl_stats() hatte
+versehentlich criteria_flags() und analog_robustness() entfernt - beide
+werden noch gebraucht (criteria_flags() jetzt zusaetzlich von
+pair_trade_search.py, analog_robustness() von dashboard_livechain.py's
+_run_bulk_analog()). Wieder ergaenzt, unveraendert gegenueber der
+urspruenglichen Fassung.
 """
 from __future__ import annotations
 
@@ -58,29 +65,37 @@ def _weighted_quantile(x: np.ndarray, w: np.ndarray, q: float) -> float:
     return float(np.interp(q, cw, x))
 
 
-def weighted_pnl_stats(x: np.ndarray, w: np.ndarray, dates, hold: int, train_mask: np.ndarray,
-                       max_loss: float | None, tail_quantile: float = 0.05) -> dict:
-    """GEMEINSAME Kennzahlen-Rechnung fuer Iron-Condor-Suche UND Depot-Analyse (eine Funktion ->
-    identische Zahlen). x = P&L je Analog-Tag in heutigen Punkten, w = Kernel-Gewichte.
+def weighted_pnl_stats(x: np.ndarray, w: np.ndarray, dates, hold_days: int,
+                        train_mask: np.ndarray, max_loss: float,
+                        tail_quantile: float = 0.05) -> dict:
+    """Gewichtete P&L-Kennzahlen fuer EINE Zeile/Kombination auf den Analog-Tagen:
+    E[P&L] ('mean'), Rendite/Risiko ('ror' = mean/max_loss), HAC-t-Stat (Bartlett-
+    Kernel, Kalenderzeit, ueber _hac_se_weighted_mean), Train-/Val-Split-Mittelwerte
+    ('e_train'/'e_val'), Anteil/Anzahl Tage mit vollem Max-Loss ('full_loss_share'/
+    'n_full_loss'), gewichtetes tail_quantile-Quantil von x/max_loss ('q_tail') und
+    gewichtete Gewinnrate ('win_rate_pct').
 
-    Ist max_loss None/nicht endlich/<=0 (unbegrenztes Risiko), sind alle auf den Max-Loss bezogenen
-    Groessen (ror, full_loss_share, n_full_loss, q_tail) NaN - E[P&L], t-Stat, Train/Val und
-    Gewinnrate bleiben davon unabhaengig gueltig."""
+    x: P&L je Analog-Tag (gleiche Laenge wie w/dates), bereits auf der gewuenschten
+       Basis (z.B. Condor-P&L oder Depot-Restgewinn).
+    max_loss: Bezugsgroesse fuer 'ror'/'full_loss_share'/'n_full_loss'/'q_tail'.
+       Bei unbegrenztem Risiko float('inf') (oder <= 0) uebergeben - diese vier
+       Kennzahlen werden dann NaN/None, der Rest bleibt reguraer berechnet."""
     W = w.sum()
     mean = float(w @ x / W)
-    se, _ = _hac_se_weighted_mean(dates, w, x, mean, int(hold) + 1)
+    se, _ = _hac_se_weighted_mean(dates, w, x, mean, hold_days + 1)
 
     def wm(mask):
         s = w[mask].sum()
         return float(w[mask] @ x[mask] / s) if s > 0 else np.nan
 
-    bounded = max_loss is not None and np.isfinite(max_loss) and max_loss > 0
+    bounded = np.isfinite(max_loss) and max_loss > 0.0
     return {
-        "mean": mean, "ror": mean / max_loss if bounded else np.nan,
+        "mean": mean,
+        "ror": (mean / max_loss) if bounded else np.nan,
         "tstat": mean / se if se > 0 else np.nan,
         "e_train": wm(train_mask), "e_val": wm(~train_mask),
         "full_loss_share": float(w[x <= -max_loss + 1e-7].sum() / W) if bounded else np.nan,
-        "n_full_loss": int((x <= -max_loss + 1e-7).sum()) if bounded else None,   # ABSOLUT; 0 = nur "nicht beobachtet"
+        "n_full_loss": int((x <= -max_loss + 1e-7).sum()) if bounded else None,
         "q_tail": _weighted_quantile(x / max_loss, w, tail_quantile) if bounded else np.nan,
         "win_rate_pct": float(w[x >= 0].sum() / W * 100.0),
     }
@@ -125,10 +140,6 @@ def analog_robustness(moves: pd.DataFrame, pnl: np.ndarray) -> dict:
         "subperiod_matching": rel_full["subperiod_matching"], "subperiod_nonempty": rel_full["subperiod_nonempty"],
         "tstat_val": val_rel["tstat"], "robust_train_val": robust, "robust_train_val_neg": robust_neg,
     }
-
-
-def _stats(x: np.ndarray, w: np.ndarray, ctx: dict, max_loss: float, cfg: CondorConfig) -> dict:
-    return weighted_pnl_stats(x, w, ctx["dates"], ctx["hold"], ctx["train"], max_loss, cfg.tail_quantile)
 
 
 def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: float,
@@ -210,7 +221,8 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
                 if r is None:
                     continue
                 credit, width, pnl = r
-                st_ = _stats(pnl, w, ctx, width - credit, cfg)
+                st_ = weighted_pnl_stats(pnl, w, ctx["dates"], ctx["hold"], ctx["train"],
+                                          width - credit, cfg.tail_quantile)
                 legs[side] = (credit, width, pnl, st_)
                 K = Kp if side == "put" else Kc
                 side_rows.append({
@@ -233,7 +245,8 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
                 "strike_call_short": Kc[i], "strike_call_wing": Kc[j],
                 "credit": credit, "max_loss": max_loss,
                 "e_put_spread": sp_stats["mean"], "e_call_spread": sc_stats["mean"],
-                **_stats(pp + pc, w, ctx, max_loss, cfg),
+                **weighted_pnl_stats(pp + pc, w, ctx["dates"], ctx["hold"], ctx["train"],
+                                      max_loss, cfg.tail_quantile),
             })
 
     cdf, sdf = pd.DataFrame(cond_rows), pd.DataFrame(side_rows)

@@ -1,69 +1,43 @@
 """
-Pair-Trade-Kern: verbindet die Analog-Tage EINES fuehrenden Instruments
-(auf dem geshortet wird - bestimmt den Aehnlichkeitsraum, siehe
+Pair-Trade-Kern: verbindet die Analog-Tage EINES fuehrenden Instruments (Lead,
+auf dem geshortet wird - bestimmt den Aehnlichkeitsraum, siehe
 analog_matching.find_analogs) mit der tatsaechlichen historischen Bewegung
-EINES ZWEITEN (Follower-)Instruments an GENAU DENSELBEN Kalendertagen.
+EINES ZWEITEN Instruments (Follower) an GENAU DENSELBEN Kalendertagen.
 
-WARUM ein Instrument fuehrend sein muss: der PCA-Aehnlichkeitsraum ist eine
-Eigenschaft EINES Kursverlaufs. "Aehnliche Tage" kann man nur relativ zu
-EINEM Referenz-Instrument definieren. Das Follower-Instrument wird an GENAU
-DIESEN Tagen mitbetrachtet (siehe pair_analog_moves - eine gemeinsame Zeile
-je Analog-Tag, Lead- UND Follower-Rendite VOM SELBEN Kalendertag), nicht
-ueber einen eigenen Aehnlichkeitsraum gesucht.
+ABLAUF von evaluate_pair_grid():
+  1. Kreuzmenge: alle Lead-Spreads x alle Follower-Spreads x Mengenfaktoren x
+     3 Strukturen (put_spread / call_spread / iron_condor).
+  2. JEDE Kombination bekommt EINE Zeile. EINZIGER Ausschlussgrund:
+       'ungueltige_bepreisung' - ein Bein hat keinen gueltigen Bid/Ask-Spread
+     Alles andere wird bewertet. Die Vola-Breiten-Regel (3.) ist nur noch die
+     Info-Spalte 'vol_rule_ok' und schliesst nichts aus.
+  3. VOLA-BREITEN-REGEL (nur Info): hat der Lead die hoehere spread-eigene IV,
+     "soll" sein Spread (in % vom Spot) breiter sein, bei niedrigerer IV
+     schmaler. Ergebnis steht in 'vol_rule_ok'.
+  4. ROBUSTHEIT NUR AUF DEM GESAMTSPREAD (Lead + Follower zusammen):
+     Train>0, Val>0, HAC-t>Schwelle, Tail. KEINE Einzelbein-Tests.
+  5. Ausgabe: alle Zeilen; sortiert erst nach 'tested', dann 'passes', dann
+     nach Verlustwahrscheinlichkeit (aufsteigend).
 
-UMBAU (siehe Chat vor dieser Version) - drei Aenderungen:
-
-  1. KEINE EINZELBEIN-ROBUSTHEITSTESTS MEHR. Die alte Version pruefte VOR der
-     eigentlichen Bewertung zusaetzlich, ob der NACKTE Lead-Short-Strangle an
-     jedem Abstand fuer sich robust profitabel ist (_lead_short_validity) und
-     verlangte ein 'Plateau' (Nachbar-Strikes ebenfalls robust,
-     require_lead_plateau). Das ist jetzt komplett entfernt. Robustheit
-     (Train>0, Val>0, t>Schwelle, Tail) wird NUR NOCH auf dem GESAMTSPREAD
-     gemessen (der tatsaechlich gehandelten Kombination aus Lead- UND
-     Follower-Bein zusammen) - ob ein einzelnes Bein fuer sich signifikant
-     waere, spielt fuer die Aufnahme in die Ergebnistabelle keine Rolle mehr.
-
-  2. VOLA-BREITEN-KONSISTENZ statt Plateau als Vorfilter. Fuer jeden
-     Kandidaten-Spread (Lead UND Follower) wird die spread-EIGENE implizite
-     Vola aus der Distanz-Tabelle verwendet (Spalte 'iv_pair_pct' - die
-     tatsaechliche Markt-Paket-IV an genau diesen Strikes, siehe
-     chain_delta.build_symmetric_distance_table). Regel: die Seite mit der
-     HOEHEREN Grundvolatilitaet muss die (in Prozent vom Spot) BREITERE
-     Spread-Weite haben. Ein Lead-Spread auf einem sehr volatilen Basiswert,
-     der genauso eng ist wie ein ruhiger Follower-Spread, wuerde strukturell
-     viel oefter verletzt - das schliesst diese Schiefe aus, BEVOR die teure
-     Tagesbewegungs-Simulation laeuft (guenstiger frueher Ausschluss).
-
-  3. EMPIRISCHER statt theoretischer Max-Verlust. Vorher wurde der Max-
-     Verlust als theoretische Summe der beiden EINZELNEN Bein-Max-Verluste
-     berechnet (Lead-Breite + Follower-Breite in Geld) - eine konservative
-     obere Schranke, die annimmt, dass BEIDE Seiten unabhaengig voneinander
-     gleichzeitig ihren jeweiligen Extremfall treffen. Das ist nicht falsch
-     als Schranke, aber irrefuehrend als 'Max-Verlust', wenn man ohnehin
-     schon die historische Gemeinsam-Bewegung simuliert (Lead UND Follower
-     IMMER vom selben Kalendertag, also mit der TATSAECHLICH beobachteten
-     Korrelation). Jetzt: max_loss = der schlechteste TATSAECHLICH
-     SIMULIERTE Tag (-min(pnl_d) ueber die gemeinsamen Analog-Tage). Das ist
-     der ehrliche empirische Wert fuer GENAU DIESE Historie - er kann eine
-     zukuenftige, in der Historie nicht vorgekommene Extremkombination
-     unterschaetzen (endliche Stichprobe), aber ueberschaetzt das Risiko
-     nicht mehr durch eine nie beobachtete Korrelationsannahme.
-
-  Zusaetzlich neu: 'loss_prob_pct' (gewichtete Verlustwahrscheinlichkeit =
-  Anteil der Analog-Tage mit pnl_d < 0) als explizite Kennzahl, und
-  Standard-Sortierung danach (aufsteigend, gemeinsam mit 'passes').
-
-  4. ALLE GEPRUEFTEN PAARE WERDEN AUSGEGEBEN. Vorher wurden Kombinationen,
-     die den Vola-Breiten-Filter oder die Max-Verlust>0-Pruefung nicht
-     bestanden, STILL aus dem Ergebnis entfernt - nicht nachvollziehbar,
-     welche Paare ueberhaupt getestet und warum sie verworfen wurden. Jetzt
-     bekommt JEDE strukturell moegliche Kombination (gueltige Bein-Bepreisung
-     auf beiden Seiten) eine Zeile im Ergebnis, mit 'tested' (bool) und
-     'exclude_reason' ('' bei tested=True, sonst 'vola_breite',
-     'min_net_cashflow' oder 'max_loss<=0'). Nur Kombinationen, bei denen
-     KEINE der drei Strukturen (put_spread/call_spread/iron_condor) ueberhaupt
-     eine gueltige Bein-Bepreisung hat, werden gar nicht erst als Zeile
-     angelegt (da fehlt eine Struktur zum Benennen).
+MAX-VERLUST (korrigiert) - warum die alte Version falsch war:
+  Alt (a): Iron Condor = Summe von Put- UND Call-Max-Loss. Ein Condor kann aber
+           nie beide Seiten gleichzeitig verlieren -> ueberschaetzt.
+  Alt (b): '-min(pnl_d)' ueber die Analog-Tage. Das ist der schlechteste
+           BEOBACHTETE Tag, kein Max-Verlust: bei gutartiger Historie winzig
+           -> 'ror' (= mean/max_loss) und die Tail-Kennzahlen ('q_tail',
+           'full_loss_share') werden aufgeblaeht bzw. bedeutungslos.
+  Neu ('structural', Standard): der EXAKTE Max-Verlust der Gesamtposition.
+           Der Gesamt-Payoff ist stueckweise linear und SEPARABEL in
+           (S_lead, S_follower): pnl = f(S_lead) + g(S_follower). Das Minimum
+           einer separablen Summe ist die Summe der Minima, und jedes
+           Minimum liegt an einem Knickpunkt (S=0 oder einem der Strikes).
+           Daher wird jedes Bein-Paket an {0} + seinen Strikes ausgewertet
+           (Condor: korrekt max(Put-, Call-Verlust), nicht die Summe).
+           Das ist die garantierte Obergrenze OHNE Annahme ueber die
+           Korrelation. Zusaetzlich wird 'max_loss_hist' (schlechtester
+           simulierter Tag) als Info-Spalte ausgegeben; mit
+           cfg.max_loss_basis='empirical' kann er als Bezugsgroesse gewaehlt
+           werden.
 """
 from __future__ import annotations
 
@@ -81,30 +55,19 @@ _NAN_STATS = {
 _NAN_FLAGS = {"c_train": False, "c_val": False, "c_t": False, "c_tail": False, "c_base": False}
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  Analog-Bewegungen (Lead + Follower vom SELBEN Kalendertag)
+# ═══════════════════════════════════════════════════════════════════════
+
 def pair_analog_moves(analogs: pd.DataFrame, lead_training_table: pd.DataFrame,
                        follower_daily_df: pd.DataFrame, T_days: int,
                        query_date: pd.Timestamp | None = None) -> pd.DataFrame:
-    """Fuer jeden Lead-Analog-Tag (aus analog_matching.find_analogs(),
-    Spalten 'analog_date', 'distance', 'weight'): die Lead-Rendite kommt aus
-    lead_training_table (wie in condor_search.analog_moves() - entry_S/exit_S
-    fuer dasselbe T_days), die Follower-Rendite wird HIER direkt aus der
-    taeglichen Kurshistorie des Follower-Instruments (follower_daily_df,
-    Spalten 'date','close') ermittelt: Follower-Entry = Schlusskurs an
-    exakt demselben Kalendertag wie der Lead-Analog-Tag, Follower-Exit = der
-    erste Handelstag mit mindestens T_days Kalendertagen Abstand (identische
-    Konvention zu labels.generate_strangle_labels/backtest.run_daily_ladder).
-    Dadurch beziehen sich Lead- UND Follower-Rendite IMMER auf dieselben
-    Kalendertage - Voraussetzung fuer den empirischen Max-Verlust unten.
-
-    query_date (optional): wie in analog_matching.evaluate_analog_set -
-    Zeilen, deren Exit NACH query_date liegt, werden verworfen (Kausalitaet
-    bei langen Laufzeiten).
-
-    Rueckgabe: entry_date, hold_days, weight, distance,
-    lead_ret (= exit_S/entry_S - 1 des FUEHRENDEN Instruments),
-    follower_ret (dieselbe Definition fuer das FOLGE-Instrument). Tage ohne
-    Follower-Kurs werden herausgefiltert; deren Anzahl steht in
-    out.attrs['n_no_follower_match'] (Diagnose/Anzeige)."""
+    """Je Lead-Analog-Tag: Lead-Rendite aus der training_table, Follower-Rendite
+    aus dessen Tageskursen (Entry = Schlusskurs am selben Kalendertag, Exit =
+    erster Handelstag mit >= T_days Kalendertagen Abstand). query_date: Exit
+    nach query_date wird verworfen (Kausalitaet). Rueckgabe: entry_date,
+    hold_days, weight, distance, lead_ret, follower_ret (+ Entry/Exit-Kurse);
+    out.attrs['n_no_follower_match'] = Anzahl verworfener Tage."""
     follower_daily_df = follower_daily_df.sort_values("date").reset_index(drop=True)
     follower_dates = follower_daily_df["date"].to_numpy()
     follower_closes = follower_daily_df["close"].to_numpy()
@@ -112,8 +75,7 @@ def pair_analog_moves(analogs: pd.DataFrame, lead_training_table: pd.DataFrame,
     tt = lead_training_table[lead_training_table["T_days"] == T_days].set_index("entry_date")
     q_ts = pd.Timestamp(query_date) if query_date is not None else None
 
-    rows = []
-    n_no_follower_match = 0
+    rows, n_no_follower_match = [], 0
     for _, arow in analogs.iterrows():
         d = arow["analog_date"]
         if d not in tt.index:
@@ -126,25 +88,20 @@ def pair_analog_moves(analogs: pd.DataFrame, lead_training_table: pd.DataFrame,
 
         lead_ret = trow["exit_S"] / trow["entry_S"] - 1.0
 
-        # Follower-Entry: Schlusskurs an GENAU diesem Kalendertag.
-        follower_entry_idx = np.searchsorted(follower_dates, np.datetime64(d), side="left")
-        if follower_entry_idx >= len(follower_dates) or follower_dates[follower_entry_idx] != np.datetime64(d):
+        entry_idx = np.searchsorted(follower_dates, np.datetime64(d), side="left")
+        if entry_idx >= len(follower_dates) or follower_dates[entry_idx] != np.datetime64(d):
             n_no_follower_match += 1
             continue
-        # Follower-Exit: erster Handelstag mit >= T_days Kalendertagen Abstand
-        # (identische Konvention zur Lead-Seite, siehe labels.py/backtest.py).
         target_exit = np.datetime64(d) + np.timedelta64(T_days, "D")
-        follower_exit_idx = np.searchsorted(follower_dates, target_exit, side="left")
-        if follower_exit_idx >= len(follower_dates):
+        exit_idx = np.searchsorted(follower_dates, target_exit, side="left")
+        if exit_idx >= len(follower_dates):
             n_no_follower_match += 1
             continue
 
-        follower_entry_S = float(follower_closes[follower_entry_idx])
-        follower_exit_S = float(follower_closes[follower_exit_idx])
-        if follower_entry_S <= 0.0 or np.isnan(follower_entry_S) or np.isnan(follower_exit_S):
+        f_entry, f_exit = float(follower_closes[entry_idx]), float(follower_closes[exit_idx])
+        if f_entry <= 0.0 or np.isnan(f_entry) or np.isnan(f_exit):
             n_no_follower_match += 1
             continue
-        follower_ret = follower_exit_S / follower_entry_S - 1.0
 
         rows.append({
             "entry_date": d,
@@ -152,8 +109,8 @@ def pair_analog_moves(analogs: pd.DataFrame, lead_training_table: pd.DataFrame,
             "weight": arow["weight"] if "weight" in arow.index else 1.0,
             "distance": arow["distance"],
             "lead_entry_S": trow["entry_S"], "lead_exit_S": trow["exit_S"], "lead_ret": lead_ret,
-            "follower_entry_S": follower_entry_S, "follower_exit_S": follower_exit_S,
-            "follower_ret": follower_ret,
+            "follower_entry_S": f_entry, "follower_exit_S": f_exit,
+            "follower_ret": f_exit / f_entry - 1.0,
         })
 
     out = pd.DataFrame(rows)
@@ -163,15 +120,10 @@ def pair_analog_moves(analogs: pd.DataFrame, lead_training_table: pd.DataFrame,
     return out
 
 
-def project_pair_payout(lead_spot_today: float, follower_spot_today: float,
-                         moves: pd.DataFrame,
+def project_pair_payout(lead_spot_today: float, follower_spot_today: float, moves: pd.DataFrame,
                          lead_payoff_fn, follower_payoff_fn) -> pd.DataFrame:
-    """Projiziert JEDEN Analog-Tag (Lead- UND Follower-Rendite aus
-    pair_analog_moves()) auf die HEUTIGEN Spot-Preise beider Instrumente und
-    wertet die dort uebergebenen Payoff-Funktionen aus. lead_payoff_fn/
-    follower_payoff_fn: Funktionen S (np.ndarray) -> P&L (np.ndarray) OHNE
-    Entry-Kosten. Rueckgabe: moves + 'S_lead_hyp', 'S_follower_hyp',
-    'lead_payoff', 'follower_payoff', 'combined_payoff'."""
+    """Projiziert jeden Analog-Tag auf die HEUTIGEN Spots und wertet die
+    Payoff-Funktionen (S -> P&L, ohne Entry-Kosten) aus."""
     out = moves.copy()
     out["S_lead_hyp"] = lead_spot_today * (1.0 + out["lead_ret"])
     out["S_follower_hyp"] = follower_spot_today * (1.0 + out["follower_ret"])
@@ -182,8 +134,7 @@ def project_pair_payout(lead_spot_today: float, follower_spot_today: float,
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  GRID-SEARCH: Lead-Credit-Spread/Condor x Follower-Debit-Spread/Reverse-
-#  Condor, ueber die VOLLE Kreuzmenge beider Strike-Tabellen.
+#  Konfiguration
 # ═══════════════════════════════════════════════════════════════════════
 
 _SORT_ASCENDING = {"ror": False, "mean": False, "tstat": False, "loss_prob_pct": True}
@@ -191,143 +142,102 @@ _SORT_ASCENDING = {"ror": False, "mean": False, "tstat": False, "loss_prob_pct":
 
 @dataclass
 class PairTradeConfig:
-    """Konfiguration fuer evaluate_pair_grid(). Feldnamen (t_min,
-    max_full_loss_share, tail_quantile, tail_floor, sort_by) bewusst
-    identisch/kompatibel zu condor_search.CondorConfig, damit condor_search.
-    criteria_flags() unveraendert (Duck-Typing) wiederverwendet werden kann.
-
-    ENTFERNT (siehe Moduldokstring, Punkt 1): require_lead_plateau - es gibt
-    keinen separaten Einzelbein-Robustheitstest mehr, daher auch kein
-    Plateau-Kriterium dafuer.
-
-    NEU: vol_width_tolerance - minimaler relativer Unterschied in der
-    spread-eigenen IV (siehe Moduldokstring, Punkt 2), ab dem die Breiten-
-    Regel ueberhaupt greift. Bei (fast) identischer Vola beider Seiten wird
-    keine Breiten-Ordnung erzwungen (sonst wuerde Rauschen in der zweiten
-    Nachkommastelle der IV zufaellig Kombinationen ausschliessen).
-
-    max_grid_cells: harte Sicherheitsgrenze - wirft ValueError statt
-    minutenlang zu rechnen, wenn das Distanz-Raster zu fein aufgeloest ist."""
-    price_basis: str = "bidask"        # "bidask" (echt) | "mid" (Naeherung, z.B. bei duennem NDX-Orderbuch)
+    """Feldnamen t_min/max_full_loss_share/tail_quantile/tail_floor kompatibel zu
+    condor_search.CondorConfig (criteria_flags() per Duck-Typing)."""
+    price_basis: str = "bidask"        # "bidask" | "mid"
     t_min: float = 3.0
     max_full_loss_share: float = 0.03
     tail_quantile: float = 0.05
     tail_floor: float = -0.75
-    sort_by: str = "loss_prob_pct"     # "loss_prob_pct" (Standard, aufsteigend) | "ror" | "mean" | "tstat"
-    max_grid_cells: int = 20_000
-    vol_width_tolerance: float = 0.05  # 5% relative IV-Differenz als Mindestschwelle fuer die Breiten-Regel
-    # GROESSEN-ANPASSUNG (Notional): SPX- und NDX-Punkte sind NICHT addierbar
-    # (NDX-Punkte sind ~3-4x groesser). P&L wird deshalb in GELD (Punkte x
-    # Multiplikator) je 1 LEAD-Kontrakt gerechnet; die Follower-Menge ist
-    # Kontrakte je Lead-Kontrakt = notional_ratio * Faktor, notional_ratio =
-    # (Lead-Spot*Lead-Mult)/(Follower-Spot*Follower-Mult). qty_factors ist ein
-    # DURCHSUCHTES Raster (1.0 = notional-neutral). Gleiche Waehrung
-    # vorausgesetzt (keine FX-Umrechnung im Projekt).
+    sort_by: str = "loss_prob_pct"     # "loss_prob_pct" (aufsteigend) | "ror" | "mean" | "tstat"
+    max_loss_basis: str = "structural"  # "structural" (exakt, Standard) | "empirical" (schlechtester Analog-Tag)
+    max_grid_cells: int = 5_000        # Zellen = Lead-Paare x Follower-Paare x Mengenfaktoren (Zeilen = 3x)
+    vol_width_tolerance: float = 0.05  # rel. IV-Unterschied, unter dem keine Breiten-Ordnung verlangt wird
     lead_multiplier: float = 100.0
     follower_multiplier: float = 100.0
-    qty_factors: tuple = (1.0,)
-    # Optional: nur Kombis mit Netto-Cashflow >= diesem Geldbetrag (0.0 =
-    # 'kein Netto-Debit', verhindert Theta-Burner-Hedges). None = aus.
-    min_net_cashflow: float | None = None
+    qty_factors: tuple = (1.0,)        # Follower-Menge = notional_ratio * Faktor
 
 
-def _price_columns(table: pd.DataFrame, price_basis: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """(bid_put, ask_put, bid_call, ask_call) - bei price_basis='mid' werden
-    Bid=Ask=Mid gesetzt (Naeherung fuer ein duennes Orderbuch)."""
+# ═══════════════════════════════════════════════════════════════════════
+#  Bausteine
+# ═══════════════════════════════════════════════════════════════════════
+
+def _price_columns(table: pd.DataFrame, price_basis: str):
     if price_basis == "mid":
-        mid_p = pd.to_numeric(table["mid_put"], errors="coerce").to_numpy(float)
-        mid_c = pd.to_numeric(table["mid_call"], errors="coerce").to_numpy(float)
-        return mid_p, mid_p, mid_c, mid_c
-    return (
-        pd.to_numeric(table["bid_put"], errors="coerce").to_numpy(float),
-        pd.to_numeric(table["ask_put"], errors="coerce").to_numpy(float),
-        pd.to_numeric(table["bid_call"], errors="coerce").to_numpy(float),
-        pd.to_numeric(table["ask_call"], errors="coerce").to_numpy(float),
-    )
+        mp = pd.to_numeric(table["mid_put"], errors="coerce").to_numpy(float)
+        mc = pd.to_numeric(table["mid_call"], errors="coerce").to_numpy(float)
+        return mp, mp, mc, mc
+    return tuple(pd.to_numeric(table[c], errors="coerce").to_numpy(float)
+                 for c in ("bid_put", "ask_put", "bid_call", "ask_call"))
 
 
-def _row_payoffs(table: pd.DataFrame, S_d_hyp: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Innerer Wert JEDER Zeile der Distanz-Tabelle bei Verfall, gegen die
-    per Analog-Tag hypothetisch projizierten Spot-Preise S_d_hyp. Rueckgabe:
-    (pay_p, pay_c), je Shape (n_rows, n_days)."""
+def _row_payoffs(table: pd.DataFrame, S_hyp: np.ndarray):
+    """Innerer Wert je Tabellenzeile bei Verfall gegen die Analog-Spots: (pay_p, pay_c)."""
     Kp = pd.to_numeric(table["strike_put"], errors="coerce").to_numpy(float)
     Kc = pd.to_numeric(table["strike_call"], errors="coerce").to_numpy(float)
-    pay_p = np.maximum(Kp[:, None] - S_d_hyp[None, :], 0.0)
-    pay_c = np.maximum(S_d_hyp[None, :] - Kc[:, None], 0.0)
-    return pay_p, pay_c
+    return np.maximum(Kp[:, None] - S_hyp[None, :], 0.0), np.maximum(S_hyp[None, :] - Kc[:, None], 0.0)
 
 
-def _vertical_spread(K_inner: float, K_wing: float,
-                      bid_inner: float, ask_inner: float, bid_wing: float, ask_wing: float,
-                      pay_inner: np.ndarray, pay_wing: np.ndarray,
-                      is_short: bool) -> tuple[float, float, np.ndarray] | None:
-    """Wirtschaftliche Kennzahlen EINES Vertical-Spreads (Put- ODER
-    Call-Seite, EIN Instrument). K_inner/pay_inner = die Zeile mit dem
-    KLEINEREN Abstand vom Spot (also naeher dran), K_wing/pay_wing = die
-    Zeile mit dem GROESSEREN Abstand.
-
-    is_short=True (LEAD-Rolle): SHORT der innere Strike, LONG der Wing ->
-    Credit-Spread. is_short=False (FOLLOWER-Rolle): LONG der innere Strike,
-    SHORT der Wing -> Debit-Spread ('Reverse').
-
-    Rueckgabe (net_cashflow, max_loss, pay_diff) oder None bei ungueltiger
-    Konfiguration:
-      net_cashflow: positiv = Kredit (Lead), negativ = Debit (Follower)
-      max_loss: THEORETISCHER Max-Verlust NUR dieses einzelnen Beins (Breite
-                minus Kredit bzw. Debit) - dient nur noch als Info-Spalte,
-                siehe Moduldokstring Punkt 3 fuer den tatsaechlich fuer
-                Ranking/Tail verwendeten EMPIRISCHEN Max-Verlust.
-      pay_diff: Array (n_days,) = pay_inner - pay_wing, OHNE Ein-/Ausstiegskosten."""
+def _vertical_spread(K_inner, K_wing, bid_inner, ask_inner, bid_wing, ask_wing,
+                      pay_inner, pay_wing, is_put: bool, is_short: bool):
+    """Ein Vertical-Spread (eine Seite, ein Instrument).
+    is_short=True (Lead): Short inner / Long Wing -> Credit.
+    is_short=False (Follower): Long inner / Short Wing -> Debit.
+    Rueckgabe (net_cf, pay_diff, legs) oder None. legs = [(K, is_put, sign)],
+    sign +1 long / -1 short. pnl(S) = net_cf + sum(sign*intrinsic(S)); fuer den
+    Lead entspricht das net_cf - (pay_inner - pay_wing), fuer den Follower
+    net_cf + (pay_inner - pay_wing)."""
     width = abs(K_inner - K_wing)
     if not np.isfinite(width) or width <= 0.0:
         return None
-
-    pay_diff = pay_inner - pay_wing
-
     if is_short:
         net_cf = bid_inner - ask_wing
         if not (np.isfinite(net_cf) and 0.0 < net_cf < width):
             return None
-        max_loss = width - net_cf
+        legs = [(K_inner, is_put, -1), (K_wing, is_put, +1)]
     else:
         net_cf = -(ask_inner - bid_wing)
         debit = -net_cf
         if not (np.isfinite(debit) and 0.0 < debit < width):
             return None
-        max_loss = debit
+        legs = [(K_inner, is_put, +1), (K_wing, is_put, -1)]
+    return net_cf, pay_inner - pay_wing, legs
 
-    return net_cf, max_loss, pay_diff
+
+def _combine(a, b):
+    """Zwei Spread-Pakete (Put + Call) zu einem Condor-Paket addieren."""
+    if a is None or b is None:
+        return None
+    return a[0] + b[0], a[1] + b[1], a[2] + b[2]
+
+
+def _min_pnl_points(net_cf: float, legs) -> float:
+    """EXAKTES Minimum der P&L (in Punkten) eines Bein-Pakets ueber alle
+    Endkurse S >= 0. Payoff ist stueckweise linear mit Knicken nur an den
+    Strikes -> Auswertung an {0} + Strikes genuegt (oberhalb des hoechsten
+    Strikes ist der Payoff konstant, da jedes Paket Long/Short-Paare enthaelt)."""
+    cand = np.array([0.0] + [k for k, _, _ in legs], dtype=float)
+    pnl = np.full(cand.shape, float(net_cf))
+    for K, is_put, sign in legs:
+        pnl += sign * (np.maximum(K - cand, 0.0) if is_put else np.maximum(cand - K, 0.0))
+    return float(pnl.min())
 
 
 def dedupe_strike_rows(table: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Entfernt Zeilen, deren (Put-Strike, Call-Strike) identisch zu einer
-    frueheren Zeile ist. build_symmetric_distance_table() rundet je Ziel-
-    Abstand auf den naechsten REAL vorhandenen Strike - bei einer duennen
-    Kette landen mehrere Abstaende auf demselben Strike; solche Duplikate
-    wuerden als verschiedene Grid-Punkte gezaehlt. Rueckgabe: (bereinigte
-    Tabelle, Anzahl entfernt)."""
     key = table[["strike_put", "strike_call"]].apply(pd.to_numeric, errors="coerce").round(6)
     dup = key.duplicated(keep="first").to_numpy()
     return table.loc[~dup].reset_index(drop=True), int(dup.sum())
 
 
-def _spread_vol_pct(iv_pair_pct: np.ndarray, i: int, j: int) -> float:
-    """Spread-eigene Grundvolatilitaet = Mittel der Markt-Paket-IV (Spalte
-    'iv_pair_pct' der Distanz-Tabelle, siehe chain_delta.
-    build_symmetric_distance_table) an den beiden Strikes, die den Spread
-    aufspannen. NaN, falls an keinem der beiden eine gueltige IV vorliegt."""
-    vals = [v for v in (iv_pair_pct[i], iv_pair_pct[j]) if np.isfinite(v)]
+def _spread_vol_pct(iv: np.ndarray, i: int, j: int) -> float:
+    vals = [v for v in (iv[i], iv[j]) if np.isfinite(v)]
     return float(np.mean(vals)) if vals else float("nan")
 
 
 def _width_order_ok(vol_lead: float, vol_follower: float, width_lead_pct: float,
                      width_follower_pct: float, tolerance: float) -> bool:
-    """Vola-Breiten-Konsistenz (siehe Moduldokstring, Punkt 2): die Seite mit
-    der hoeheren Grundvolatilitaet muss den (in % vom Spot) BREITEREN Spread
-    haben. Ohne gueltige Vola auf beiden Seiten wird die Kombination
-    verworfen (kein Freifahrtschein bei fehlenden Daten). Bei einem
-    relativen Vola-Unterschied unter 'tolerance' wird keine Ordnung
-    verlangt (Rauschschutz)."""
+    """Lead hoehere Vola -> Lead-Spread breiter; Lead niedrigere Vola -> schmaler.
+    Fehlende Vola -> verworfen. Unter 'tolerance' keine Ordnung."""
     if not (np.isfinite(vol_lead) and np.isfinite(vol_follower)):
         return False
     hi = max(vol_lead, vol_follower)
@@ -335,53 +245,29 @@ def _width_order_ok(vol_lead: float, vol_follower: float, width_lead_pct: float,
         return True
     if vol_lead > vol_follower:
         return width_lead_pct > width_follower_pct
-    return width_follower_pct > width_lead_pct
+    return width_lead_pct < width_follower_pct
 
 
-def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame,
-                        pair_moves: pd.DataFrame,
+# ═══════════════════════════════════════════════════════════════════════
+#  Grid-Search
+# ═══════════════════════════════════════════════════════════════════════
+
+def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame, pair_moves: pd.DataFrame,
                         lead_spot_today: float, follower_spot_today: float,
                         cfg: PairTradeConfig | None = None) -> pd.DataFrame:
-    """Durchsucht das VOLLE kartesische Produkt aus Lead-Strike-Paaren
-    (i<j auf lead_table) x Follower-Strike-Paaren (i'<j' auf follower_table)
-    x Follower-Mengenfaktoren (cfg.qty_factors) und bewertet DREI Strukturen:
-      'put_spread'  - NUR Put-Seite (Lead Short Put Spread / Follower Long
-                       Put Spread) - die MINIMALE nutzbare Struktur.
-      'call_spread' - NUR Call-Seite, analog.
-      'iron_condor' - Put- UND Call-Seite (Lead = Iron Condor, Follower =
-                       'Reverse Iron Condor').
+    """Siehe Moduldokstring. Geldeinheiten: GELD je 1 Lead-Kontrakt (Punkte x
+    Multiplikator); Follower-Menge 'follower_qty' = Kontrakte je Lead-Kontrakt
+    (notional_ratio * Faktor). Heutige echte Strikes/Preise fest, nur die
+    %-Bewegungen der Analog-Tage werden auf den heutigen Spot projiziert.
 
-    VORFILTER (siehe Moduldokstring, Punkt 2): eine Kombination wird nur
-    geprueft, wenn die volatilere Seite (spread-eigene IV, Spalte
-    'iv_pair_pct') auch den (in %) breiteren Spread hat - ersetzt das
-    fruehere Lead-Plateau-Kriterium.
-
-    ROBUSTHEIT (siehe Moduldokstring, Punkt 1): wird AUSSCHLIESSLICH auf dem
-    GESAMTSPREAD (der tatsaechlich kombinierten Lead+Follower-Position)
-    gemessen - kein separater Einzelbein-Test mehr.
-
-    MAX-VERLUST (siehe Moduldokstring, Punkt 3): EMPIRISCH, der schlechteste
-    tatsaechlich simulierte gemeinsame Analog-Tag (-min(pnl_d)), NICHT mehr
-    die theoretische Summe der Einzelbein-Breiten. Die theoretischen
-    Einzelbein-Max-Verluste bleiben als Info-Spalten
-    ('lead_max_loss_theo'/'follower_max_loss_theo') erhalten.
-
-    EINHEITEN: alle Geldgroessen in GELD je 1 Lead-Kontrakt (Punkte x
-    Multiplikator). Follower-Menge 'follower_qty' = Kontrakte je Lead-
-    Kontrakt (siehe PairTradeConfig, Notional-Anpassung).
-
-    SIMULATIONSTECHNIK: HEUTIGE echte Strikes/Bid-Ask fest, nur die
-    %-Bewegung der Analog-Tage wird auf den heutigen Spot projiziert (kein
-    Delta-Solve je Analog-Tag). Lead- und Follower-Bewegung stammen IMMER
-    vom SELBEN Kalendertag (siehe pair_analog_moves) - das ist die
-    Voraussetzung dafuer, dass der empirische Max-Verlust die echte
-    historische Korrelation abbildet.
-
-    PERFORMANCE: Zellen = Lead-Paare x Follower-Paare x Mengenfaktoren;
-    cfg.max_grid_cells bricht hart ab. Der Vola-Breiten-Vorfilter greift
-    VOR der teuren Stats-Berechnung und spart dadurch Rechenzeit."""
+    Rueckgabe: EINE Zeile je (Lead-Paar, Follower-Paar, Struktur, Mengenfaktor),
+    inkl. der Zeilen mit ungueltiger Bepreisung ('tested'=False)."""
     if cfg is None:
         cfg = PairTradeConfig()
+    if cfg.sort_by not in _SORT_ASCENDING:
+        raise ValueError(f"sort_by muss eines von {sorted(_SORT_ASCENDING)} sein (erhalten: {cfg.sort_by!r}).")
+    if cfg.max_loss_basis not in ("structural", "empirical"):
+        raise ValueError("max_loss_basis muss 'structural' oder 'empirical' sein.")
     if pair_moves.empty:
         return pd.DataFrame()
 
@@ -392,13 +278,12 @@ def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame,
     n_lead, n_follower = len(lead_table), len(follower_table)
 
     qty_factors = tuple(cfg.qty_factors) or (1.0,)
-    notional_ratio = (lead_spot_today * cfg.lead_multiplier) / (follower_spot_today * cfg.follower_multiplier)
     lm, fm = float(cfg.lead_multiplier), float(cfg.follower_multiplier)
+    notional_ratio = (lead_spot_today * lm) / (follower_spot_today * fm)
 
     def _finish(out: pd.DataFrame) -> pd.DataFrame:
-        out.attrs["dedupe_dropped"] = (n_lead_dup, n_foll_dup)
-        out.attrs["notional_ratio"] = notional_ratio
-        out.attrs["n_lead_rows"], out.attrs["n_follower_rows"] = n_lead, n_follower
+        out.attrs.update({"dedupe_dropped": (n_lead_dup, n_foll_dup), "notional_ratio": notional_ratio,
+                          "n_lead_rows": n_lead, "n_follower_rows": n_follower})
         return out
 
     n_lead_pairs = n_lead * (n_lead - 1) // 2
@@ -407,8 +292,8 @@ def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame,
     if n_cells > cfg.max_grid_cells:
         raise ValueError(
             f"Grid zu gross: {n_lead_pairs} Lead-Paare x {n_follower_pairs} Follower-Paare x "
-            f"{len(qty_factors)} Mengenfaktoren = {n_cells:,} Kombinationen (Grenze: "
-            f"{cfg.max_grid_cells:,}). Distanz-Raster oder Mengenfaktoren verkleinern."
+            f"{len(qty_factors)} Mengenfaktoren = {n_cells:,} Zellen (Grenze: {cfg.max_grid_cells:,}). "
+            "Distanz-Raster oder Mengenfaktoren verkleinern."
         )
     if n_lead_pairs == 0 or n_follower_pairs == 0:
         return _finish(pd.DataFrame())
@@ -419,122 +304,110 @@ def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame,
     train_mask = (pair_moves["entry_date"] < pair_moves["entry_date"].median()).to_numpy()
 
     S_lead_hyp = lead_spot_today * (1.0 + pair_moves["lead_ret"].to_numpy(float))
-    S_follower_hyp = follower_spot_today * (1.0 + pair_moves["follower_ret"].to_numpy(float))
-
+    S_foll_hyp = follower_spot_today * (1.0 + pair_moves["follower_ret"].to_numpy(float))
     pay_p_lead, pay_c_lead = _row_payoffs(lead_table, S_lead_hyp)
-    pay_p_foll, pay_c_foll = _row_payoffs(follower_table, S_follower_hyp)
+    pay_p_foll, pay_c_foll = _row_payoffs(follower_table, S_foll_hyp)
 
-    lead_bid_p, lead_ask_p, lead_bid_c, lead_ask_c = _price_columns(lead_table, cfg.price_basis)
-    lead_Kp = pd.to_numeric(lead_table["strike_put"], errors="coerce").to_numpy(float)
-    lead_Kc = pd.to_numeric(lead_table["strike_call"], errors="coerce").to_numpy(float)
-    lead_dist = pd.to_numeric(lead_table["distance_pct"], errors="coerce").to_numpy(float)
-    lead_iv = pd.to_numeric(lead_table.get("iv_pair_pct"), errors="coerce").to_numpy(float)
+    def num(t, c):
+        return pd.to_numeric(t[c], errors="coerce").to_numpy(float)
 
-    foll_bid_p, foll_ask_p, foll_bid_c, foll_ask_c = _price_columns(follower_table, cfg.price_basis)
-    foll_Kp = pd.to_numeric(follower_table["strike_put"], errors="coerce").to_numpy(float)
-    foll_Kc = pd.to_numeric(follower_table["strike_call"], errors="coerce").to_numpy(float)
-    foll_dist = pd.to_numeric(follower_table["distance_pct"], errors="coerce").to_numpy(float)
-    foll_iv = pd.to_numeric(follower_table.get("iv_pair_pct"), errors="coerce").to_numpy(float)
+    lbp, lap, lbc, lac = _price_columns(lead_table, cfg.price_basis)
+    fbp, fap, fbc, fac = _price_columns(follower_table, cfg.price_basis)
+    lKp, lKc, ldist = num(lead_table, "strike_put"), num(lead_table, "strike_call"), num(lead_table, "distance_pct")
+    fKp, fKc, fdist = num(follower_table, "strike_put"), num(follower_table, "strike_call"), num(follower_table, "distance_pct")
+    liv, fiv = num(lead_table, "iv_pair_pct"), num(follower_table, "iv_pair_pct")
 
-    def _lead_pairs():
-        for i in range(n_lead - 1):
-            for j in range(i + 1, n_lead):
-                put = _vertical_spread(lead_Kp[i], lead_Kp[j], lead_bid_p[i], lead_ask_p[i],
-                                       lead_bid_p[j], lead_ask_p[j], pay_p_lead[i], pay_p_lead[j], is_short=True)
-                call = _vertical_spread(lead_Kc[i], lead_Kc[j], lead_bid_c[i], lead_ask_c[i],
-                                        lead_bid_c[j], lead_ask_c[j], pay_c_lead[i], pay_c_lead[j], is_short=True)
-                yield i, j, put, call
-
-    def _follower_pairs():
-        for i in range(n_follower - 1):
-            for j in range(i + 1, n_follower):
-                put = _vertical_spread(foll_Kp[i], foll_Kp[j], foll_bid_p[i], foll_ask_p[i],
-                                       foll_bid_p[j], foll_ask_p[j], pay_p_foll[i], pay_p_foll[j], is_short=False)
-                call = _vertical_spread(foll_Kc[i], foll_Kc[j], foll_bid_c[i], foll_ask_c[i],
-                                        foll_bid_c[j], foll_ask_c[j], pay_c_foll[i], pay_c_foll[j], is_short=False)
-                yield i, j, put, call
-
-    follower_cache = list(_follower_pairs())
-    n_skipped_vol = 0
+    follower_cache = []
+    for fi in range(n_follower - 1):
+        for fj in range(fi + 1, n_follower):
+            put = _vertical_spread(fKp[fi], fKp[fj], fbp[fi], fap[fi], fbp[fj], fap[fj],
+                                   pay_p_foll[fi], pay_p_foll[fj], True, False)
+            call = _vertical_spread(fKc[fi], fKc[fj], fbc[fi], fac[fi], fbc[fj], fac[fj],
+                                    pay_c_foll[fi], pay_c_foll[fj], False, False)
+            follower_cache.append((fi, fj, put, call))
 
     rows = []
-    for li, lj, lput, lcall in _lead_pairs():
-        width_lead_pct = abs(lead_dist[lj] - lead_dist[li])
-        vol_lead = _spread_vol_pct(lead_iv, li, lj)
+    for li in range(n_lead - 1):
+        for lj in range(li + 1, n_lead):
+            lput = _vertical_spread(lKp[li], lKp[lj], lbp[li], lap[li], lbp[lj], lap[lj],
+                                    pay_p_lead[li], pay_p_lead[lj], True, True)
+            lcall = _vertical_spread(lKc[li], lKc[lj], lbc[li], lac[li], lbc[lj], lac[lj],
+                                     pay_c_lead[li], pay_c_lead[lj], False, True)
+            width_lead = abs(ldist[lj] - ldist[li])
+            vol_lead = _spread_vol_pct(liv, li, lj)
 
-        for fi, fj, fput, fcall in follower_cache:
-            width_follower_pct = abs(foll_dist[fj] - foll_dist[fi])
-            vol_follower = _spread_vol_pct(foll_iv, fi, fj)
+            for fi, fj, fput, fcall in follower_cache:
+                width_foll = abs(fdist[fj] - fdist[fi])
+                vol_foll = _spread_vol_pct(fiv, fi, fj)
+                vol_ok = _width_order_ok(vol_lead, vol_foll, width_lead, width_foll, cfg.vol_width_tolerance)
 
-            if not _width_order_ok(vol_lead, vol_follower, width_lead_pct, width_follower_pct,
-                                   cfg.vol_width_tolerance):
-                n_skipped_vol += 1
-                continue
+                structures = [
+                    ("put_spread", lput, fput),
+                    ("call_spread", lcall, fcall),
+                    ("iron_condor", _combine(lput, lcall), _combine(fput, fcall)),
+                ]
+                for structure, lead_leg, foll_leg in structures:
+                    for factor in qty_factors:
+                        q = notional_ratio * factor
+                        base = {
+                            "structure": structure,
+                            "lead_i": li, "lead_j": lj, "follower_i": fi, "follower_j": fj,
+                            "lead_short_distance": float(ldist[li]), "lead_wing_distance": float(ldist[lj]),
+                            "follower_short_distance": float(fdist[fi]), "follower_wing_distance": float(fdist[fj]),
+                            "vol_lead_pct": vol_lead, "vol_follower_pct": vol_foll,
+                            "width_lead_pct": width_lead, "width_follower_pct": width_foll,
+                            "follower_qty": q, "qty_factor": factor,
+                            "net_cashflow": np.nan, "max_loss": np.nan,
+                            "max_loss_struct": np.nan, "max_loss_hist": np.nan,
+                            "loss_prob_pct": np.nan, "full_loss_pct": np.nan, "lead_full_loss_pct": np.nan,
+                            "lead_net_cashflow": np.nan, "follower_net_cashflow": np.nan,
+                            "vol_rule_ok": vol_ok,   # NUR Info-Spalte, schliesst NICHTS aus
+                            "tested": False, "exclude_reason": "", "passes": False,
+                            **_NAN_STATS, **_NAN_FLAGS,
+                        }
+                        if lead_leg is None or foll_leg is None:
+                            base["exclude_reason"] = "ungueltige_bepreisung"
+                            rows.append(base)
+                            continue
 
-            structures = []
-            if lput is not None and fput is not None:
-                structures.append(("put_spread", lput, fput))
-            if lcall is not None and fcall is not None:
-                structures.append(("call_spread", lcall, fcall))
-            if lput is not None and lcall is not None and fput is not None and fcall is not None:
-                structures.append((
-                    "iron_condor",
-                    (lput[0] + lcall[0], lput[1] + lcall[1], lput[2] + lcall[2]),
-                    (fput[0] + fcall[0], fput[1] + fcall[1], fput[2] + fcall[2]),
-                ))
+                        l_net, l_pay, l_legs = lead_leg
+                        f_net, f_pay, f_legs = foll_leg
+                        f_scale = q * fm
+                        combined_net = lm * l_net + f_scale * f_net
+                        # EXAKTER struktureller Max-Verlust (separable Summe der Minima)
+                        lead_min = lm * _min_pnl_points(l_net, l_legs)
+                        struct_ml = max(0.0, -(lead_min + f_scale * _min_pnl_points(f_net, f_legs)))
+                        base["net_cashflow"], base["max_loss_struct"] = combined_net, struct_ml
+                        base["lead_net_cashflow"], base["follower_net_cashflow"] = lm * l_net, f_scale * f_net
 
-            for structure, lead_leg, foll_leg in structures:
-                l_net, l_max_theo, l_pay = lead_leg
-                f_net, f_max_theo, f_pay = foll_leg
-                lead_pnl = lm * (l_net - l_pay)              # GELD je Lead-Kontrakt
-                foll_pnl_pts = f_net + f_pay                 # Follower in PUNKTEN je Follower-Kontrakt
+                        pnl_d = lm * (l_net - l_pay) + f_scale * (f_net + f_pay)
+                        hist_ml = max(0.0, -float(np.min(pnl_d)))
+                        max_loss = struct_ml if cfg.max_loss_basis == "structural" else hist_ml
+                        if max_loss <= 0.0 < struct_ml:
+                            # Kein einziger Verlusttag in den Analogdaten: Paar NICHT verwerfen (das waeren
+                            # genau die besten Paare), sondern auf den strukturellen Max-Verlust zurueckfallen.
+                            max_loss = struct_ml
+                        base["max_loss_hist"], base["max_loss"] = hist_ml, max_loss
 
-                for factor in qty_factors:
-                    q = notional_ratio * factor              # Follower-Kontrakte je Lead-Kontrakt
-                    f_scale = q * fm
-                    combined_net = lm * l_net + f_scale * f_net
-                    if cfg.min_net_cashflow is not None and combined_net < cfg.min_net_cashflow:
-                        continue
-                    pnl_d = lead_pnl + f_scale * foll_pnl_pts
-
-                    # EMPIRISCHER Max-Verlust (siehe Moduldokstring Punkt 3):
-                    # der schlechteste TATSAECHLICH SIMULIERTE gemeinsame Tag,
-                    # NICHT die theoretische Summe der Einzelbein-Breiten.
-                    max_loss = max(0.0, -float(np.min(pnl_d)))
-                    if max_loss <= 0.0:
-                        continue
-
-                    stats = weighted_pnl_stats(pnl_d, w, dates, hold, train_mask, max_loss, cfg.tail_quantile)
-                    flags = criteria_flags(stats, cfg)
-                    loss_prob_pct = 100.0 - stats["win_rate_pct"]
-
-                    rows.append({
-                        "structure": structure,
-                        "lead_i": li, "lead_j": lj, "follower_i": fi, "follower_j": fj,
-                        "lead_short_distance": float(lead_table["distance_pct"].iloc[li]),
-                        "lead_wing_distance": float(lead_table["distance_pct"].iloc[lj]),
-                        "follower_short_distance": float(follower_table["distance_pct"].iloc[fi]),
-                        "follower_wing_distance": float(follower_table["distance_pct"].iloc[fj]),
-                        "vol_lead_pct": vol_lead, "vol_follower_pct": vol_follower,
-                        "width_lead_pct": width_lead_pct, "width_follower_pct": width_follower_pct,
-                        "follower_qty": q, "qty_factor": factor,
-                        "net_cashflow": combined_net, "max_loss": max_loss,
-                        "lead_max_loss_theo": lm * l_max_theo, "follower_max_loss_theo": f_scale * f_max_theo,
-                        "lead_net_cashflow": lm * l_net, "follower_net_cashflow": f_scale * f_net,
-                        "loss_prob_pct": loss_prob_pct,
-                        **stats, **flags,
-                    })
+                        stats = weighted_pnl_stats(pnl_d, w, dates, hold, train_mask, max_loss, cfg.tail_quantile)
+                        flags = criteria_flags(stats, cfg)
+                        # Verlustwahrscheinlichkeit = gewichteter Anteil Analog-Tage mit P&L < 0
+                        loss_prob = float(w[pnl_d < 0.0].sum() / w.sum() * 100.0)
+                        lead_pnl_d = lm * (l_net - l_pay)
+                        base["lead_full_loss_pct"] = float(w[lead_pnl_d <= lead_min + 1e-7].sum() / w.sum() * 100.0)
+                        base["full_loss_pct"] = (float(stats["full_loss_share"]) * 100.0
+                                                 if np.isfinite(stats["full_loss_share"]) else np.nan)
+                        base.update(stats)
+                        base.update(flags)
+                        base.update({"loss_prob_pct": loss_prob, "tested": True, "passes": bool(flags["c_base"])})
+                        rows.append(base)
 
     result = pd.DataFrame(rows)
     if result.empty:
         return _finish(result)
 
-    result["passes"] = result["c_base"]   # NUR NOCH Gesamtspread-Kriterien, kein Plateau mehr
-    if cfg.sort_by not in _SORT_ASCENDING:
-        raise ValueError(f"sort_by muss eines von {sorted(_SORT_ASCENDING)} sein (erhalten: {cfg.sort_by!r}).")
     result = result.sort_values(
-        ["passes", cfg.sort_by], ascending=[False, _SORT_ASCENDING[cfg.sort_by]],
+        ["tested", "passes", cfg.sort_by], ascending=[False, False, _SORT_ASCENDING[cfg.sort_by]],
+        na_position="last",
     ).reset_index(drop=True)
-    out = _finish(result)
-    out.attrs["n_skipped_vol_width"] = n_skipped_vol
-    return out
+    return _finish(result)

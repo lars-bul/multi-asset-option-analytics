@@ -1,6 +1,6 @@
 """
 MODUS 3: Heutige Kette - symmetrische Abstands-Ansicht + Analog-Tage-Tabelle
-+ modellfreie Iron-Condor-Suche.
++ modellfreie Iron-Condor-Suche (inkl. Reverse Iron Condor).
 
 MULTI-INSTRUMENT-UMBAU: dieses Modul bekommt jetzt zusaetzlich das oben
 gewaehlte Instrument (siehe dashboard.py) und ist vollstaendig darauf
@@ -56,6 +56,10 @@ _ensure_training_table(), jetzt fuer jedes Instrument, siehe oben);
 (Quote-Alter) ab _QUOTE_AGE_WARNING_MINUTES.
 
 TEIL C: Iron-Condor-Suche (condor_search.py) mit Bid/Ask-Preisen der Kette.
+NEU: direkt darunter die Reverse-Iron-Condor-Suche (Long-Condor, inneren
+Strangle kaufen, Fluegel verkaufen) - gleiche Analog-Tage (moves), gleiche
+Tabelle, gleicher Auto-Lauf-Block und gleicher Cache wie der Short-Condor
+(kein zusaetzlicher Analog-Lauf, keine zusaetzliche Ladezeit).
 
 AUTOMATISCHER ABLAUF: Sobald dieser Tab geoeffnet wird, laedt die Kette (Auto-Load), danach
 rechnet Teil B (Analog-Tabelle) und anschliessend Teil C (Condor-Suche) von selbst. Neu gerechnet
@@ -85,7 +89,8 @@ from analog_matching import (
 )
 from features import FeatureConfig, build_feature_matrix
 from dashboard_common import load_training_table
-from condor_search import CondorConfig, analog_moves, evaluate_condor_grid, analog_robustness
+from condor_search import (CondorConfig, analog_moves, evaluate_condor_grid, analog_robustness,
+                           evaluate_reverse_condor_grid)
 
 _QUOTE_AGE_WARNING_MINUTES = 60.0
 _ANALOG_MIN_CANDIDATES = 20
@@ -591,6 +596,76 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
     return out
 
 
+def _render_reverse_condor(res: dict) -> None:
+    """Reverse Iron Condor (Long-Condor): inneren Strangle kaufen, Fluegel verkaufen.
+    Nutzt die in res gespeicherten Ergebnisse (gleiche Analog-Tage wie der Short-Condor)."""
+    st.markdown("### Reverse Iron Condor (Long-Condor)")
+    rdf, rmeta = res.get("rcdf"), res.get("rmeta")
+    if rdf is None:
+        st.info("Reverse-Condor-Ergebnis fehlt - 'Iron-Condor-Suche neu berechnen' klicken.")
+        return
+    if rdf.empty:
+        st.warning("Kein gültiger Reverse Condor (Debit<=0, Debit>=Breite oder Bid/Ask fehlt). "
+                   "Bei Bid/Ask=0: Preisbasis 'Mid' testen.")
+        return
+    st.caption(
+        "Inneren Strangle KAUFEN (Ask), äußere Flügel VERKAUFEN (Bid). Debit = Max-Loss "
+        "(Kurs endet zwischen den inneren Strikes). Max-Gewinn = größere Flügelbreite − Debit. "
+        "P&L je Analog-Tag = Payout − Debit, auf denselben Analog-Tagen und mit denselben "
+        "Gewichten wie der Short-Condor. Rendite/Risiko % = E[P&L] / Debit. "
+        "KEIN Tail-Kriterium (beim Long-Condor ist der Totalverlust der Normalfall); "
+        "'Max-Verlust-Tage' ist nur Information. Kandidat = Train>0 UND Val>0 UND t (HAC) > Schwelle "
+        "UND der innere Long-Strangle ist selbst gültig (E>0, Train>0, Val>0, t>Schwelle, Ask-Preise) "
+        "UND Plateau (Zeile direkt darüber und darunter ebenfalls gültig)."
+    )
+    st.caption(
+        f"{rmeta['n_days']} Analog-Tage (n_eff Kish {rmeta['n_eff']:.1f}, max. Haltedauer "
+        f"{rmeta['hold_max']}d) · {rmeta['n_pairs']} Paare getestet, {rmeta['n_base']} erfüllen die "
+        f"Basis-Kriterien, {rmeta['n_pass']} bestehen zusätzlich Long-Strangle-Kriterium und Plateau."
+    )
+    if rmeta["n_pass"] == 0:
+        st.info("Kein Reverse Condor besteht alle Kriterien - kein belastbarer Long-Edge für die heutige Lage.")
+    else:
+        b = rdf.iloc[0]
+        st.success(
+            f"Optimum Reverse Condor: Long {b['strike_put_inner']:.0f}P / {b['strike_call_inner']:.0f}C, "
+            f"Short-Flügel {b['strike_put_wing']:.0f}P / {b['strike_call_wing']:.0f}C · "
+            f"Debit {b['debit']:.2f}, Max-Gewinn {b['max_gain']:.2f} · E[P&L] {b['mean']:+.2f} Pkt = "
+            f"{b['ror']*100:+.1f}% auf Risikokapital (t={b['tstat']:.2f}, Val-E {b['e_val']:+.2f})."
+        )
+
+    yn = lambda s: s.map({True: "✅", False: "❌"})
+    rshow = pd.DataFrame({
+        "Innen-Abstand %": rdf["distance_inner"], "Flügel-Abstand %": rdf["distance_wing"],
+        "Put Flügel (short)": rdf["strike_put_wing"], "Put Innen (long)": rdf["strike_put_inner"],
+        "Call Innen (long)": rdf["strike_call_inner"], "Call Flügel (short)": rdf["strike_call_wing"],
+        "Debit": rdf["debit"], "Max-Loss": rdf["max_loss"], "Max-Gewinn": rdf["max_gain"],
+        "Max-Gewinn/Max-Loss": rdf["rr_max"],
+        "E[P&L] (Pkt)": rdf["mean"], "Rendite/Risiko %": rdf["ror"] * 100,
+        "E Put-Spread": rdf["e_put_spread"], "E Call-Spread": rdf["e_call_spread"],
+        "t (HAC)": rdf["tstat"], "E Train": rdf["e_train"], "E Val": rdf["e_val"],
+        "Max-Verlust-Tage %": rdf["full_loss_share"] * 100, "Max-Verlust-Tage (n)": rdf["n_full_loss"],
+        "Gewinnrate %": rdf["win_rate_pct"],
+        "Train>0": yn(rdf["c_train"]), "Val>0": yn(rdf["c_val"]), "t": yn(rdf["c_t"]),
+        "Long-Strangle gültig": yn(rdf["c_long"]), "Plateau (Innen ±1)": yn(rdf["c_plateau"]),
+        "Kandidat": yn(rdf["passes"]),
+    })
+    rfmt = {c: "{:.2f}" for c in rshow.select_dtypes("number").columns}
+    rfmt.update({c: "{:.0f}" for c in ["Put Flügel (short)", "Put Innen (long)", "Call Innen (long)",
+                                       "Call Flügel (short)", "Max-Verlust-Tage (n)"]})
+    rpassing = rshow[rdf["passes"].to_numpy()]
+    if len(rpassing):
+        st.dataframe(rpassing.style.format(rfmt, na_rep="n/a"), use_container_width=True, hide_index=True)
+    with st.expander(f"Alle getesteten Paare ({len(rshow)}) inkl. Kriterien – Reverse Condor"):
+        st.dataframe(rshow.style.format(rfmt, na_rep="n/a"), use_container_width=True, hide_index=True)
+    if "long_df" in rmeta:
+        with st.expander("Long-Strangle je Zeile (Basis für Long-Kriterium und Plateau)"):
+            lg = rmeta["long_df"].copy()
+            lg["ok"] = lg["ok"].map({True: "✅", False: "❌"})
+            st.dataframe(lg.style.format({c: "{:.2f}" for c in lg.select_dtypes("number").columns},
+                                         na_rep="n/a"), use_container_width=True, hide_index=True)
+
+
 def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spot,
                            max_distance, bandwidth, min_gap, distance_key, instr: InstrumentConfig) -> None:
     """TEIL C: modellfreie Iron-Condor-Suche (siehe condor_search.py)."""
@@ -650,7 +725,9 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
     # AUTO-LAUF: die Suche startet von selbst, sobald die Analog-Tabelle vorliegt und sich Tabelle
     # oder Einstellungen geaendert haben. Der Versuch wird MIT SCHLUESSEL gemerkt - ein Fehlschlag
     # wird deshalb nicht bei jedem Rerun wiederholt. Der Button erzwingt eine Neuberechnung.
-    cparams = (basis, float(t_min), float(max_full), float(tail_floor), sort_label)
+    # Das Versionskuerzel "v2-reverse" sorgt dafuer, dass alte Cache-Eintraege ohne
+    # Reverse-Condor-Ergebnis automatisch neu gerechnet werden.
+    cparams = (basis, float(t_min), float(max_full), float(tail_floor), sort_label, "v2-reverse")
     st.session_state["shared_condor_criteria"] = dict(basis=basis, t_min=float(t_min), max_full=float(max_full),
                                                       tail_floor=float(tail_floor))
     if st.session_state.get("livechain_condor_attempt") != (distance_key, cparams):
@@ -673,7 +750,10 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
                 cdf, sdf, meta = evaluate_condor_grid(table, moves, spot, cfg, short_valid)
                 meta["T_days_used"] = ctx["T_days_used"]
                 meta["sort_label"] = sort_label
-                st.session_state["livechain_condor"] = dict(key=distance_key, params=cparams, cdf=cdf, sdf=sdf, meta=meta)
+                # Reverse Iron Condor: gleiche moves/table/cfg - kein zusaetzlicher Analog-Lauf.
+                rcdf, rmeta = evaluate_reverse_condor_grid(table, moves, spot, cfg)
+                st.session_state["livechain_condor"] = dict(key=distance_key, params=cparams, cdf=cdf, sdf=sdf,
+                                                            meta=meta, rcdf=rcdf, rmeta=rmeta)
                 _RESULT_CACHE["condor"] = ((distance_key, cparams), st.session_state["livechain_condor"])
 
     res = st.session_state.get("livechain_condor")
@@ -685,6 +765,7 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
     cdf, sdf, meta = res["cdf"], res["sdf"], res["meta"]
     if cdf.empty:
         st.warning("Kein gueltiges Paar (Kredit<=0 oder Bid/Ask fehlt). Bei Bid/Ask=0: Preisbasis 'Mid' testen.")
+        _render_reverse_condor(res)
         return
 
     st.caption(
@@ -741,6 +822,11 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
         sd["ror"] *= 100
         st.dataframe(sd.style.format({c: "{:.2f}" for c in sd.select_dtypes("number").columns}, na_rep="n/a"),
                      use_container_width=True, hide_index=True)
+
+    # ── Reverse Iron Condor (Long-Condor) ──
+    st.divider()
+    _render_reverse_condor(res)
+    st.divider()
 
     # ── Condor aus dieser Zeile ins Depot uebernehmen ──
     st.markdown("**Condor aus einer Zeile zum Depot hinzufuegen**")

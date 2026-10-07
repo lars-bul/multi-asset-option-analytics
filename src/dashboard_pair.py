@@ -9,6 +9,19 @@ LAUFZEIT: fuer beide Instrumente werden die verfuegbaren Verfallstage aus der
 Live-Kette gelesen; angeboten werden nur Verfallstage, die es bei BEIDEN gibt
 (gleiches Datum). Beide Seiten werden mit exakt diesem Verfall gebaut.
 
+BEIN-ROLLEN (KORRIGIERT):
+  Lead     = Credit-Spread: inneres Bein SHORT, aeusseres Bein (Fluegel) LONG.
+  Follower = Debit-Spread:  inneres Bein LONG,  aeusseres Bein (Fluegel) SHORT.
+  Die Spalten heissen daher: 'Lead Short %' / 'Lead Long (Fluegel) %' und
+  'Follower Long %' / 'Follower Short (Fluegel) %'. (Vorher waren die beiden
+  Follower-Labels vertauscht.)
+
+NEUER TAB: In der Sidebar oeffnet 'In neuem Tab oeffnen' dieselbe Anwendung in
+einem neuen Browser-Tab (eigene Streamlit-Session, eigenes Ergebnis). Lead,
+Follower und Verfall werden ueber URL-Parameter (pt_lead/pt_follower/pt_expiry)
+uebernommen; bestehende URL-Parameter bleiben erhalten (falls dashboard.py den
+Modus per Query-Parameter steuert, wird er also mitgenommen).
+
 ERGEBNIS-PERSISTENZ: das Ergebnis liegt in st.session_state['pair_result']
 (dashboard.py loescht den Schluessel beim Instrumentwechsel). Sortieren/
 Filtern/Spaltenklick rechnet NICHTS neu und laesst die Tabelle stehen; neu
@@ -25,6 +38,7 @@ steigen stark) und 'Max-Gewinn Unterseite' (beide fallen auf 0).
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlencode
 
 import pandas as pd
 import streamlit as st
@@ -62,6 +76,43 @@ _SORT_OPTIONS = {
 }
 
 _fragment = getattr(st, "fragment", None) or (lambda f: f)
+
+
+# ── Neuer Tab / URL-Parameter ────────────────────────────────────────
+
+def _qp(name: str):
+    """Einzelnen Query-Parameter als String lesen (oder None)."""
+    try:
+        val = st.query_params.get(name)
+    except Exception:
+        return None
+    if isinstance(val, list):
+        val = val[0] if val else None
+    return val
+
+
+def _new_tab_url(lead_key: str, follower_key: str, expiry) -> str:
+    """Relative URL (nur Query-String) auf dieselbe App; bestehende Parameter
+    bleiben erhalten, die Pair-Parameter werden gesetzt/ueberschrieben."""
+    try:
+        params = {k: (v[0] if isinstance(v, list) else v) for k, v in dict(st.query_params).items()}
+    except Exception:
+        params = {}
+    params["pt_lead"] = lead_key
+    params["pt_follower"] = follower_key
+    if expiry is not None:
+        params["pt_expiry"] = str(pd.Timestamp(expiry).date())
+    return "?" + urlencode(params)
+
+
+def _new_tab_button(lead_key: str, follower_key: str, expiry) -> None:
+    url = _new_tab_url(lead_key, follower_key, expiry)
+    label = "In neuem Tab oeffnen"
+    link_button = getattr(st, "link_button", None)
+    if link_button is not None:
+        link_button(label, url, use_container_width=True)
+    else:  # aeltere Streamlit-Versionen
+        st.markdown(f'<a href="{url}" target="_blank" rel="noopener">{label} ↗</a>', unsafe_allow_html=True)
 
 
 # ── Kette / Verfallstage ─────────────────────────────────────────────
@@ -166,8 +217,8 @@ def _render_result() -> None:
         "c_train", "c_val", "c_t", "c_tail",
         "ror", "mean", "tstat", "e_train", "e_val",
         "max_loss", "max_loss_struct", "max_loss_hist", "max_loss_up", "max_gain_down",
-        "lead_short_distance", "lead_wing_distance", "vol_lead_pct",
-        "follower_short_distance", "follower_wing_distance", "vol_follower_pct",
+        "lead_short_distance", "lead_long_distance", "vol_lead_pct",
+        "follower_long_distance", "follower_short_distance", "vol_follower_pct",
         "follower_qty",
     ]].rename(columns={
         "structure": "Struktur", "loss_prob_pct": "Verlust-Wahrsch. %", "full_loss_pct": "Vollverlust %",
@@ -179,9 +230,11 @@ def _render_result() -> None:
         "max_loss": "Max-Verlust (verwendet)", "max_loss_struct": "Max-Verlust strukturell",
         "max_loss_hist": "Schlechtester Analog-Tag",
         "max_loss_up": "Max-Verlust Oberseite", "max_gain_down": "Max-Gewinn Unterseite",
-        "lead_short_distance": "Lead Short %", "lead_wing_distance": "Lead Fluegel %",
+        # Lead: innen = SHORT, aussen (Fluegel) = LONG
+        "lead_short_distance": "Lead Short %", "lead_long_distance": "Lead Long (Fluegel) %",
         "vol_lead_pct": "Lead-IV %",
-        "follower_short_distance": "Follower Short %", "follower_wing_distance": "Follower Fluegel %",
+        # Follower: innen = LONG, aussen (Fluegel) = SHORT
+        "follower_long_distance": "Follower Long %", "follower_short_distance": "Follower Short (Fluegel) %",
         "vol_follower_pct": "Follower-IV %",
         "follower_qty": "Follower-Menge",
     })
@@ -201,6 +254,10 @@ def _render_result() -> None:
     )
     st.caption(
         f"{len(view)} Zeilen. Spaltenkoepfe sind direkt anklickbar (sortiert nur die Anzeige). "
+        "BEIN-ROLLEN: Lead = Credit-Spread - 'Lead Short %' = verkauftes (inneres, naeher am Spot) Bein, "
+        "'Lead Long (Fluegel) %' = gekauftes (aeusseres) Schutzbein. Follower = Debit-Spread - "
+        "'Follower Long %' = gekauftes (inneres) Bein, 'Follower Short (Fluegel) %' = verkauftes (aeusseres) Bein. "
+        "Alle Distanzen in % vom Spot. "
         "'Kredit (netto)' = Lead-Kredit + Follower-Debit (negativ), in Geld je Lead-Kontrakt. "
         "'Verlust-Wahrsch.' = gewichteter Anteil Analog-Tage mit Gesamt-P&L < 0. "
         "'Vollverlust %' = Anteil Analog-Tage, an denen der Gesamtspread den verwendeten Max-Verlust "
@@ -229,13 +286,27 @@ def render(instr: InstrumentConfig) -> None:
         st.warning("Es werden mindestens zwei Instrumente mit Live-Kette benoetigt.")
         return
 
+    # Vorbelegung aus URL-Parametern (z.B. nach 'In neuem Tab oeffnen'), nur einmal je Session
+    # und nur, solange der Widget-Key noch nicht existiert.
+    if "pt_lead" not in st.session_state and _qp("pt_lead") in providers:
+        st.session_state["pt_lead"] = _qp("pt_lead")
+    if "pt_follower" not in st.session_state:
+        seed_lead = st.session_state.get("pt_lead", instr.key if instr.key in providers else providers[0])
+        seed_follower = _qp("pt_follower")
+        if seed_follower in providers and seed_follower != seed_lead:
+            st.session_state["pt_follower"] = seed_follower
+
     with st.sidebar:
         st.divider()
         st.header("Pair-Trade")
         lead_idx = providers.index(instr.key) if instr.key in providers else 0
-        lead_key = st.selectbox("Lead-Instrument", providers, index=lead_idx,
-                                format_func=lambda k: INSTRUMENTS[k].label, key="pt_lead")
+        lead_kwargs = {} if "pt_lead" in st.session_state else {"index": lead_idx}
+        lead_key = st.selectbox("Lead-Instrument", providers,
+                                format_func=lambda k: INSTRUMENTS[k].label, key="pt_lead", **lead_kwargs)
         follower_opts = [k for k in providers if k != lead_key]
+        # Gespeicherter Follower nicht mehr in den Optionen (z.B. Lead gewechselt) -> verwerfen
+        if st.session_state.get("pt_follower") not in follower_opts:
+            st.session_state.pop("pt_follower", None)
         follower_key = st.selectbox("Follower-Instrument", follower_opts,
                                     format_func=lambda k: INSTRUMENTS[k].label, key="pt_follower")
 
@@ -245,12 +316,20 @@ def render(instr: InstrumentConfig) -> None:
         common = sorted(set(_expiries(lead_snap)) & set(_expiries(follower_snap)))
         expiry = None
         if common:
+            if "pt_expiry" not in st.session_state and _qp("pt_expiry"):
+                match = [d for d in common if str(pd.Timestamp(d).date()) == _qp("pt_expiry")]
+                if match:
+                    st.session_state["pt_expiry"] = match[0]
+            if st.session_state.get("pt_expiry") not in common:
+                st.session_state.pop("pt_expiry", None)
             expiry = st.selectbox(
                 "Laufzeit (bei beiden verfuegbar)", common,
                 format_func=lambda d: f"{pd.Timestamp(d).date()} (DTE {_dte(d)})", key="pt_expiry",
             )
         else:
             st.warning("Kein gemeinsamer Verfall bei Lead und Follower.")
+
+        _new_tab_button(lead_key, follower_key, expiry)
 
         with st.expander("Erweiterte Einstellungen"):
             max_distance = st.number_input("Max. Distanz (Aehnlichkeit)", 0.01, 100.0, 4.0, 0.5, key="pt_maxdist")
@@ -261,6 +340,15 @@ def render(instr: InstrumentConfig) -> None:
             t_min = st.number_input("Min. t-Stat (HAC)", 0.0, 10.0, 3.0, 0.1, key="pt_tmin")
             ml_label = st.selectbox("Max-Verlust-Basis",
                                     ["Strukturell (exakt)", "Empirisch (schlechtester Analog-Tag)"], key="pt_mlbasis")
+
+    # URL spiegelt die aktuelle Auswahl (damit Kopieren/Neuer Tab/Reload dieselbe Ansicht liefert)
+    try:
+        st.query_params["pt_lead"] = lead_key
+        st.query_params["pt_follower"] = follower_key
+        if expiry is not None:
+            st.query_params["pt_expiry"] = str(pd.Timestamp(expiry).date())
+    except Exception:
+        pass
 
     if lead_snap["enriched"].empty or follower_snap["enriched"].empty:
         st.error("Eine der beiden Ketten ist leer (Markt geschlossen / Provider-Fehler?).")

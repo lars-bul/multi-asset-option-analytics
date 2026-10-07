@@ -4,6 +4,20 @@ auf dem geshortet wird - bestimmt den Aehnlichkeitsraum, siehe
 analog_matching.find_analogs) mit der tatsaechlichen historischen Bewegung
 EINES ZWEITEN Instruments (Follower) an GENAU DENSELBEN Kalendertagen.
 
+BEIN-ROLLEN (KORRIGIERT - die Spaltennamen folgen jetzt der echten Rolle):
+  Beide Tabellen sind nach distance_pct aufsteigend sortiert; Index i = INNERES
+  Bein (naeher am Spot), Index j = AEUSSERES Bein (weiter OTM, "Fluegel").
+  Lead     (Credit-Spread): inneres Bein = SHORT, aeusseres Bein = LONG.
+  Follower (Debit-Spread) : inneres Bein = LONG,  aeusseres Bein = SHORT.
+  Ergebnis-Spalten:
+    lead_short_distance     = Distanz des Lead-SHORT-Beins   (innen)
+    lead_long_distance      = Distanz des Lead-LONG-Beins    (aussen, Fluegel)
+    follower_long_distance  = Distanz des Follower-LONG-Beins  (innen)
+    follower_short_distance = Distanz des Follower-SHORT-Beins (aussen, Fluegel)
+  (Frueher hiess der Follower-Eintrag 'follower_short_distance' faelschlich das
+  INNERE = LONG-Bein und 'follower_wing_distance' das aeussere = SHORT-Bein;
+  'lead_wing_distance' heisst jetzt 'lead_long_distance'.)
+
 ABLAUF von evaluate_pair_grid():
   1. Kreuzmenge: alle Lead-Spreads x alle Follower-Spreads x Mengenfaktoren x
      3 Strukturen (put_spread / call_spread / iron_condor).
@@ -19,7 +33,7 @@ ABLAUF von evaluate_pair_grid():
 'width_lead_pct', 'width_follower_pct' wurde entfernt. Die spread-eigenen IVs
 'vol_lead_pct'/'vol_follower_pct' bleiben als reine Info-Spalten.)
 
-EXTREMWERTE OBERSEITE / UNTERSEITE (NEU):
+EXTREMWERTE OBERSEITE / UNTERSEITE:
   'max_loss_up'   = Verlust der Gesamtposition, wenn BEIDE Basiswerte stark
                     steigen (S -> unendlich, jedes Bein im Extremwert).
                     Positiv = Verlust, negativ = Gewinn (z.B. Put-Credit-Spread:
@@ -191,7 +205,8 @@ def _row_payoffs(table: pd.DataFrame, S_hyp: np.ndarray):
 
 def _vertical_spread(K_inner, K_wing, bid_inner, ask_inner, bid_wing, ask_wing,
                       pay_inner, pay_wing, is_put: bool, is_short: bool):
-    """Ein Vertical-Spread (eine Seite, ein Instrument).
+    """Ein Vertical-Spread (eine Seite, ein Instrument). 'inner' = naeher am
+    Spot (kleinere distance_pct), 'wing' = weiter OTM.
     is_short=True (Lead): Short inner / Long Wing -> Credit.
     is_short=False (Follower): Long inner / Short Wing -> Debit.
     Rueckgabe (net_cf, pay_diff, legs) oder None. legs = [(K, is_put, sign)],
@@ -357,8 +372,12 @@ def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame, p
                         base = {
                             "structure": structure,
                             "lead_i": li, "lead_j": lj, "follower_i": fi, "follower_j": fj,
-                            "lead_short_distance": float(ldist[li]), "lead_wing_distance": float(ldist[lj]),
-                            "follower_short_distance": float(fdist[fi]), "follower_wing_distance": float(fdist[fj]),
+                            # Rollenbasierte Distanzen (innen = i, aussen = j):
+                            #   Lead: innen SHORT, aussen LONG | Follower: innen LONG, aussen SHORT
+                            "lead_short_distance": float(ldist[li]),
+                            "lead_long_distance": float(ldist[lj]),
+                            "follower_long_distance": float(fdist[fi]),
+                            "follower_short_distance": float(fdist[fj]),
                             "vol_lead_pct": vol_lead, "vol_follower_pct": vol_foll,
                             "follower_qty": q, "qty_factor": factor,
                             "net_cashflow": np.nan, "max_loss": np.nan,

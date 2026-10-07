@@ -1327,6 +1327,18 @@ def render(df, daily_df, has_resolution, instr: InstrumentConfig) -> None:
                     ("2020-02-15", "2020-04-15", "Corona-Crash 2020"),
                 ]
                 dbg = moves_dbg.sort_values("weight", ascending=False).copy()
+                hv_by_date = bounds.set_index("date")["hv"]
+                dbg["hv_analog"] = dbg["entry_date"].map(hv_by_date)
+
+                _ok = dbg["hv_analog"].notna()
+                if _ok.any():
+                    w_ok = dbg.loc[_ok, "weight"]
+                    hv_w = float((w_ok * dbg.loc[_ok, "hv_analog"]).sum() / w_ok.sum())
+                    st.caption(
+                        f"Gewichtete mittlere HV der Analog-Tage: **{hv_w*100:.2f}%** "
+                        f"vs. heutige HV: **{flat_hv*100:.2f}%** "
+                        f"(Verhältnis heute/Analog: {flat_hv/hv_w:.2f})."
+    )
                 dbg["weight_share_pct"] = dbg["weight"] / dbg["weight"].sum() * 100.0
                 dbg["ret_pct"] = dbg["ret"] * 100.0
 

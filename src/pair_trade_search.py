@@ -9,15 +9,27 @@ ABLAUF von evaluate_pair_grid():
      3 Strukturen (put_spread / call_spread / iron_condor).
   2. JEDE Kombination bekommt EINE Zeile. EINZIGER Ausschlussgrund:
        'ungueltige_bepreisung' - ein Bein hat keinen gueltigen Bid/Ask-Spread
-     Alles andere wird bewertet. Die Vola-Breiten-Regel (3.) ist nur noch die
-     Info-Spalte 'vol_rule_ok' und schliesst nichts aus.
-  3. VOLA-BREITEN-REGEL (nur Info): hat der Lead die hoehere spread-eigene IV,
-     "soll" sein Spread (in % vom Spot) breiter sein, bei niedrigerer IV
-     schmaler. Ergebnis steht in 'vol_rule_ok'.
-  4. ROBUSTHEIT NUR AUF DEM GESAMTSPREAD (Lead + Follower zusammen):
+     Alles andere wird bewertet.
+  3. ROBUSTHEIT NUR AUF DEM GESAMTSPREAD (Lead + Follower zusammen):
      Train>0, Val>0, HAC-t>Schwelle, Tail. KEINE Einzelbein-Tests.
-  5. Ausgabe: alle Zeilen; sortiert erst nach 'tested', dann 'passes', dann
+  4. Ausgabe: alle Zeilen; sortiert erst nach 'tested', dann 'passes', dann
      nach Verlustwahrscheinlichkeit (aufsteigend).
+
+(Die frueher hier beschriebene Vola-Breiten-Regel samt Spalten 'vol_rule_ok',
+'width_lead_pct', 'width_follower_pct' wurde entfernt. Die spread-eigenen IVs
+'vol_lead_pct'/'vol_follower_pct' bleiben als reine Info-Spalten.)
+
+EXTREMWERTE OBERSEITE / UNTERSEITE (NEU):
+  'max_loss_up'   = Verlust der Gesamtposition, wenn BEIDE Basiswerte stark
+                    steigen (S -> unendlich, jedes Bein im Extremwert).
+                    Positiv = Verlust, negativ = Gewinn (z.B. Put-Credit-Spread:
+                    Kredit = Max-Gewinn -> negativer Wert; Put-Debit: Debit =
+                    Max-Verlust -> positiver Wert).
+  'max_gain_down' = P&L der Gesamtposition, wenn BEIDE Basiswerte auf 0 fallen.
+                    Positiv = Gewinn, negativ = Verlust.
+  Beide exakt und korrelationsfrei: oben ist jeder Put wertlos und der
+  Call-Anteil konstant (-Summe sign*K, da jedes Paket aus Long/Short-Paaren
+  besteht); unten ist jeder Call wertlos und der Put-Anteil Summe sign*K.
 
 MAX-VERLUST (korrigiert) - warum die alte Version falsch war:
   Alt (a): Iron Condor = Summe von Put- UND Call-Max-Loss. Ein Condor kann aber
@@ -152,7 +164,6 @@ class PairTradeConfig:
     sort_by: str = "loss_prob_pct"     # "loss_prob_pct" (aufsteigend) | "ror" | "mean" | "tstat"
     max_loss_basis: str = "structural"  # "structural" (exakt, Standard) | "empirical" (schlechtester Analog-Tag)
     max_grid_cells: int = 5_000        # Zellen = Lead-Paare x Follower-Paare x Mengenfaktoren (Zeilen = 3x)
-    vol_width_tolerance: float = 0.05  # rel. IV-Unterschied, unter dem keine Breiten-Ordnung verlangt wird
     lead_multiplier: float = 100.0
     follower_multiplier: float = 100.0
     qty_factors: tuple = (1.0,)        # Follower-Menge = notional_ratio * Faktor
@@ -223,6 +234,17 @@ def _min_pnl_points(net_cf: float, legs) -> float:
     return float(pnl.min())
 
 
+def _extreme_pnl_points(net_cf: float, legs, side: str) -> float:
+    """P&L (in Punkten) eines Bein-Pakets im Extremwert der Oberseite
+    (side='up', S -> unendlich) bzw. Unterseite (side='down', S = 0).
+    Oben: Puts wertlos; Calls liefern sign*(S-K), die S-Anteile heben sich auf
+    (Long/Short-Paare) -> Rest = -Summe(sign*K ueber Calls).
+    Unten: Calls wertlos; Puts liefern sign*K."""
+    if side == "up":
+        return float(net_cf - sum(sign * K for K, is_put, sign in legs if not is_put))
+    return float(net_cf + sum(sign * K for K, is_put, sign in legs if is_put))
+
+
 def dedupe_strike_rows(table: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     key = table[["strike_put", "strike_call"]].apply(pd.to_numeric, errors="coerce").round(6)
     dup = key.duplicated(keep="first").to_numpy()
@@ -232,20 +254,6 @@ def dedupe_strike_rows(table: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 def _spread_vol_pct(iv: np.ndarray, i: int, j: int) -> float:
     vals = [v for v in (iv[i], iv[j]) if np.isfinite(v)]
     return float(np.mean(vals)) if vals else float("nan")
-
-
-def _width_order_ok(vol_lead: float, vol_follower: float, width_lead_pct: float,
-                     width_follower_pct: float, tolerance: float) -> bool:
-    """Lead hoehere Vola -> Lead-Spread breiter; Lead niedrigere Vola -> schmaler.
-    Fehlende Vola -> verworfen. Unter 'tolerance' keine Ordnung."""
-    if not (np.isfinite(vol_lead) and np.isfinite(vol_follower)):
-        return False
-    hi = max(vol_lead, vol_follower)
-    if hi <= 0.0 or abs(vol_lead - vol_follower) / hi < tolerance:
-        return True
-    if vol_lead > vol_follower:
-        return width_lead_pct > width_follower_pct
-    return width_lead_pct < width_follower_pct
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -333,13 +341,10 @@ def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame, p
                                     pay_p_lead[li], pay_p_lead[lj], True, True)
             lcall = _vertical_spread(lKc[li], lKc[lj], lbc[li], lac[li], lbc[lj], lac[lj],
                                      pay_c_lead[li], pay_c_lead[lj], False, True)
-            width_lead = abs(ldist[lj] - ldist[li])
             vol_lead = _spread_vol_pct(liv, li, lj)
 
             for fi, fj, fput, fcall in follower_cache:
-                width_foll = abs(fdist[fj] - fdist[fi])
                 vol_foll = _spread_vol_pct(fiv, fi, fj)
-                vol_ok = _width_order_ok(vol_lead, vol_foll, width_lead, width_foll, cfg.vol_width_tolerance)
 
                 structures = [
                     ("put_spread", lput, fput),
@@ -355,13 +360,12 @@ def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame, p
                             "lead_short_distance": float(ldist[li]), "lead_wing_distance": float(ldist[lj]),
                             "follower_short_distance": float(fdist[fi]), "follower_wing_distance": float(fdist[fj]),
                             "vol_lead_pct": vol_lead, "vol_follower_pct": vol_foll,
-                            "width_lead_pct": width_lead, "width_follower_pct": width_foll,
                             "follower_qty": q, "qty_factor": factor,
                             "net_cashflow": np.nan, "max_loss": np.nan,
                             "max_loss_struct": np.nan, "max_loss_hist": np.nan,
+                            "max_loss_up": np.nan, "max_gain_down": np.nan,
                             "loss_prob_pct": np.nan, "full_loss_pct": np.nan, "lead_full_loss_pct": np.nan,
                             "lead_net_cashflow": np.nan, "follower_net_cashflow": np.nan,
-                            "vol_rule_ok": vol_ok,   # NUR Info-Spalte, schliesst NICHTS aus
                             "tested": False, "exclude_reason": "", "passes": False,
                             **_NAN_STATS, **_NAN_FLAGS,
                         }
@@ -379,6 +383,14 @@ def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame, p
                         struct_ml = max(0.0, -(lead_min + f_scale * _min_pnl_points(f_net, f_legs)))
                         base["net_cashflow"], base["max_loss_struct"] = combined_net, struct_ml
                         base["lead_net_cashflow"], base["follower_net_cashflow"] = lm * l_net, f_scale * f_net
+
+                        # Extremwerte: beide Basiswerte oben (S -> inf) bzw. unten (S = 0)
+                        up_total = (lm * _extreme_pnl_points(l_net, l_legs, "up")
+                                    + f_scale * _extreme_pnl_points(f_net, f_legs, "up"))
+                        down_total = (lm * _extreme_pnl_points(l_net, l_legs, "down")
+                                      + f_scale * _extreme_pnl_points(f_net, f_legs, "down"))
+                        base["max_loss_up"] = -up_total      # positiv = Verlust, negativ = Gewinn
+                        base["max_gain_down"] = down_total   # positiv = Gewinn, negativ = Verlust
 
                         pnl_d = lm * (l_net - l_pay) + f_scale * (f_net + f_pay)
                         hist_ml = max(0.0, -float(np.min(pnl_d)))

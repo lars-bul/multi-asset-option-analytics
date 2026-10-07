@@ -17,9 +17,10 @@ st.fragment (falls verfuegbar) - Sortier-Widgets loesen dann auch keinen
 Neuaufbau der ganzen Seite aus.
 
 METHODIK: Lead bestimmt den Aehnlichkeitsraum, Follower wird an denselben
-Kalendertagen mitbewertet; Robustheit NUR auf dem Gesamtspread; Vola-Breiten-
-Regel (hoehere IV -> breiterer Spread); alle Kombinationen werden angezeigt;
-Max-Verlust strukturell exakt (siehe pair_trade_search.py).
+Kalendertagen mitbewertet; Robustheit NUR auf dem Gesamtspread; alle
+Kombinationen werden angezeigt; Max-Verlust strukturell exakt (siehe
+pair_trade_search.py). Zusaetzlich: 'Max-Verlust Oberseite' (beide Basiswerte
+steigen stark) und 'Max-Gewinn Unterseite' (beide fallen auf 0).
 """
 import sys
 import time
@@ -56,6 +57,8 @@ _SORT_OPTIONS = {
     "E[P&L]": ("mean", False),
     "t (HAC)": ("tstat", False),
     "Max-Verlust": ("max_loss", True),
+    "Max-Verlust Oberseite": ("max_loss_up", True),
+    "Max-Gewinn Unterseite": ("max_gain_down", False),
 }
 
 _fragment = getattr(st, "fragment", None) or (lambda f: f)
@@ -158,16 +161,16 @@ def _render_result() -> None:
     show["Status"] = show["exclude_reason"].map(lambda r: _REASON_LABELS.get(r, r))
     show["ror"] = show["ror"] * 100.0
     show = show[[
-        "structure", "Status", "vol_rule_ok", "loss_prob_pct", "full_loss_pct", "lead_full_loss_pct", "passes",
+        "structure", "Status", "loss_prob_pct", "full_loss_pct", "lead_full_loss_pct", "passes",
         "net_cashflow", "lead_net_cashflow", "follower_net_cashflow",
         "c_train", "c_val", "c_t", "c_tail",
         "ror", "mean", "tstat", "e_train", "e_val",
-        "max_loss", "max_loss_struct", "max_loss_hist",
-        "lead_short_distance", "lead_wing_distance", "vol_lead_pct", "width_lead_pct",
-        "follower_short_distance", "follower_wing_distance", "vol_follower_pct", "width_follower_pct",
+        "max_loss", "max_loss_struct", "max_loss_hist", "max_loss_up", "max_gain_down",
+        "lead_short_distance", "lead_wing_distance", "vol_lead_pct",
+        "follower_short_distance", "follower_wing_distance", "vol_follower_pct",
         "follower_qty",
     ]].rename(columns={
-        "structure": "Struktur", "vol_rule_ok": "Vola-Regel ok", "loss_prob_pct": "Verlust-Wahrsch. %", "full_loss_pct": "Vollverlust %",
+        "structure": "Struktur", "loss_prob_pct": "Verlust-Wahrsch. %", "full_loss_pct": "Vollverlust %",
         "lead_full_loss_pct": "Lead-Vollverlust %", "passes": "Kandidat",
         "net_cashflow": "Kredit (netto)", "lead_net_cashflow": "Lead-Kredit",
         "follower_net_cashflow": "Follower (Debit = neg.)",
@@ -175,10 +178,11 @@ def _render_result() -> None:
         "ror": "Rendite/Risiko %", "mean": "E[P&L]", "tstat": "t (HAC)", "e_train": "E Train", "e_val": "E Val",
         "max_loss": "Max-Verlust (verwendet)", "max_loss_struct": "Max-Verlust strukturell",
         "max_loss_hist": "Schlechtester Analog-Tag",
+        "max_loss_up": "Max-Verlust Oberseite", "max_gain_down": "Max-Gewinn Unterseite",
         "lead_short_distance": "Lead Short %", "lead_wing_distance": "Lead Fluegel %",
-        "vol_lead_pct": "Lead-IV %", "width_lead_pct": "Lead-Breite %",
+        "vol_lead_pct": "Lead-IV %",
         "follower_short_distance": "Follower Short %", "follower_wing_distance": "Follower Fluegel %",
-        "vol_follower_pct": "Follower-IV %", "width_follower_pct": "Follower-Breite %",
+        "vol_follower_pct": "Follower-IV %",
         "follower_qty": "Follower-Menge",
     })
     st.dataframe(
@@ -189,8 +193,9 @@ def _render_result() -> None:
             "E Train": "{:+.2f}", "E Val": "{:+.2f}",
             "Max-Verlust (verwendet)": "{:.2f}", "Max-Verlust strukturell": "{:.2f}",
             "Schlechtester Analog-Tag": "{:.2f}",
-            "Lead-IV %": "{:.1f}", "Lead-Breite %": "{:.2f}",
-            "Follower-IV %": "{:.1f}", "Follower-Breite %": "{:.2f}", "Follower-Menge": "{:.3f}",
+            "Max-Verlust Oberseite": "{:+.2f}", "Max-Gewinn Unterseite": "{:+.2f}",
+            "Lead-IV %": "{:.1f}",
+            "Follower-IV %": "{:.1f}", "Follower-Menge": "{:.3f}",
         }, na_rep="–"),
         use_container_width=True, hide_index=True, height=650,
     )
@@ -201,7 +206,11 @@ def _render_result() -> None:
         "'Vollverlust %' = Anteil Analog-Tage, an denen der Gesamtspread den verwendeten Max-Verlust "
         "erreicht (bei strukturellem Max-Verlust praktisch immer ~0, da er Lead- und Follower-Extrem "
         "gleichzeitig annimmt). 'Lead-Vollverlust %' = Anteil Tage, an denen der Lead-Spread allein "
-        "seinen vollen Max-Verlust erreicht (reine Info-Spalte, kein Kriterium)."
+        "seinen vollen Max-Verlust erreicht (reine Info-Spalte, kein Kriterium). "
+        "'Max-Verlust Oberseite' = Verlust der Gesamtposition, wenn BEIDE Basiswerte stark steigen "
+        "(jedes Bein im Extremwert); positiv = Verlust, negativ = Gewinn (z.B. Put-Credit-Spread: "
+        "Kredit = Max-Gewinn -> negativer Wert). 'Max-Gewinn Unterseite' = P&L, wenn BEIDE Basiswerte "
+        "auf 0 fallen; positiv = Gewinn, negativ = Verlust."
     )
 
 
@@ -211,7 +220,7 @@ def render(instr: InstrumentConfig) -> None:
     st.header("Pair-Trade-Suche")
     st.caption(
         "Lead bestimmt die Analog-Tage, der Follower wird an denselben Kalendertagen mitbewertet. "
-        "Robustheit nur auf dem Gesamtspread. Die Spalte 'Vola-Regel ok' zeigt, ob die Breiten-Ordnung (hoehere IV -> breiter) erfuellt ist - schliesst nichts aus. "
+        "Robustheit nur auf dem Gesamtspread. "
         "Alle untersuchten Kombinationen werden angezeigt. Berechnung startet automatisch."
     )
 
@@ -250,7 +259,6 @@ def render(instr: InstrumentConfig) -> None:
             dist_input = st.text_input("Distanz-Raster (%)", _DEFAULT_DISTANCES, key="pt_dist")
             qty_input = st.text_input("Follower-Mengenfaktoren", "1.0", key="pt_qty")
             t_min = st.number_input("Min. t-Stat (HAC)", 0.0, 10.0, 3.0, 0.1, key="pt_tmin")
-            vol_tol = st.number_input("Vola-Toleranz (nur Info-Spalte) (%)", 0.0, 50.0, 5.0, 1.0, key="pt_voltol") / 100.0
             ml_label = st.selectbox("Max-Verlust-Basis",
                                     ["Strukturell (exakt)", "Empirisch (schlechtester Analog-Tag)"], key="pt_mlbasis")
 
@@ -266,18 +274,18 @@ def render(instr: InstrumentConfig) -> None:
     _ensure_training_table(lead_instr)
 
     params = (lead_key, follower_key, str(pd.Timestamp(expiry).date()), max_distance, bandwidth, min_gap,
-              dist_input, qty_input, t_min, vol_tol, ml_label)
+              dist_input, qty_input, t_min, ml_label)
 
     store = st.session_state.get("pair_result")
     if store is None or store["meta"]["params"] != params:
         st.session_state.pop("pair_result", None)
         _compute(lead_instr, follower_instr, lead_snap, follower_snap, expiry, max_distance, bandwidth,
-                 min_gap, dist_input, qty_input, t_min, vol_tol, ml_label, params)
+                 min_gap, dist_input, qty_input, t_min, ml_label, params)
     _render_result()
 
 
 def _compute(lead_instr, follower_instr, lead_snap, follower_snap, expiry, max_distance, bandwidth, min_gap,
-             dist_input, qty_input, t_min, vol_tol, ml_label, params) -> None:
+             dist_input, qty_input, t_min, ml_label, params) -> None:
     try:
         distances = [float(x) for x in dist_input.split(",") if x.strip()]
         qty_factors = tuple(float(x) for x in qty_input.split(",") if x.strip()) or (1.0,)
@@ -303,7 +311,7 @@ def _compute(lead_instr, follower_instr, lead_snap, follower_snap, expiry, max_d
             st.error("Distanz-Tabelle/HV fuer den gewaehlten Verfall nicht verfuegbar.")
             return
         if "iv_pair_pct" not in lead_table.columns or "iv_pair_pct" not in follower_table.columns:
-            st.error("Distanz-Tabelle liefert keine 'iv_pair_pct'-Spalte - Vola-Breiten-Regel nicht moeglich.")
+            st.error("Distanz-Tabelle liefert keine 'iv_pair_pct'-Spalte - IV-Anzeige nicht moeglich.")
             return
         ctx = _find_today_analogs(lead_daily, float(dte), max_distance, bandwidth, min_gap, lead_instr)
     if ctx is None:
@@ -317,7 +325,7 @@ def _compute(lead_instr, follower_instr, lead_snap, follower_snap, expiry, max_d
 
     cfg = PairTradeConfig(
         t_min=float(t_min), lead_multiplier=lead_instr.multiplier, follower_multiplier=follower_instr.multiplier,
-        vol_width_tolerance=float(vol_tol), qty_factors=qty_factors,
+        qty_factors=qty_factors,
         max_loss_basis="structural" if ml_label.startswith("Strukturell") else "empirical",
     )
     try:

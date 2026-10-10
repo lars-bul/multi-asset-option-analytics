@@ -23,6 +23,12 @@ urspruenglichen Fassung.
 
 NEU: evaluate_reverse_condor_grid() - Reverse Iron Condor (Long-Condor) auf
 denselben Analog-Tagen/Gewichten. Alle bisherigen Funktionen sind unveraendert.
+
+NEU (optionales Tail-Kriterium): CondorConfig.use_tail (Default True = bisheriges
+Verhalten). Bei use_tail=False wird das Tail-Kriterium (Voll-Verlust-Anteil +
+5%-Quantil) NICHT mehr in 'c_base' bzw. 'passes' einbezogen; die Kennzahlen/die
+Spalte 'c_tail' werden weiterhin berechnet und angezeigt (nur Information).
+Der Reverse Condor hat ohnehin kein Tail-Kriterium und ist davon unberuehrt.
 """
 from __future__ import annotations
 
@@ -43,6 +49,7 @@ class CondorConfig:
     tail_floor: float = -0.75          # min. gewichtetes 5%-Quantil von pnl/max_loss
     require_plateau: bool = True
     sort_by: str = "ror"              # Ranking der Kandidaten: "ror" (Rendite/Risiko, Standard) | "mean" (E[P&L] in Punkten) | "tstat"
+    use_tail: bool = True              # False = Tail-Kriterium zaehlt nicht fuer 'c_base'/'passes' (nur Anzeige)
 
 
 def analog_moves(analogs: pd.DataFrame, training_table: pd.DataFrame, T_days: int,
@@ -107,7 +114,8 @@ def weighted_pnl_stats(x: np.ndarray, w: np.ndarray, dates, hold_days: int,
 def criteria_flags(stats: dict, cfg: "CondorConfig") -> dict:
     """Die Basis-Kriterien (Train>0, Val>0, t>Schwelle, Tail) fuer EINE Kennzahlen-Zeile - dieselbe
     Definition wie in der Iron-Condor-Suche. Nicht bestimmbare Werte (NaN, z.B. Tail bei
-    unbegrenztem Risiko) gelten als NICHT bestanden."""
+    unbegrenztem Risiko) gelten als NICHT bestanden. Bei cfg.use_tail=False zaehlt 'c_tail' nicht
+    fuer 'c_base' (bleibt aber als Information in den Flags)."""
     def gt(a, b):
         return bool(np.isfinite(a) and a > b)
     c_train = gt(stats["e_train"], 0.0)
@@ -115,8 +123,9 @@ def criteria_flags(stats: dict, cfg: "CondorConfig") -> dict:
     c_t = gt(stats["tstat"], cfg.t_min)
     fl, q = stats["full_loss_share"], stats["q_tail"]
     c_tail = bool(np.isfinite(fl) and np.isfinite(q) and fl <= cfg.max_full_loss_share and q >= cfg.tail_floor)
+    use_tail = getattr(cfg, "use_tail", True)
     return {"c_train": c_train, "c_val": c_val, "c_t": c_t, "c_tail": c_tail,
-            "c_base": bool(c_train and c_val and c_t and c_tail)}
+            "c_base": bool(c_train and c_val and c_t and (c_tail or not use_tail))}
 
 
 def analog_robustness(moves: pd.DataFrame, pnl: np.ndarray) -> dict:
@@ -143,6 +152,29 @@ def analog_robustness(moves: pd.DataFrame, pnl: np.ndarray) -> dict:
         "subperiod_matching": rel_full["subperiod_matching"], "subperiod_nonempty": rel_full["subperiod_nonempty"],
         "tstat_val": val_rel["tstat"], "robust_train_val": robust, "robust_train_val_neg": robust_neg,
     }
+
+
+def apply_criteria(df: pd.DataFrame, kind: str, use_tail: bool = True, require_plateau: bool = True,
+                   sort_by: str = "ror") -> pd.DataFrame:
+    """Berechnet 'c_base', 'passes' und die Sortierung aus den BEREITS vorhandenen Kriterien-Flags
+    neu - OHNE die Analog-Bewertung zu wiederholen. Damit lassen sich Tail- und Plateau-Kriterium
+    nachtraeglich ein-/ausschalten, ohne dass etwas neu gerechnet werden muss.
+
+    kind: 'condor' (Flags c_train/c_val/c_t/c_tail + c_short + c_plateau) oder
+          'reverse' (c_train/c_val/c_t + c_long + c_plateau; kein Tail-Kriterium)."""
+    if df is None or df.empty:
+        return df
+    if kind not in ("condor", "reverse"):
+        raise ValueError(f"kind muss 'condor' oder 'reverse' sein (erhalten: {kind!r}).")
+    out = df.copy()
+    base_cols = ["c_train", "c_val", "c_t"] + (["c_tail"] if (use_tail and kind == "condor") else [])
+    out["c_base"] = out[base_cols].all(axis=1)
+    inner = "c_short" if kind == "condor" else "c_long"
+    ok = out["c_base"] & out[inner].astype(bool)
+    if require_plateau:
+        ok = ok & out["c_plateau"].astype(bool)
+    out["passes"] = ok
+    return out.sort_values(["passes", sort_by], ascending=[False, False]).reset_index(drop=True)
 
 
 def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: float,
@@ -257,6 +289,7 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
         "n_days": len(moves), "hold_max": ctx["hold"],
         "n_eff": float(w.sum() ** 2 / np.sum(w ** 2)),
         "n_pairs": len(cdf),
+        "use_tail": bool(cfg.use_tail),
     }
     if cdf.empty:
         return cdf, sdf, {**meta, "n_pass": 0}
@@ -265,8 +298,9 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
     cdf["c_val"] = cdf["e_val"] > 0
     cdf["c_t"] = cdf["tstat"] > cfg.t_min
     cdf["c_tail"] = (cdf["full_loss_share"] <= cfg.max_full_loss_share) & (cdf["q_tail"] >= cfg.tail_floor)
-    # Basis-Kriterien des Condors selbst (Train, Val, t, Tail)
-    cdf["c_base"] = cdf[["c_train", "c_val", "c_t", "c_tail"]].all(axis=1)
+    # Basis-Kriterien des Condors selbst (Train, Val, t, und - nur falls aktiviert - Tail)
+    base_cols = ["c_train", "c_val", "c_t"] + (["c_tail"] if cfg.use_tail else [])
+    cdf["c_base"] = cdf[base_cols].all(axis=1)
     # Short-Kriterium: die Short-Zeile i (nur Short-Strangle) muss selbst gueltig sein
     cdf["c_short"] = [short_ok[int(i)] for i in cdf["i"]]
 
@@ -277,8 +311,10 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
         erfuellen. Fehlender Nachbar (Rand der Kette) = nicht erfuellt."""
         return (i - 1 >= 0 and short_ok.get(i - 1, False)) and (i + 1 < n and short_ok.get(i + 1, False))
 
-    cdf["c_plateau"] = ([plateau(int(i)) for i in cdf["i"]] if cfg.require_plateau else True)
-    cdf["passes"] = cdf[["c_base", "c_short", "c_plateau"]].all(axis=1)
+    # Plateau-Flag wird IMMER berechnet (damit es nachtraeglich per apply_criteria() ein-/ausgeschaltet
+    # werden kann, ohne neu zu rechnen); cfg.require_plateau steuert nur, ob es in 'passes' zaehlt.
+    cdf["c_plateau"] = [plateau(int(i)) for i in cdf["i"]]
+    cdf["passes"] = cdf["c_base"] & cdf["c_short"] & (cdf["c_plateau"] | (not cfg.require_plateau))
 
     # Ranking der Kandidaten nach cfg.sort_by (Standard: Rendite/Risiko %).
     if cfg.sort_by not in ("ror", "mean", "tstat"):
@@ -401,8 +437,8 @@ def evaluate_reverse_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_
     def plateau(i):
         return (i - 1 >= 0 and long_ok.get(i - 1, False)) and (i + 1 < n and long_ok.get(i + 1, False))
 
-    rdf["c_plateau"] = ([plateau(int(i)) for i in rdf["i"]] if cfg.require_plateau else True)
-    rdf["passes"] = rdf[["c_base", "c_long", "c_plateau"]].all(axis=1)
+    rdf["c_plateau"] = [plateau(int(i)) for i in rdf["i"]]   # immer berechnet, siehe apply_criteria()
+    rdf["passes"] = rdf["c_base"] & rdf["c_long"] & (rdf["c_plateau"] | (not cfg.require_plateau))
 
     if cfg.sort_by not in ("ror", "mean", "tstat"):
         raise ValueError(f"sort_by muss 'ror', 'mean' oder 'tstat' sein (erhalten: {cfg.sort_by!r}).")

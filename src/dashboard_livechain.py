@@ -1,6 +1,7 @@
 """
 MODUS 3: Heutige Kette - symmetrische Abstands-Ansicht + Analog-Tage-Tabelle
-+ modellfreie Iron-Condor-Suche (inkl. Reverse Iron Condor).
++ modellfreie Iron-Condor-Suche (inkl. Reverse Iron Condor)
++ NEU: beste Trades ueber ALLE Laufzeiten (Teil D).
 
 MULTI-INSTRUMENT-UMBAU: dieses Modul bekommt jetzt zusaetzlich das oben
 gewaehlte Instrument (siehe dashboard.py) und ist vollstaendig darauf
@@ -61,11 +62,19 @@ Strangle kaufen, Fluegel verkaufen) - gleiche Analog-Tage (moves), gleiche
 Tabelle, gleicher Auto-Lauf-Block und gleicher Cache wie der Short-Condor
 (kein zusaetzlicher Analog-Lauf, keine zusaetzliche Ladezeit).
 
+TEIL D (NEU): beste Condors UND Reverse Condors ueber ALLE Laufzeiten (Verfaelle)
+des Instruments, sortiert nach Rendite/Risiko %. Gleiche Logik/gleiches Layout wie
+Teil C, aber je Verfall mit eigenen Analog-Tagen (T_days), eigener Distanz-Tabelle
+und eigenem Short-/Long-Kriterium inkl. Plateau. Zusaetzliche Spalte 'Typ'
+(Condor / Reverse Condor) und ein Multiselect zum Ausblenden eines Typs (nur
+Anzeige-Filter, keine Neuberechnung). Rechenintensiv -> nur per Button, Ergebnis
+wird gecacht. Kriterien/Preisbasis kommen aus den Eingaben von Teil C.
+
 AUTOMATISCHER ABLAUF: Sobald dieser Tab geoeffnet wird, laedt die Kette (Auto-Load), danach
 rechnet Teil B (Analog-Tabelle) und anschliessend Teil C (Condor-Suche) von selbst. Neu gerechnet
 wird nur bei geaenderter Kette/Verfall/Raster/Einstellungen/Instrument (Schluessel in
 st.session_state); ein Tab-Wechsel loescht nichts. Die Buttons 'neu berechnen' erzwingen eine
-Neuberechnung.
+Neuberechnung. Teil D laeuft NICHT automatisch (nur per Button).
 """
 import subprocess
 import sys
@@ -90,7 +99,8 @@ from analog_matching import (
 from features import FeatureConfig, build_feature_matrix
 from dashboard_common import load_training_table
 from condor_search import (CondorConfig, analog_moves, evaluate_condor_grid, analog_robustness,
-                           evaluate_reverse_condor_grid)
+                           evaluate_reverse_condor_grid, apply_criteria)
+from quote_filter import QuoteFilterConfig, filter_chain_quotes
 
 _QUOTE_AGE_WARNING_MINUTES = 60.0
 _ANALOG_MIN_CANDIDATES = 20
@@ -98,6 +108,7 @@ _LOW_N_EFF_WARNING = 10.0
 _ROBUST_TSTAT_THRESHOLD = 2.0
 _ROBUST_MIN_PERIODS_MATCH = 5   # mindestens 5 von 6 Teilperioden
 _REQUIRED_T_DAYS = list(range(1, 91))
+_SORT_COL = {"Rendite/Risiko %": "ror", "E[P&L] (Pkt)": "mean", "t (HAC)": "tstat"}
 
 _ROW_STYLE = {
     "green": "background-color: rgba(46, 160, 67, 0.30)",
@@ -111,7 +122,22 @@ _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _ANALOG_CORE: dict = {}    # Analog-Suche (PCA-Fit + Analog-Tage), Schluessel enthaelt instr.key
 _TT_DAYS: dict = {}        # vorhandene T_days der Trainingstabelle je (instr.key, Dateisignatur)
 _BOUNDS_CACHE: dict = {}   # HV-Min/Max-Fenster je (instr.key, Datenstand, HV-Laenge, Lookback)
-_RESULT_CACHE: dict = {}   # letzte Ergebnisse von Teil B ('analog') und Teil C ('condor') samt Schluessel
+_RESULT_CACHE: dict = {}   # letzte Ergebnisse von Teil B ('analog'), Teil C ('condor') und Teil D ('allexp') samt Schluessel
+
+
+_QF_CACHE: dict = {}       # Ergebnis der Quote-Pruefung je (Instrument, Kettenabruf, Parameter)
+
+
+def _filtered_chain(instr: InstrumentConfig, chain: pd.DataFrame, spot: float, r_free: float,
+                    dividend_yield: float, fetch_ts, qcfg: QuoteFilterConfig):
+    """Quote-Pruefung (quote_filter.py) einmal je Kettenabruf/Parameter, danach aus dem Cache -
+    Rerun durch andere Widgets rechnet sie NICHT neu."""
+    key = (instr.key, fetch_ts, float(spot), float(r_free), float(dividend_yield), len(chain), qcfg)
+    if key not in _QF_CACHE:
+        if len(_QF_CACHE) > 6:
+            _QF_CACHE.clear()
+        _QF_CACHE[key] = filter_chain_quotes(chain, spot, r_free, dividend_yield, qcfg)
+    return _QF_CACHE[key]
 
 
 def _tt_file(instr: InstrumentConfig) -> Path:
@@ -166,6 +192,66 @@ def _bounds_cached(daily_df: pd.DataFrame, hv_length: int, lookback: int, instr:
     return _BOUNDS_CACHE[key]
 
 
+_TT_COUNTS: dict = {}      # Zeilen je T_days der Trainingstabelle je (instr.key, Dateisignatur)
+
+
+def _training_counts(instr: InstrumentConfig) -> dict:
+    """Zeilenzahl je T_days (nur die Spalte T_days wird gelesen). {} falls nicht bestimmbar."""
+    sig = _training_table_signature(instr)
+    cache_key = (instr.key, sig)
+    if sig is None:
+        return {}
+    if cache_key in _TT_COUNTS:
+        return _TT_COUNTS[cache_key]
+    try:
+        vc = pd.read_parquet(_tt_file(instr), columns=["T_days"])["T_days"].value_counts()
+        counts = {int(k): int(v) for k, v in vc.items()}
+    except Exception:
+        counts = {}
+    _TT_COUNTS[cache_key] = counts
+    return counts
+
+
+def _thin_t_days(instr: InstrumentConfig, rel_threshold: float = 0.2) -> list[int]:
+    """T_days, die zwar in der Tabelle vorkommen, aber auffaellig DUENN besetzt sind
+    (< rel_threshold * Median der Zeilenzahlen) - z.B. wenn nur wenige Einzelzeilen fuer
+    T_days=1 existieren. Solche Laufzeiten gelten fuer die Analog-Suche als 'fehlend'."""
+    counts = _training_counts(instr)
+    if not counts:
+        return []
+    med = float(np.median(list(counts.values())))
+    return sorted(t for t, n in counts.items() if t in _REQUIRED_T_DAYS and n < rel_threshold * med)
+
+
+def _build_tt_button(instr: InstrumentConfig, key: str) -> None:
+    """Button zum (Neu-)Bauen der Trainingstabelle (build_dataset.py <instr.key>) - von
+    _ensure_training_table() und Teil D gemeinsam genutzt (unterschiedliche Widget-Keys)."""
+    if st.button(
+        f"Trainingstabelle fuer {instr.label} jetzt (neu) bauen (T_days 1-90)",
+        key=key,
+    ):
+        script = Path(__file__).resolve().parent / "build_dataset.py"
+        with st.spinner(
+            f"Baue Trainingstabelle fuer {instr.label} - bitte warten, das kann mehrere Minuten dauern..."
+        ):
+            proc = subprocess.run(
+                [sys.executable, str(script), instr.key], capture_output=True, text=True,
+            )
+        if proc.returncode == 0:
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            _ANALOG_CORE.clear()
+            _TT_DAYS.clear()
+            _TT_COUNTS.clear()
+            st.success(f"Trainingstabelle fuer {instr.label} (neu) gebaut. Seite wird neu geladen.")
+            st.rerun()
+        else:
+            st.error("build_dataset.py ist fehlgeschlagen:")
+            st.code((proc.stdout or "")[-1500:] + "\n" + (proc.stderr or "")[-3000:])
+
+
 def _ensure_training_table(instr: InstrumentConfig) -> None:
     """Prueft, ob die Trainingstabelle DIESES Instruments alle Laufzeiten
     1..90 enthaelt. Fehlt sie komplett ODER fehlen nur einzelne Laufzeiten
@@ -186,36 +272,23 @@ def _ensure_training_table(instr: InstrumentConfig) -> None:
         missing = list(_REQUIRED_T_DAYS)
     else:
         missing = [t for t in _REQUIRED_T_DAYS if t not in have]
-        if not missing:
+        thin = _thin_t_days(instr)
+        if not missing and not thin:
             return
-        st.warning(
-            f"Die Trainingstabelle fuer {instr.label} enthaelt nur die Laufzeiten {sorted(have)} - "
-            f"es fehlen {len(missing)} von 90 (T_days 1..90). Einmal (neu) bauen (dauert laenger, siehe unten)."
-        )
-
-    if st.button(
-        f"Trainingstabelle fuer {instr.label} jetzt (neu) bauen (T_days 1-90)",
-        key=f"build_tt_{instr.key}",
-    ):
-        script = Path(__file__).resolve().parent / "build_dataset.py"
-        with st.spinner(
-            f"Baue Trainingstabelle fuer {instr.label} - bitte warten, das kann mehrere Minuten dauern..."
-        ):
-            proc = subprocess.run(
-                [sys.executable, str(script), instr.key], capture_output=True, text=True,
+        if missing:
+            st.warning(
+                f"Die Trainingstabelle fuer {instr.label} enthaelt nur die Laufzeiten {sorted(have)} - "
+                f"es fehlen {len(missing)} von 90 (T_days 1..90). Einmal (neu) bauen (dauert laenger, siehe unten)."
             )
-        if proc.returncode == 0:
-            try:
-                st.cache_data.clear()
-            except Exception:
-                pass
-            _ANALOG_CORE.clear()
-            _TT_DAYS.clear()
-            st.success(f"Trainingstabelle fuer {instr.label} (neu) gebaut. Seite wird neu geladen.")
-            st.rerun()
-        else:
-            st.error("build_dataset.py ist fehlgeschlagen:")
-            st.code((proc.stdout or "")[-1500:] + "\n" + (proc.stderr or "")[-3000:])
+        if thin:
+            cnt = _training_counts(instr)
+            st.warning(
+                f"Fuer {instr.label} sind diese Laufzeiten nur sehr duenn besetzt: "
+                + ", ".join(f"T_days={t} ({cnt.get(t, 0)} Zeilen)" for t in thin)
+                + ". Neu bauen, falls das nicht gewollt ist."
+            )
+
+    _build_tt_button(instr, f"build_tt_{instr.key}")
 
 
 def _robustness_row_state(df: pd.DataFrame) -> pd.Series:
@@ -373,8 +446,9 @@ def _build_daily_df_with_today(daily_df: pd.DataFrame, instr: InstrumentConfig):
     return out, today, False
 
 
-def _find_today_analogs(daily_df, chosen_dte_exact, max_distance, bandwidth, min_gap, instr: InstrumentConfig):
-    """Analog-Suche fuer 'heute' (von Teil B, Teil C und der Depot-Analyse
+def _find_today_analogs(daily_df, chosen_dte_exact, max_distance, bandwidth, min_gap,
+                        instr: InstrumentConfig, quiet: bool = False):
+    """Analog-Suche fuer 'heute' (von Teil B, Teil C, Teil D und der Depot-Analyse
     gemeinsam genutzt) - jetzt FUER EIN BESTIMMTES INSTRUMENT.
 
     CACHE: die teure Arbeit (Feature-Matrix, PCA-Fit, Analog-Tage) haengt NICHT
@@ -382,7 +456,11 @@ def _find_today_analogs(daily_df, chosen_dte_exact, max_distance, bandwidth, min
     Tag, Datenstand) gerechnet und modulweit gehalten - alle Modi und
     Browser-Sitzungen arbeiten fuer DIESES Instrument auf demselben Bestand.
     Die Restlaufzeit bestimmt nur T_days_used (billig). Bei einem Cache-Treffer
-    wird die grosse Trainingstabelle NICHT neu geladen."""
+    wird die grosse Trainingstabelle NICHT neu geladen.
+
+    quiet=True (NEU): unterdrueckt den Rundungs-Hinweis (st.info) - Teil D ruft
+    diese Funktion einmal je Verfall auf und wuerde sonst pro Verfall eine
+    Meldung erzeugen. Fehlermeldungen (st.error/st.warning) bleiben erhalten."""
     sig = _training_table_signature(instr)
     core_key = (instr.key, float(max_distance), float(bandwidth), int(min_gap), date.today(), sig,
                 len(daily_df), daily_df["date"].max())
@@ -431,7 +509,7 @@ def _find_today_analogs(daily_df, chosen_dte_exact, max_distance, bandwidth, min
 
     valid_t_days = core["valid_t_days"]
     T_days_used = min(valid_t_days, key=lambda t: abs(t - chosen_dte_exact))
-    if abs(T_days_used - chosen_dte_exact) > 1.0:
+    if not quiet and abs(T_days_used - chosen_dte_exact) > 1.0:
         st.info(f"Restlaufzeit {chosen_dte_exact:.2f} Tage wird auf T_days={T_days_used} gerundet "
                 f"(verfuegbar: {valid_t_days}).")
     return {**core, "T_days_used": T_days_used, "key": core_key}
@@ -596,7 +674,7 @@ def _run_bulk_analog(table: pd.DataFrame, daily_df: pd.DataFrame,
     return out
 
 
-def _render_reverse_condor(res: dict) -> None:
+def _render_reverse_condor(res: dict, use_plateau: bool = True, sort_col: str = "ror") -> None:
     """Reverse Iron Condor (Long-Condor): inneren Strangle kaufen, Fluegel verkaufen.
     Nutzt die in res gespeicherten Ergebnisse (gleiche Analog-Tage wie der Short-Condor)."""
     st.markdown("### Reverse Iron Condor (Long-Condor)")
@@ -608,6 +686,9 @@ def _render_reverse_condor(res: dict) -> None:
         st.warning("Kein gültiger Reverse Condor (Debit<=0, Debit>=Breite oder Bid/Ask fehlt). "
                    "Bei Bid/Ask=0: Preisbasis 'Mid' testen.")
         return
+    # Plateau-Schalter wirkt hier (Anzeige) ohne Neuberechnung.
+    rdf = apply_criteria(rdf, "reverse", True, use_plateau, sort_col)
+    rmeta = {**rmeta, "n_pass": int(rdf["passes"].sum()), "n_base": int(rdf["c_base"].sum())}
     st.caption(
         "Inneren Strangle KAUFEN (Ask), äußere Flügel VERKAUFEN (Bid). Debit = Max-Loss "
         "(Kurs endet zwischen den inneren Strikes). Max-Gewinn = größere Flügelbreite − Debit. "
@@ -686,6 +767,15 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
         st.error("Distanz-Tabelle hat keine Bid/Ask-Spalten - Kette neu laden.")
         return
 
+    use_tail = bool(st.session_state.get("condor_use_tail", True))
+    use_plateau = bool(st.session_state.get("condor_use_plateau", True))
+    if not use_plateau:
+        st.info("Plateau-Kriterium ist AUS (Sidebar 'Plateau-Kriterium anwenden'): nur die Innen-Zeile selbst "
+                "muss gueltig sein, die Nachbarzeilen werden nicht geprueft.")
+    if not use_tail:
+        st.info("Tail-Kriterium ist AUS (Sidebar 'Tail-Kriterium bei Condors anwenden'): die Spalten "
+                "'Voll-Verlust' / '5%-Quantil' / 'Tail' werden nur angezeigt und entscheiden nicht ueber 'Kandidat'.")
+
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         basis = st.radio("Preisbasis", ["Bid/Ask (echt)", "Mid (Näherung)"], key="condor_basis",
@@ -694,10 +784,10 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
         t_min = st.number_input("Min. t-Stat (HAC)", 0.0, 10.0, 3.0, 0.1, key="condor_tmin3")
     with c3:
         max_full = st.number_input("Max. Anteil Volltreffer-Verlust (%)", 0.0, 100.0, 3.0, 0.5,
-                                   key="condor_fullloss")
+                                   key="condor_fullloss", disabled=not use_tail)
     with c4:
         tail_floor = st.number_input("Min. 5%-Quantil (Rendite/Max-Loss)", -1.0, 0.0, -0.75, 0.05,
-                                     key="condor_tail")
+                                     key="condor_tail", disabled=not use_tail)
     with c5:
         sort_label = st.selectbox(
             "Sortierung", ["Rendite/Risiko %", "E[P&L] (Pkt)", "t (HAC)"], index=0, key="condor_sort",
@@ -727,7 +817,10 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
     # wird deshalb nicht bei jedem Rerun wiederholt. Der Button erzwingt eine Neuberechnung.
     # Das Versionskuerzel "v2-reverse" sorgt dafuer, dass alte Cache-Eintraege ohne
     # Reverse-Condor-Ergebnis automatisch neu gerechnet werden.
-    cparams = (basis, float(t_min), float(max_full), float(tail_floor), sort_label, "v2-reverse")
+    # Tail-/Plateau-Schalter stehen bewusst NICHT im Schluessel: sie werden erst bei der Anzeige
+    # angewendet (condor_search.apply_criteria) - Umschalten loest keine Neuberechnung aus.
+    cparams = (basis, float(t_min), float(max_full), float(tail_floor), sort_label, "v4-flags")
+    # Teil D (alle Laufzeiten) uebernimmt Kriterien/Preisbasis aus diesen Eingaben.
     st.session_state["shared_condor_criteria"] = dict(basis=basis, t_min=float(t_min), max_full=float(max_full),
                                                       tail_floor=float(tail_floor))
     if st.session_state.get("livechain_condor_attempt") != (distance_key, cparams):
@@ -745,8 +838,7 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
                 moves = analog_moves(ctx["analogs"], ctx["training_table"], ctx["T_days_used"], ctx["query_date"])
                 cfg = CondorConfig(price_basis="mid" if basis.startswith("Mid") else "bidask",
                                    t_min=float(t_min), max_full_loss_share=max_full / 100.0,
-                                   tail_floor=float(tail_floor),
-                                   sort_by={"Rendite/Risiko %": "ror", "E[P&L] (Pkt)": "mean", "t (HAC)": "tstat"}[sort_label])
+                                   tail_floor=float(tail_floor), sort_by=_SORT_COL[sort_label])
                 cdf, sdf, meta = evaluate_condor_grid(table, moves, spot, cfg, short_valid)
                 meta["T_days_used"] = ctx["T_days_used"]
                 meta["sort_label"] = sort_label
@@ -763,9 +855,14 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
         st.info("Tabelle/Expiry/Instrument hat sich geaendert - Suche erneut starten.")
         return
     cdf, sdf, meta = res["cdf"], res["sdf"], res["meta"]
+    sort_col = _SORT_COL.get(meta.get("sort_label", "Rendite/Risiko %"), "ror")
+    if not cdf.empty:
+        # Tail-/Plateau-Schalter wirken HIER (Anzeige), ohne dass neu gerechnet wird.
+        cdf = apply_criteria(cdf, "condor", use_tail, use_plateau, sort_col)
+        meta = {**meta, "n_pass": int(cdf["passes"].sum()), "n_base": int(cdf["c_base"].sum())}
     if cdf.empty:
         st.warning("Kein gueltiges Paar (Kredit<=0 oder Bid/Ask fehlt). Bei Bid/Ask=0: Preisbasis 'Mid' testen.")
-        _render_reverse_condor(res)
+        _render_reverse_condor(res, use_plateau, sort_col)
         return
 
     st.caption(
@@ -825,7 +922,7 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
 
     # ── Reverse Iron Condor (Long-Condor) ──
     st.divider()
-    _render_reverse_condor(res)
+    _render_reverse_condor(res, use_plateau, sort_col)
     st.divider()
 
     # ── Condor aus dieser Zeile ins Depot uebernehmen ──
@@ -870,6 +967,390 @@ def _render_condor_section(table, daily_df, chosen_expiry, chosen_dte_exact, spo
             st.error(f"Nicht hinzugefuegt: {e}")
         else:
             st.success(f"'{condor_name}' ({instr.label}) zum Depot hinzugefuegt (siehe Tab 'Depot-Analyse').")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TEIL D: Beste Trades ueber ALLE Laufzeiten (Condor + Reverse Condor)
+# ═══════════════════════════════════════════════════════════════════════
+
+_ALL_EXP_TYPES = ["Condor", "Reverse Condor"]
+
+
+def _short_valid_quiet(table: pd.DataFrame, moves: pd.DataFrame, spot_today: float) -> dict:
+    """Wie _run_bulk_analog (Teil B), aber OHNE UI und nur fuer die Frage 'Zeile gruen?'.
+    Gleiche Funktionen (analog_robustness, _robustness_row_state) -> gleiche Definition
+    von 'Short gueltig'. Rueckgabe: {distance_pct: bool}."""
+    S_d = spot_today * (1.0 + moves["ret"].to_numpy(dtype=float))
+    rows = []
+    for row in table.itertuples():
+        base = {"distance_pct": float(row.distance_pct), "tstat_full": np.nan, "tstat_val": np.nan,
+                "ci_excludes_zero_full": False, "subperiod_matching": np.nan,
+                "robust_train_val": False, "robust_train_val_neg": False}
+        if (pd.isna(row.mid_put) or pd.isna(row.mid_call)
+                or pd.isna(row.strike_put) or pd.isna(row.strike_call)):
+            rows.append(base)
+            continue
+        premium = float(row.mid_put) + float(row.mid_call)
+        payout = (np.maximum(float(row.strike_put) - S_d, 0.0)
+                  + np.maximum(S_d - float(row.strike_call), 0.0))
+        rb = analog_robustness(moves, premium - payout)
+        base.update({
+            "tstat_full": rb["tstat_full"], "tstat_val": rb["tstat_val"],
+            "ci_excludes_zero_full": rb["ci_excludes_zero_full"],
+            "subperiod_matching": rb["subperiod_matching"],
+            "robust_train_val": rb["robust_train_val"],
+            "robust_train_val_neg": rb["robust_train_val_neg"],
+        })
+        rows.append(base)
+    df_ = pd.DataFrame(rows)
+    state = _robustness_row_state(df_)
+    return dict(zip(df_["distance_pct"].astype(float).tolist(), state.eq("green").astype(bool).tolist()))
+
+
+def _unify_condor_rows(cdf: pd.DataFrame, rcdf: pd.DataFrame, expiry, dte_exact: float,
+                       T_days_used: int) -> pd.DataFrame:
+    """Bringt Condor- und Reverse-Condor-Ergebnis eines Verfalls in EIN gemeinsames Spaltenschema
+    (inkl. Spalte 'Typ')."""
+    parts = []
+    common = {"expiry": pd.Timestamp(expiry), "dte": dte_exact, "T_days": T_days_used}
+    if cdf is not None and not cdf.empty:
+        parts.append(pd.DataFrame({
+            "Typ": "Condor", **common,
+            "dist_inner": cdf["distance_short"], "dist_wing": cdf["distance_wing"],
+            "k_put_wing": cdf["strike_put_wing"], "k_put_inner": cdf["strike_put_short"],
+            "k_call_inner": cdf["strike_call_short"], "k_call_wing": cdf["strike_call_wing"],
+            "credit": cdf["credit"], "debit": np.nan,
+            "max_loss": cdf["max_loss"], "max_gain": cdf["credit"],
+            "mean": cdf["mean"], "ror": cdf["ror"],
+            "e_put_spread": cdf["e_put_spread"], "e_call_spread": cdf["e_call_spread"],
+            "tstat": cdf["tstat"], "e_train": cdf["e_train"], "e_val": cdf["e_val"],
+            "full_loss_share": cdf["full_loss_share"], "n_full_loss": cdf["n_full_loss"],
+            "q_tail": cdf["q_tail"], "win_rate_pct": cdf["win_rate_pct"],
+            "c_train": cdf["c_train"], "c_val": cdf["c_val"], "c_t": cdf["c_t"],
+            "c_tail": cdf["c_tail"], "c_inner": cdf["c_short"], "c_plateau": cdf["c_plateau"],
+            "passes": cdf["passes"],
+        }))
+    if rcdf is not None and not rcdf.empty:
+        parts.append(pd.DataFrame({
+            "Typ": "Reverse Condor", **common,
+            "dist_inner": rcdf["distance_inner"], "dist_wing": rcdf["distance_wing"],
+            "k_put_wing": rcdf["strike_put_wing"], "k_put_inner": rcdf["strike_put_inner"],
+            "k_call_inner": rcdf["strike_call_inner"], "k_call_wing": rcdf["strike_call_wing"],
+            "credit": np.nan, "debit": rcdf["debit"],
+            "max_loss": rcdf["max_loss"], "max_gain": rcdf["max_gain"],
+            "mean": rcdf["mean"], "ror": rcdf["ror"],
+            "e_put_spread": rcdf["e_put_spread"], "e_call_spread": rcdf["e_call_spread"],
+            "tstat": rcdf["tstat"], "e_train": rcdf["e_train"], "e_val": rcdf["e_val"],
+            "full_loss_share": rcdf["full_loss_share"], "n_full_loss": rcdf["n_full_loss"],
+            "q_tail": np.nan, "win_rate_pct": rcdf["win_rate_pct"],
+            "c_train": rcdf["c_train"], "c_val": rcdf["c_val"], "c_t": rcdf["c_t"],
+            "c_tail": None, "c_inner": rcdf["c_long"], "c_plateau": rcdf["c_plateau"],
+            "passes": rcdf["passes"],
+        }))
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
+def _run_all_expiries(enriched, expiry_info, spot, daily_df, instr, distance_targets_pct,
+                      r_free, dividend_yield, flat_hv, max_distance, bandwidth, min_gap,
+                      cfg: CondorConfig) -> dict:
+    """Condor- UND Reverse-Condor-Suche fuer JEDEN Verfall in expiry_info."""
+    frames, summary, errors = [], [], []
+    n = len(expiry_info)
+    progress = st.progress(0.0)
+    status = st.empty()
+    for k, row in enumerate(expiry_info.itertuples()):
+        exp_str = pd.Timestamp(row.expiry).date().isoformat()
+        status.text(f"Verfall {k + 1}/{n}: {exp_str} ({row.dte_exact:.1f} Tage)...")
+        progress.progress((k + 1) / n)
+        dte = float(row.dte_exact)
+        try:
+            ctx = _find_today_analogs(daily_df, dte, max_distance, bandwidth, min_gap, instr, quiet=True)
+            if ctx is None:
+                errors.append("Analog-Suche nicht moeglich (siehe Fehlermeldung oben) - Abbruch.")
+                break
+            moves = analog_moves(ctx["analogs"], ctx["training_table"], ctx["T_days_used"], ctx["query_date"])
+            if moves.empty:
+                errors.append(f"{exp_str}: keine nutzbaren Analog-Tage.")
+                continue
+            tbl = build_symmetric_distance_table(
+                enriched, row.expiry, spot, flat_hv, dte / 365.0,
+                r_free, dividend_yield, distance_targets_pct, None, None,
+            )
+            short_valid = _short_valid_quiet(tbl, moves, spot)
+            cdf, _sdf, meta = evaluate_condor_grid(tbl, moves, spot, cfg, short_valid)
+            rcdf, rmeta = evaluate_reverse_condor_grid(tbl, moves, spot, cfg)
+        except Exception as e:
+            errors.append(f"{exp_str}: {type(e).__name__}: {e}")
+            continue
+
+        u = _unify_condor_rows(cdf, rcdf, row.expiry, dte, ctx["T_days_used"])
+        if not u.empty:
+            frames.append(u)
+        summary.append({
+            "Verfall": exp_str, "Restlaufzeit (Tage)": dte, "T_days": ctx["T_days_used"],
+            "Analog-Tage": len(moves),
+            "Condor getestet": len(cdf), "Condor Kandidaten": int(cdf["passes"].sum()) if not cdf.empty else 0,
+            "Reverse getestet": len(rcdf), "Reverse Kandidaten": int(rcdf["passes"].sum()) if not rcdf.empty else 0,
+        })
+    status.empty()
+    progress.empty()
+    return {"all_df": pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(),
+            "summary": pd.DataFrame(summary), "errors": errors}
+
+
+def _apply_all_exp_criteria(df: pd.DataFrame, use_tail: bool, require_plateau: bool) -> pd.DataFrame:
+    """Setzt 'passes' im vereinheitlichten Schema (Condor + Reverse) aus den vorhandenen Flags neu -
+    ohne Neuberechnung. Tail zaehlt nur bei Condors (Reverse hat kein Tail-Kriterium)."""
+    out = df.copy()
+    is_cond = out["Typ"] == "Condor"
+    tail_ok = out["c_tail"].map(lambda v: True if (v is None or pd.isna(v)) else bool(v))
+    ok = out["c_train"].astype(bool) & out["c_val"].astype(bool) & out["c_t"].astype(bool)
+    if use_tail:
+        ok = ok & (tail_ok | ~is_cond)
+    ok = ok & out["c_inner"].astype(bool)
+    if require_plateau:
+        ok = ok & out["c_plateau"].astype(bool)
+    out["passes"] = ok
+    return out
+
+
+def _all_exp_show(d: pd.DataFrame) -> pd.DataFrame:
+    yn = lambda s: s.map({True: "✅", False: "❌"}).fillna("–")
+    return pd.DataFrame({
+        "Typ": d["Typ"], "Verfall": pd.to_datetime(d["expiry"]).dt.date,
+        "Restlaufzeit (Tage)": d["dte"], "T_days": d["T_days"],
+        "Innen-Abstand %": d["dist_inner"], "Flügel-Abstand %": d["dist_wing"],
+        "Put Flügel": d["k_put_wing"], "Put Innen": d["k_put_inner"],
+        "Call Innen": d["k_call_inner"], "Call Flügel": d["k_call_wing"],
+        "Kredit": d["credit"], "Debit": d["debit"],
+        "Max-Loss": d["max_loss"], "Max-Gewinn": d["max_gain"],
+        "E[P&L] (Pkt)": d["mean"], "Rendite/Risiko %": d["ror"] * 100,
+        "R/R % pro Tag": d["ror_pd"] * 100,
+        "E Put-Spread": d["e_put_spread"], "E Call-Spread": d["e_call_spread"],
+        "t (HAC)": d["tstat"], "E Train": d["e_train"], "E Val": d["e_val"],
+        "Voll-Verlust %": d["full_loss_share"] * 100, "Voll-Verlust-Tage (n)": d["n_full_loss"],
+        "5%-Quantil (R/R)": d["q_tail"], "Gewinnrate %": d["win_rate_pct"],
+        "Train>0": yn(d["c_train"]), "Val>0": yn(d["c_val"]), "t": yn(d["c_t"]),
+        "Tail": yn(d["c_tail"]), "Short/Long gültig": yn(d["c_inner"]),
+        "Plateau (±1)": yn(d["c_plateau"]), "Kandidat": yn(d["passes"]),
+    })
+
+
+def _all_exp_fmt(show: pd.DataFrame) -> dict:
+    fmt = {c: "{:.2f}" for c in show.select_dtypes("number").columns}
+    fmt.update({c: "{:.0f}" for c in ["Put Flügel", "Put Innen", "Call Innen", "Call Flügel",
+                                      "Voll-Verlust-Tage (n)", "T_days"]})
+    fmt["Restlaufzeit (Tage)"] = "{:.1f}"
+    return fmt
+
+
+def _render_all_expiries_section(enriched, expiry_info, spot, daily_df, instr, distance_targets_pct,
+                                 r_free, dividend_yield, flat_hv, max_distance, bandwidth, min_gap,
+                                 fetch_ts, qcfg=None) -> None:
+    """TEIL D: beste (Reverse-)Condors ueber ALLE Laufzeiten, sortiert nach Rendite/Risiko %."""
+    st.divider()
+    st.subheader("Beste Trades über alle Laufzeiten (Condor + Reverse Condor)")
+    st.caption(
+        "Dieselbe Logik wie die Iron-Condor-Suche oben, aber für JEDEN Verfall: eigene Analog-Tage je "
+        "Restlaufzeit, eigenes Short-/Long-Kriterium und Plateau, Kriterien/Preisbasis aus den Eingaben "
+        "der Condor-Suche. Ranking fix nach Rendite/Risiko %. Rechenintensiv - deshalb nur per Button; "
+        "das Ergebnis bleibt bei Tab-Wechsel erhalten. Das Ein-/Ausblenden eines Typs rechnet nichts neu."
+    )
+    crit = st.session_state.get("shared_condor_criteria")
+    if crit is None:
+        st.info("Die Kriterien kommen aus der Iron-Condor-Suche oben - sie ist noch nicht initialisiert.")
+        return
+
+    use_tail = bool(st.session_state.get("condor_use_tail", True))
+    use_plateau = bool(st.session_state.get("condor_use_plateau", True))
+    st.caption(f"Plateau-Kriterium: **{'AN' if use_plateau else 'AUS'}** (Sidebar: 'Plateau-Kriterium anwenden').")
+    if use_tail:
+        st.caption(f"Tail-Kriterium: **AN** (Voll-Verlust ≤ {crit['max_full']:g} %, 5%-Quantil ≥ "
+                   f"{crit['tail_floor']:g}) - abschaltbar in der Sidebar.")
+    else:
+        st.caption("Tail-Kriterium: **AUS** - Tail-Spalten werden nur angezeigt, "
+                   "'Kandidat' hängt nicht davon ab (Sidebar: 'Tail-Kriterium bei Condors anwenden').")
+
+    c0, c1, c2, c3, c4 = st.columns(5)
+    with c0:
+        min_dte_all = st.number_input("Min. Restlaufzeit (Tage)", 0.0, 365.0, 0.0, 1.0, key="allexp_mindte",
+                                      help="Nur Verfälle mit mindestens dieser Restlaufzeit.")
+    with c1:
+        max_dte_all = st.number_input("Max. Restlaufzeit (Tage)", 0.5, 365.0, 30.0, 1.0, key="allexp_maxdte",
+                                      help="Begrenzt zusätzlich durch 'Max. DTE' in der Sidebar (Kette wird dort gefiltert).")
+    with c2:
+        max_n_exp = st.number_input("Max. Anzahl Verfälle (nächste zuerst)", 1, 100, 15, 1, key="allexp_maxn")
+    with c3:
+        top_n = st.number_input("Zeilen anzeigen (Top N)", 1, 1000, 50, 10, key="allexp_topn")
+    with c4:
+        types = st.multiselect("Typen anzeigen", _ALL_EXP_TYPES, default=_ALL_EXP_TYPES, key="allexp_types",
+                               help="Blendet Condor bzw. Reverse Condor aus - ohne Neuberechnung.")
+
+    t1, t2 = st.columns(2)
+    with t1:
+        rank_mode = st.selectbox(
+            "Ranking", ["Rendite/Risiko %", "Rendite/Risiko % pro Tag (zeitnormiert)"], index=0,
+            key="allexp_rank",
+            help="Rendite/Risiko % = E[P&L] / Max-Loss ueber die GANZE Restlaufzeit. Zeitnormiert: dieselbe "
+                 "Zahl geteilt durch die exakte Restlaufzeit in Tagen (Kapital im Risiko x Zeit). Erst damit "
+                 "sind 4-Tage- und 30-Tage-Trades vergleichbar. Aendert nur die Sortierung, keine Neuberechnung.",
+        )
+    with t2:
+        min_time_base = st.number_input(
+            "Min. Zeitbasis (Tage) fuer die Normierung", 0.1, 30.0, 1.0, 0.5, key="allexp_mintime",
+            help="Untergrenze fuer den Teiler: bei Restlaufzeiten unter diesem Wert wird durch diesen Wert "
+                 "geteilt (Default 1 Tag = kuerzeste Laufzeit der Trainingstabelle). Verhindert, dass "
+                 "Verfaelle mit 0,3 Tagen nur wegen des Teilers nach oben rutschen.",
+        )
+
+    _dte_vals = expiry_info["dte_exact"].astype(float)
+    sel = expiry_info[(_dte_vals > 0.0) & (_dte_vals >= float(min_dte_all))
+                      & (_dte_vals <= float(max_dte_all))].head(int(max_n_exp))
+    key = (instr.key, tuple(pd.Timestamp(e).date() for e in sel["expiry"]), tuple(distance_targets_pct),
+           fetch_ts, float(max_distance), float(bandwidth), int(min_gap), date.today(), len(enriched),
+           crit["basis"], crit["t_min"], crit["max_full"], crit["tail_floor"],
+           float(r_free), float(dividend_yield), qcfg, "v2-flags")
+
+    if st.session_state.get("livechain_allexp") is None:
+        cached = _RESULT_CACHE.get("allexp")
+        if cached is not None and cached[0] == key:
+            st.session_state["livechain_allexp"] = cached[1]
+
+    st.caption(f"{len(sel)} Verfälle im gewählten Bereich.")
+
+    # ABDECKUNG: gibt es fuer die Restlaufzeit jedes gewaehlten Verfalls (gerundet, mind. 1 Tag)
+    # ueberhaupt genuegend Zeilen in der Trainingstabelle? Sonst wird still auf die naechste
+    # Laufzeit ausgewichen - hier wird es sichtbar gemacht, samt Bau-Button.
+    have_days = _training_days(instr) or set()
+    thin_days = set(_thin_t_days(instr))
+    absent_info = []
+    for r_ in sel.itertuples():
+        need_t = max(1, int(round(float(r_.dte_exact))))
+        if need_t not in have_days or need_t in thin_days:
+            absent_info.append(f"{pd.Timestamp(r_.expiry).date().isoformat()} (braucht T_days={need_t})")
+    if absent_info:
+        st.warning(
+            "Fuer diese Verfaelle fehlt die passende Laufzeit in der Trainingstabelle (oder sie ist nur "
+            "sehr duenn besetzt) - die Rechnung wuerde auf die naechstgelegene Laufzeit ausweichen: "
+            + "; ".join(absent_info[:10]) + (f" (+{len(absent_info) - 10} weitere)" if len(absent_info) > 10 else "")
+            + ". Mit dem Button unten die Trainingstabelle (neu) bauen."
+        )
+        _build_tt_button(instr, f"build_tt_allexp_{instr.key}")
+
+    if st.button("Alle Laufzeiten berechnen", key="allexp_run", disabled=sel.empty):
+        cfg = CondorConfig(
+            price_basis="mid" if crit["basis"].startswith("Mid") else "bidask",
+            t_min=crit["t_min"], max_full_loss_share=crit["max_full"] / 100.0,
+            tail_floor=crit["tail_floor"], sort_by="ror",
+        )
+        with st.spinner("Berechne alle Laufzeiten..."):
+            out = _run_all_expiries(enriched, sel, spot, daily_df, instr, distance_targets_pct,
+                                    r_free, dividend_yield, flat_hv, max_distance, bandwidth, min_gap, cfg)
+        out["key"] = key
+        st.session_state["livechain_allexp"] = out
+        _RESULT_CACHE["allexp"] = (key, out)
+
+    res = st.session_state.get("livechain_allexp")
+    if res is None:
+        st.info("Noch nicht berechnet - 'Alle Laufzeiten berechnen' klicken.")
+        return
+    if res["key"] != key:
+        st.info("Kette/Instrument/Einstellungen haben sich geändert - bitte erneut berechnen "
+                "(angezeigt wird das alte Ergebnis nicht).")
+        return
+    for msg in res["errors"]:
+        st.warning(msg)
+    all_df = res["all_df"]
+    if all_df.empty:
+        st.warning("Kein gültiges Paar in den berechneten Verfällen (Kredit/Debit<=0 oder Bid/Ask fehlt). "
+                   "Bei Bid/Ask=0: Preisbasis 'Mid' in der Condor-Suche oben wählen.")
+        return
+    if not types:
+        st.info("Kein Typ ausgewählt.")
+        return
+
+    # Tail-/Plateau-Schalter wirken hier (Anzeige) - kein Neurechnen beim Umschalten.
+    applied = _apply_all_exp_criteria(all_df, use_tail, use_plateau)
+    # Zeitnormierung: R/R pro Tag = R/R / max(exakte Restlaufzeit, Zeitbasis-Untergrenze).
+    applied["ror_pd"] = applied["ror"] / np.maximum(applied["dte"].astype(float), float(min_time_base))
+    rank_col = "ror_pd" if rank_mode.startswith("Rendite/Risiko % pro Tag") else "ror"
+    vis = applied[applied["Typ"].isin(types)]
+    passing = (vis[vis["passes"].astype(bool)].sort_values(rank_col, ascending=False)
+               .head(int(top_n)).reset_index(drop=True))
+
+    summ = res["summary"]
+    if not summ.empty:
+        s = summ.copy()
+        _cand = applied[applied["passes"]].groupby(["expiry", "Typ"]).size()
+        s["Condor Kandidaten"] = [int(_cand.get((pd.Timestamp(e), "Condor"), 0)) for e in s["Verfall"]]
+        s["Reverse Kandidaten"] = [int(_cand.get((pd.Timestamp(e), "Reverse Condor"), 0)) for e in s["Verfall"]]
+        if "Condor" not in types:
+            s = s.drop(columns=["Condor getestet", "Condor Kandidaten"])
+        if "Reverse Condor" not in types:
+            s = s.drop(columns=["Reverse getestet", "Reverse Kandidaten"])
+        with st.expander("Übersicht je Verfall"):
+            st.dataframe(s.style.format({"Restlaufzeit (Tage)": "{:.1f}"}, na_rep="n/a"),
+                         use_container_width=True, hide_index=True)
+
+    if passing.empty:
+        st.info("Kein Trade besteht alle Kriterien - kein belastbarer Edge in den gewählten Typen/Laufzeiten.")
+    else:
+        b = passing.iloc[0]
+        st.success(
+            f"Bester Trade ({b['Typ']}, Verfall {pd.Timestamp(b['expiry']).date()}, {b['dte']:.1f} Tage): "
+            f"{'Short' if b['Typ'] == 'Condor' else 'Long'} {b['k_put_inner']:.0f}P / {b['k_call_inner']:.0f}C, "
+            f"Flügel {b['k_put_wing']:.0f}P / {b['k_call_wing']:.0f}C · "
+            f"{'Kredit %.2f' % b['credit'] if b['Typ'] == 'Condor' else 'Debit %.2f' % b['debit']}, "
+            f"Max-Loss {b['max_loss']:.2f} · E[P&L] {b['mean']:+.2f} Pkt = {b['ror']*100:+.1f}% "
+            f"({b['ror_pd']*100:+.1f}% pro Tag) "
+            f"(t={b['tstat']:.2f}, Val-E {b['e_val']:+.2f})."
+        )
+        show = _all_exp_show(passing)
+        st.dataframe(show.style.format(_all_exp_fmt(show), na_rep="n/a"),
+                     use_container_width=True, hide_index=True)
+
+    with st.expander(f"Alle getesteten Paare inkl. Kriterien (Top 500 nach '{rank_mode}')"):
+        everything = vis.sort_values(rank_col, ascending=False).head(500)
+        sh_all = _all_exp_show(everything)
+        st.dataframe(sh_all.style.format(_all_exp_fmt(sh_all), na_rep="n/a"),
+                     use_container_width=True, hide_index=True)
+
+    # ── Zeile ins Depot uebernehmen ──
+    if not passing.empty:
+        st.markdown("**Trade aus der Tabelle zum Depot hinzufuegen**")
+        opts = [
+            f"{r.Typ} · {pd.Timestamp(r.expiry).date()} · {r.dist_inner:g}% / Flügel {r.dist_wing:g}% "
+            f"({r.k_put_wing:.0f}P/{r.k_put_inner:.0f}P .. {r.k_call_inner:.0f}C/{r.k_call_wing:.0f}C)"
+            for r in passing.itertuples()
+        ]
+        a1, a2 = st.columns([3, 1])
+        with a1:
+            pick = st.selectbox("Trade", opts, key="allexp_add_row")
+        with a2:
+            qty = st.number_input("Menge", min_value=0.01, value=1.0, step=1.0, key="allexp_add_qty")
+        p = passing.iloc[opts.index(pick)]
+        is_short = p["Typ"] == "Condor"
+        default_name = (f"{'IC' if is_short else 'RIC'} {p['k_put_wing']:.0f}/{p['k_put_inner']:.0f}/"
+                        f"{p['k_call_inner']:.0f}/{p['k_call_wing']:.0f} {pd.Timestamp(p['expiry']).date()}")
+        name = st.text_input("Name der Kombo", value=default_name, key="allexp_add_name")
+        if st.button("Zum Depot hinzufuegen", key="allexp_add_btn"):
+            import dashboard_depot
+            inner, wing = ("short", "long") if is_short else ("long", "short")
+            legs = [
+                {"option_type": "put", "side": wing, "strike": float(p["k_put_wing"]), "qty": float(qty)},
+                {"option_type": "put", "side": inner, "strike": float(p["k_put_inner"]), "qty": float(qty)},
+                {"option_type": "call", "side": inner, "strike": float(p["k_call_inner"]), "qty": float(qty)},
+                {"option_type": "call", "side": wing, "strike": float(p["k_call_wing"]), "qty": float(qty)},
+            ]
+            try:
+                dashboard_depot.add_combo_to_depot(
+                    name, pd.Timestamp(p["expiry"]).strftime("%Y-%m-%d"), legs,
+                    note=f"Aus Alle-Laufzeiten-Suche ({p['Typ']})", instrument=instr.key,
+                )
+            except ValueError as e:
+                st.error(f"Nicht hinzugefuegt: {e}")
+            else:
+                st.success(f"'{name}' ({instr.label}) zum Depot hinzugefuegt (siehe Tab 'Depot-Analyse').")
 
 
 def render(df, daily_df, has_resolution, instr: InstrumentConfig) -> None:
@@ -919,6 +1400,57 @@ def render(df, daily_df, has_resolution, instr: InstrumentConfig) -> None:
                  "HV-Rang der Kombi-IV gesucht wird - identisches Prinzip zu "
                  "backtest.FixedRankConfig.lookback_days.",
         )
+        min_hv_window = st.number_input(
+            "Min. HV-Fenster (Handelstage)", 2, 60, 5, 1, key="livechain_min_hv_window",
+            help="Untergrenze fuer die HV-Periode (Anzeige: Modell-Delta und HV-Rang). Die HV-Periode "
+                 "folgt der Restlaufzeit, wird aber nie kleiner als dieser Wert - eine HV aus 1-2 "
+                 "Tagesrenditen ist statistisch wertlos (Minimum technisch: 2, sonst keine Standardabweichung). "
+                 "Hat KEINEN Einfluss auf Analog-Tage, Condor-Suche oder Teil D.",
+        )
+        st.checkbox(
+            "Tail-Kriterium bei Condors anwenden", value=True, key="condor_use_tail",
+            help="Gilt fuer die Iron-Condor-Suche UND 'Beste Trades ueber alle Laufzeiten'. "
+                 "AN: Kandidat braucht Voll-Verlust-Anteil <= Maximum UND 5%-Quantil >= Minimum "
+                 "(Schwellen in der Iron-Condor-Suche). AUS: Tail wird nur angezeigt, entscheidet "
+                 "aber nicht ueber 'Kandidat'. Reverse Condor hat ohnehin kein Tail-Kriterium. "
+                 "Wirkt sofort, ohne Neuberechnung.",
+        )
+        st.checkbox(
+            "Plateau-Kriterium anwenden", value=True, key="condor_use_plateau",
+            help="Gilt fuer Condor, Reverse Condor UND 'Beste Trades ueber alle Laufzeiten'. "
+                 "AN: die Zeilen direkt ueber und unter der Innen-Zeile muessen ebenfalls gueltig sein. "
+                 "AUS: nur die Innen-Zeile selbst muss gueltig sein (Randzeilen koennen dann auch "
+                 "Optimum sein). Wirkt sofort, ohne Neuberechnung.",
+        )
+        qf_enabled = st.checkbox(
+            "Quotes auf Plausibilitaet pruefen (falsche Preise entfernen)", value=True, key="qf_enabled",
+            help="Entfernt VOR allen Tabellen Serien mit unplausiblen Preisen: kein/gekreuztes Bid/Ask, "
+                 "zu weiter Spread, Verletzung der Put-Call-Parity, Ausreisser gegen die Nachbarstrikes "
+                 "(optional: zu altes Quote). Arbeitet nur mit Standardspalten der Kette, ist also "
+                 "unabhaengig vom Datenanbieter.",
+        )
+        with st.expander("Quote-Pruefung: Schwellen"):
+            qf_rel = st.number_input("Max. relativer Spread ((Ask-Bid)/Mid)", 0.1, 10.0, 1.0, 0.1, key="qf_rel")
+            qf_floor = st.number_input("Spread-Untergrenze (Basispunkte vom Spot)", 0.0, 100.0, 1.0, 0.5,
+                                       key="qf_floor",
+                                       help="Spreads darunter werden nie beanstandet (relative Spreads sind "
+                                            "bei sehr billigen Optionen sonst sinnlos gross).")
+            qf_par = st.number_input("Parity-Toleranz (x Halb-Spreads)", 0.5, 10.0, 1.5, 0.5, key="qf_par",
+                                     help="Erlaubte Abweichung des impliziten Terminkurses je Strike vom "
+                                          "Median des Verfalls, in Vielfachen der Halb-Spreads von Call+Put.")
+            qf_smile = st.number_input("Smile-Toleranz (x Halb-Spread)", 0.5, 20.0, 3.0, 0.5, key="qf_smile",
+                                       help="Erlaubte Preisabweichung gegenueber dem Preis aus der lokal "
+                                            "geglaetteten IV der Nachbarstrikes.")
+            qf_age = st.number_input("Max. Quote-Alter in Min. (0 = aus)", 0.0, 100000.0, 0.0, 10.0,
+                                     key="qf_age",
+                                     help="Nur sinnvoll, wenn der Anbieter ein echtes Quote-Alter liefert. "
+                                          "Bei Yahoo ist es das Alter des letzten TRADES - weit OTM-Strikes "
+                                          "handeln selten, daher dort besser aus.")
+        qcfg = QuoteFilterConfig(
+            enabled=bool(qf_enabled), max_rel_spread=float(qf_rel), spread_floor_bp=float(qf_floor),
+            parity_mult=float(qf_par), smile_mult=float(qf_smile),
+            max_quote_age_min=float(qf_age) if qf_age > 0 else None,
+        )
         r_free = st.number_input("Risikoloser Zins", 0.0, 0.20, 0.0, 0.005, format="%.3f")
         dividend_yield = st.number_input(
             "Dividenden-/Convenience-Yield", 0.0, 0.10, float(instr.dividend_yield), 0.001,
@@ -952,6 +1484,13 @@ def render(df, daily_df, has_resolution, instr: InstrumentConfig) -> None:
     dividend_yield = snap["dividend_yield"]
     fetch_ts = snap["fetch_ts"]
     enriched_all = snap["enriched"]
+    # Quote-Pruefung auf der VOLLEN Kette (vor DTE-/Delta-Filter), damit Put-Call-Paare vollstaendig sind.
+    # Entfernte Serien fehlen danach ueberall (Tabelle, Analog-Tabelle, Condor-Suche, Teil D).
+    q_removed = pd.DataFrame()
+    n_chain_before = len(enriched_all)
+    if not enriched_all.empty and qcfg.enabled:
+        enriched_all, q_removed = _filtered_chain(instr, enriched_all, spot, r_free, dividend_yield,
+                                                  fetch_ts, qcfg)
     if enriched_all.empty:
         enriched = enriched_all
     else:
@@ -965,6 +1504,23 @@ def render(df, daily_df, has_resolution, instr: InstrumentConfig) -> None:
             f"Kette abgerufen um {fetch_ts.tz_convert('America/New_York').strftime('%Y-%m-%d %H:%M:%S')} ET "
             "- Referenzzeitpunkt fuer die 'Quote-Alter'-Spalten weiter unten."
         )
+
+    if qcfg.enabled and n_chain_before > 0:
+        with st.expander(f"Quote-Pruefung: {len(q_removed)} von {n_chain_before} Serien entfernt"):
+            if q_removed.empty:
+                st.caption("Keine unplausiblen Quotes gefunden.")
+            else:
+                by_reason = (q_removed.groupby("reason").size().rename("Anzahl").reset_index()
+                             .rename(columns={"reason": "Grund"}).sort_values("Anzahl", ascending=False))
+                st.dataframe(by_reason, use_container_width=True, hide_index=True)
+                cols = [c for c in ["expiry", "option_type", "strike", "bid", "ask", "mid",
+                                    "implied_vol_mkt", "quote_age_minutes", "reason"] if c in q_removed.columns]
+                st.dataframe(q_removed[cols].sort_values([c for c in ["expiry", "option_type", "strike"]
+                                                          if c in cols]),
+                             use_container_width=True, hide_index=True)
+                st.caption("Betroffene Strikes werden in allen Tabellen uebersprungen - eine Zeile greift dann "
+                           "auf den naechstgelegenen GUELTIGEN Strike zurueck. Schwellen: Sidebar "
+                           "'Quote-Pruefung: Schwellen'.")
 
     if enriched.empty:
         st.warning(
@@ -999,10 +1555,12 @@ def render(df, daily_df, has_resolution, instr: InstrumentConfig) -> None:
         "stattdessen die dortige AM-Settlement-Naeherung, siehe chain_providers/ib_provider.py)."
     )
 
-    hv_length = max(2, round(chosen_dte_exact))
+    hv_length = max(int(min_hv_window), round(chosen_dte_exact))
     st.caption(
-        f"→ HV-Periode automatisch auf **{hv_length} Handelstage** gesetzt "
-        f"(gerundete Restlaufzeit von {chosen_dte_exact:.2f} Tagen)."
+        f"→ HV-Periode: **{hv_length} Handelstage** (Restlaufzeit {chosen_dte_exact:.2f} Tage, "
+        f"Untergrenze {int(min_hv_window)} - einstellbar in der Sidebar). Betrifft nur die Anzeige "
+        "'Δ Modell'/'HV-Rang'. Die Analog-Bewertung nutzt die Laufzeit "
+        f"T_days={max(1, int(round(chosen_dte_exact)))} der Trainingstabelle und echte Marktpreise, keine HV."
     )
 
     bounds = _bounds_cached(daily_df, hv_length, int(rank_lookback), instr)
@@ -1193,7 +1751,7 @@ def render(df, daily_df, has_resolution, instr: InstrumentConfig) -> None:
     # bleibt das Ergebnis aus st.session_state (auch nach einem Tab-Wechsel) stehen.
     analog_key = (instr.key, chosen_expiry, tuple(distance_targets_pct), fetch_ts, float(analog_max_distance),
                   float(analog_bandwidth), int(analog_min_gap), date.today(),
-                  float(min_dte), float(max_dte), float(min_abs_delta))
+                  float(min_dte), float(max_dte), float(min_abs_delta), qcfg)
     if st.session_state.get("livechain_analog_key") != analog_key:
         cached_b = _RESULT_CACHE.get("analog")            # z.B. neue Browser-Sitzung, gleicher Datenstand
         if cached_b is not None and cached_b[0] == analog_key:
@@ -1338,7 +1896,7 @@ def render(df, daily_df, has_resolution, instr: InstrumentConfig) -> None:
                         f"Gewichtete mittlere HV der Analog-Tage: **{hv_w*100:.2f}%** "
                         f"vs. heutige HV: **{flat_hv*100:.2f}%** "
                         f"(Verhältnis heute/Analog: {flat_hv/hv_w:.2f})."
-    )
+                    )
                 dbg["weight_share_pct"] = dbg["weight"] / dbg["weight"].sum() * 100.0
                 dbg["ret_pct"] = dbg["ret"] * 100.0
 
@@ -1434,4 +1992,12 @@ def render(df, daily_df, has_resolution, instr: InstrumentConfig) -> None:
         table, daily_df, chosen_expiry, chosen_dte_exact, spot,
         float(analog_max_distance), float(analog_bandwidth), int(analog_min_gap),
         analog_key, instr,
+    )
+
+    # ── TEIL D: beste Trades ueber alle Laufzeiten ──
+    _render_all_expiries_section(
+        enriched, expiry_info, spot, daily_df, instr, distance_targets_pct,
+        r_free, dividend_yield, flat_hv,
+        float(analog_max_distance), float(analog_bandwidth), int(analog_min_gap),
+        fetch_ts, qcfg,
     )

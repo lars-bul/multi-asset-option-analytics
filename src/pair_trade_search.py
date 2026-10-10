@@ -4,7 +4,7 @@ auf dem geshortet wird - bestimmt den Aehnlichkeitsraum, siehe
 analog_matching.find_analogs) mit der tatsaechlichen historischen Bewegung
 EINES ZWEITEN Instruments (Follower) an GENAU DENSELBEN Kalendertagen.
 
-BEIN-ROLLEN (KORRIGIERT - die Spaltennamen folgen jetzt der echten Rolle):
+BEIN-ROLLEN (die Spaltennamen folgen der echten Rolle):
   Beide Tabellen sind nach distance_pct aufsteigend sortiert; Index i = INNERES
   Bein (naeher am Spot), Index j = AEUSSERES Bein (weiter OTM, "Fluegel").
   Lead     (Credit-Spread): inneres Bein = SHORT, aeusseres Bein = LONG.
@@ -14,9 +14,6 @@ BEIN-ROLLEN (KORRIGIERT - die Spaltennamen folgen jetzt der echten Rolle):
     lead_long_distance      = Distanz des Lead-LONG-Beins    (aussen, Fluegel)
     follower_long_distance  = Distanz des Follower-LONG-Beins  (innen)
     follower_short_distance = Distanz des Follower-SHORT-Beins (aussen, Fluegel)
-  (Frueher hiess der Follower-Eintrag 'follower_short_distance' faelschlich das
-  INNERE = LONG-Bein und 'follower_wing_distance' das aeussere = SHORT-Bein;
-  'lead_wing_distance' heisst jetzt 'lead_long_distance'.)
 
 ABLAUF von evaluate_pair_grid():
   1. Kreuzmenge: alle Lead-Spreads x alle Follower-Spreads x Mengenfaktoren x
@@ -29,21 +26,24 @@ ABLAUF von evaluate_pair_grid():
   4. Ausgabe: alle Zeilen; sortiert erst nach 'tested', dann 'passes', dann
      nach Verlustwahrscheinlichkeit (aufsteigend).
 
-(Die frueher hier beschriebene Vola-Breiten-Regel samt Spalten 'vol_rule_ok',
-'width_lead_pct', 'width_follower_pct' wurde entfernt. Die spread-eigenen IVs
-'vol_lead_pct'/'vol_follower_pct' bleiben als reine Info-Spalten.)
-
-EXTREMWERTE OBERSEITE / UNTERSEITE:
-  'max_loss_up'   = Verlust der Gesamtposition, wenn BEIDE Basiswerte stark
-                    steigen (S -> unendlich, jedes Bein im Extremwert).
-                    Positiv = Verlust, negativ = Gewinn (z.B. Put-Credit-Spread:
-                    Kredit = Max-Gewinn -> negativer Wert; Put-Debit: Debit =
-                    Max-Verlust -> positiver Wert).
-  'max_gain_down' = P&L der Gesamtposition, wenn BEIDE Basiswerte auf 0 fallen.
-                    Positiv = Gewinn, negativ = Verlust.
+RANDWERTE OBERSEITE / UNTERSEITE (VORZEICHEN = ERGEBNIS: positiv = GEWINN,
+negativ = VERLUST):
+  'max_result_up'   = Ergebnis (P&L) der Gesamtposition, wenn BEIDE Basiswerte
+                      stark steigen (S -> unendlich, jedes Bein im Extremwert).
+                      Beispiel Put-Credit-Spread: Kredit = Max-Gewinn -> positiv;
+                      Put-Debit: Debit = Max-Verlust -> negativ.
+  'max_result_down' = Ergebnis (P&L) der Gesamtposition, wenn BEIDE Basiswerte
+                      auf 0 fallen.
+  (Frueher 'max_loss_up' / 'max_gain_down' mit unterschiedlichen Vorzeichen,
+  dann kurz beide als Verlust; jetzt einheitlich als ERGEBNIS.)
   Beide exakt und korrelationsfrei: oben ist jeder Put wertlos und der
   Call-Anteil konstant (-Summe sign*K, da jedes Paket aus Long/Short-Paaren
   besteht); unten ist jeder Call wertlos und der Put-Anteil Summe sign*K.
+  WICHTIG: Das sind Werte an den Raendern (S=0 bzw. S->inf), NICHT der
+  Max-Verlust der Position. Der Max-Verlust ('max_loss_struct') ist das
+  Minimum ueber alle Endkurse; hat die Position konvexe Fluegel (z.B. ein
+  12 % breiter Follower-Debit-Condor), koennen die Randwerte sehr gross im
+  GEWINN liegen (stark positive Werte), waehrend der Max-Verlust klein bleibt.
 
 MAX-VERLUST (korrigiert) - warum die alte Version falsch war:
   Alt (a): Iron Condor = Summe von Put- UND Call-Max-Loss. Ein Condor kann aber
@@ -64,6 +64,10 @@ MAX-VERLUST (korrigiert) - warum die alte Version falsch war:
            simulierter Tag) als Info-Spalte ausgegeben; mit
            cfg.max_loss_basis='empirical' kann er als Bezugsgroesse gewaehlt
            werden.
+           Hinweis: Hat ein Bein-Paket zwischen zwei Strikes ein Plateau auf
+           Minimum-Niveau (z.B. Put- und Call-Strike des 'Distanz 0'-Beins liegen
+           auf verschiedenen Listenstrikes), kann ein einzelner Analog-Tag das
+           strukturelle Minimum EXAKT erreichen (max_loss_hist == max_loss_struct).
 """
 from __future__ import annotations
 
@@ -254,7 +258,9 @@ def _extreme_pnl_points(net_cf: float, legs, side: str) -> float:
     (side='up', S -> unendlich) bzw. Unterseite (side='down', S = 0).
     Oben: Puts wertlos; Calls liefern sign*(S-K), die S-Anteile heben sich auf
     (Long/Short-Paare) -> Rest = -Summe(sign*K ueber Calls).
-    Unten: Calls wertlos; Puts liefern sign*K."""
+    Unten: Calls wertlos; Puts liefern sign*K.
+    Rueckgabe ist P&L: positiv = Gewinn, negativ = Verlust (wird unveraendert
+    als 'max_result_up' / 'max_result_down' ausgegeben)."""
     if side == "up":
         return float(net_cf - sum(sign * K for K, is_put, sign in legs if not is_put))
     return float(net_cf + sum(sign * K for K, is_put, sign in legs if is_put))
@@ -382,7 +388,7 @@ def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame, p
                             "follower_qty": q, "qty_factor": factor,
                             "net_cashflow": np.nan, "max_loss": np.nan,
                             "max_loss_struct": np.nan, "max_loss_hist": np.nan,
-                            "max_loss_up": np.nan, "max_gain_down": np.nan,
+                            "max_result_up": np.nan, "max_result_down": np.nan,
                             "loss_prob_pct": np.nan, "full_loss_pct": np.nan, "lead_full_loss_pct": np.nan,
                             "lead_net_cashflow": np.nan, "follower_net_cashflow": np.nan,
                             "tested": False, "exclude_reason": "", "passes": False,
@@ -403,13 +409,12 @@ def evaluate_pair_grid(lead_table: pd.DataFrame, follower_table: pd.DataFrame, p
                         base["net_cashflow"], base["max_loss_struct"] = combined_net, struct_ml
                         base["lead_net_cashflow"], base["follower_net_cashflow"] = lm * l_net, f_scale * f_net
 
-                        # Extremwerte: beide Basiswerte oben (S -> inf) bzw. unten (S = 0)
-                        up_total = (lm * _extreme_pnl_points(l_net, l_legs, "up")
-                                    + f_scale * _extreme_pnl_points(f_net, f_legs, "up"))
-                        down_total = (lm * _extreme_pnl_points(l_net, l_legs, "down")
-                                      + f_scale * _extreme_pnl_points(f_net, f_legs, "down"))
-                        base["max_loss_up"] = -up_total      # positiv = Verlust, negativ = Gewinn
-                        base["max_gain_down"] = down_total   # positiv = Gewinn, negativ = Verlust
+                        # Randwerte: beide Basiswerte oben (S -> inf) bzw. unten (S = 0).
+                        # Vorzeichen = ERGEBNIS: positiv = Gewinn, negativ = Verlust.
+                        base["max_result_up"] = (lm * _extreme_pnl_points(l_net, l_legs, "up")
+                                                 + f_scale * _extreme_pnl_points(f_net, f_legs, "up"))
+                        base["max_result_down"] = (lm * _extreme_pnl_points(l_net, l_legs, "down")
+                                                   + f_scale * _extreme_pnl_points(f_net, f_legs, "down"))
 
                         pnl_d = lm * (l_net - l_pay) + f_scale * (f_net + f_pay)
                         hist_ml = max(0.0, -float(np.min(pnl_d)))

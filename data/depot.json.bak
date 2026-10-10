@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "saved_at": "2026-09-24T21:59:30",
+  "saved_at": "2026-09-24T22:01:02",
   "combos": [
     {
       "id": "c1880d4b60",
@@ -168,43 +168,6 @@
           "option_type": "call",
           "side": "long",
           "strike": 7845.0,
-          "qty": 1.0,
-          "entry_price": 0.0
-        }
-      ]
-    },
-    {
-      "id": "f2a413feff",
-      "name": "IC 7695/7705/7705/7710 2026-11-30",
-      "expiry": "2026-10-14",
-      "note": "Aus Iron-Condor-Suche (Heutige Kette)",
-      "created": "2026-09-24T21:59:30",
-      "legs": [
-        {
-          "option_type": "put",
-          "side": "long",
-          "strike": 7640.0,
-          "qty": 1.0,
-          "entry_price": 0.0
-        },
-        {
-          "option_type": "put",
-          "side": "short",
-          "strike": 7680.0,
-          "qty": 1.0,
-          "entry_price": 0.0
-        },
-        {
-          "option_type": "call",
-          "side": "short",
-          "strike": 7720.0,
-          "qty": 1.0,
-          "entry_price": 0.0
-        },
-        {
-          "option_type": "call",
-          "side": "long",
-          "strike": 7760.0,
           "qty": 1.0,
           "entry_price": 0.0
         }

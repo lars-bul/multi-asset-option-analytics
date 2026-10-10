@@ -3,7 +3,8 @@ MODUS 5: Pair-Trade-Suche (Backend: pair_trade_search.py).
 
 SONDERFALL (siehe dashboard.py): braucht zwei Instrumente (Lead + Follower),
 waehlt beide selbst in der eigenen Sidebar und bekommt nur 'instr' (Vorschlag
-fuer die Lead-Seite).
+fuer die Lead-Seite) plus 'header_slot' (Platzhalter in der Kopfzeile von
+dashboard.py, rechts neben dem Instrument-Auswaehler).
 
 LAUFZEIT: fuer beide Instrumente werden die verfuegbaren Verfallstage aus der
 Live-Kette gelesen; angeboten werden nur Verfallstage, die es bei BEIDEN gibt
@@ -13,14 +14,15 @@ BEIN-ROLLEN (KORRIGIERT):
   Lead     = Credit-Spread: inneres Bein SHORT, aeusseres Bein (Fluegel) LONG.
   Follower = Debit-Spread:  inneres Bein LONG,  aeusseres Bein (Fluegel) SHORT.
   Die Spalten heissen daher: 'Lead Short %' / 'Lead Long (Fluegel) %' und
-  'Follower Long %' / 'Follower Short (Fluegel) %'. (Vorher waren die beiden
-  Follower-Labels vertauscht.)
+  'Follower Long %' / 'Follower Short (Fluegel) %'.
 
-NEUER TAB: In der Sidebar oeffnet 'In neuem Tab oeffnen' dieselbe Anwendung in
-einem neuen Browser-Tab (eigene Streamlit-Session, eigenes Ergebnis). Lead,
-Follower und Verfall werden ueber URL-Parameter (pt_lead/pt_follower/pt_expiry)
-uebernommen; bestehende URL-Parameter bleiben erhalten (falls dashboard.py den
-Modus per Query-Parameter steuert, wird er also mitgenommen).
+NEUER TAB: 'In neuem Tab oeffnen' sitzt in der KOPFZEILE (nicht in der Sidebar)
+und oeffnet dieselbe Anwendung in einem neuen Browser-Tab (eigene Streamlit-
+Session, eigenes Ergebnis). Lead, Follower und Verfall werden ueber URL-
+Parameter (pt_lead/pt_follower/pt_expiry) uebernommen; bestehende URL-Parameter
+bleiben erhalten (falls dashboard.py den Modus per Query-Parameter steuert, wird
+er also mitgenommen). Der Button wird in den von dashboard.py uebergebenen
+Platzhalter 'header_slot' gerendert.
 
 ERGEBNIS-PERSISTENZ: das Ergebnis liegt in st.session_state['pair_result']
 (dashboard.py loescht den Schluessel beim Instrumentwechsel). Sortieren/
@@ -33,7 +35,8 @@ METHODIK: Lead bestimmt den Aehnlichkeitsraum, Follower wird an denselben
 Kalendertagen mitbewertet; Robustheit NUR auf dem Gesamtspread; alle
 Kombinationen werden angezeigt; Max-Verlust strukturell exakt (siehe
 pair_trade_search.py). Zusaetzlich: 'Max-Verlust Oberseite' (beide Basiswerte
-steigen stark) und 'Max-Gewinn Unterseite' (beide fallen auf 0).
+steigen stark) und 'Max-Verlust Unterseite' (beide fallen auf 0) - BEIDE mit
+demselben Vorzeichen: positiv = Verlust, negativ = Gewinn.
 """
 import sys
 import time
@@ -72,7 +75,7 @@ _SORT_OPTIONS = {
     "t (HAC)": ("tstat", False),
     "Max-Verlust": ("max_loss", True),
     "Max-Verlust Oberseite": ("max_loss_up", True),
-    "Max-Gewinn Unterseite": ("max_gain_down", False),
+    "Max-Verlust Unterseite": ("max_loss_down", True),
 }
 
 _fragment = getattr(st, "fragment", None) or (lambda f: f)
@@ -105,14 +108,22 @@ def _new_tab_url(lead_key: str, follower_key: str, expiry) -> str:
     return "?" + urlencode(params)
 
 
-def _new_tab_button(lead_key: str, follower_key: str, expiry) -> None:
+def _new_tab_button(lead_key: str, follower_key: str, expiry, header_slot=None) -> None:
+    """Button 'In neuem Tab oeffnen'. Wird in den Kopfzeilen-Platzhalter von
+    dashboard.py gerendert (rechts neben dem Instrument-Auswaehler); ohne
+    Platzhalter (z.B. Aufruf ausserhalb von dashboard.py) direkt an der aktuellen Stelle."""
     url = _new_tab_url(lead_key, follower_key, expiry)
     label = "In neuem Tab oeffnen"
-    link_button = getattr(st, "link_button", None)
-    if link_button is not None:
-        link_button(label, url, use_container_width=True)
-    else:  # aeltere Streamlit-Versionen
-        st.markdown(f'<a href="{url}" target="_blank" rel="noopener">{label} ↗</a>', unsafe_allow_html=True)
+    target = header_slot.container() if header_slot is not None else st.container()
+    with target:
+        if header_slot is not None:
+            # Abstandshalter, damit der Button auf Hoehe der Selectbox (nicht des Labels) sitzt
+            st.markdown("<div style='height:1.65rem'></div>", unsafe_allow_html=True)
+        link_button = getattr(st, "link_button", None)
+        if link_button is not None:
+            link_button(label, url, use_container_width=True)
+        else:  # aeltere Streamlit-Versionen
+            st.markdown(f'<a href="{url}" target="_blank" rel="noopener">{label} ↗</a>', unsafe_allow_html=True)
 
 
 # ── Kette / Verfallstage ─────────────────────────────────────────────
@@ -216,7 +227,7 @@ def _render_result() -> None:
         "net_cashflow", "lead_net_cashflow", "follower_net_cashflow",
         "c_train", "c_val", "c_t", "c_tail",
         "ror", "mean", "tstat", "e_train", "e_val",
-        "max_loss", "max_loss_struct", "max_loss_hist", "max_loss_up", "max_gain_down",
+        "max_loss", "max_loss_struct", "max_loss_hist", "max_loss_up", "max_loss_down",
         "lead_short_distance", "lead_long_distance", "vol_lead_pct",
         "follower_long_distance", "follower_short_distance", "vol_follower_pct",
         "follower_qty",
@@ -229,7 +240,7 @@ def _render_result() -> None:
         "ror": "Rendite/Risiko %", "mean": "E[P&L]", "tstat": "t (HAC)", "e_train": "E Train", "e_val": "E Val",
         "max_loss": "Max-Verlust (verwendet)", "max_loss_struct": "Max-Verlust strukturell",
         "max_loss_hist": "Schlechtester Analog-Tag",
-        "max_loss_up": "Max-Verlust Oberseite", "max_gain_down": "Max-Gewinn Unterseite",
+        "max_loss_up": "Max-Verlust Oberseite", "max_loss_down": "Max-Verlust Unterseite",
         # Lead: innen = SHORT, aussen (Fluegel) = LONG
         "lead_short_distance": "Lead Short %", "lead_long_distance": "Lead Long (Fluegel) %",
         "vol_lead_pct": "Lead-IV %",
@@ -246,7 +257,7 @@ def _render_result() -> None:
             "E Train": "{:+.2f}", "E Val": "{:+.2f}",
             "Max-Verlust (verwendet)": "{:.2f}", "Max-Verlust strukturell": "{:.2f}",
             "Schlechtester Analog-Tag": "{:.2f}",
-            "Max-Verlust Oberseite": "{:+.2f}", "Max-Gewinn Unterseite": "{:+.2f}",
+            "Max-Verlust Oberseite": "{:+.2f}", "Max-Verlust Unterseite": "{:+.2f}",
             "Lead-IV %": "{:.1f}",
             "Follower-IV %": "{:.1f}", "Follower-Menge": "{:.3f}",
         }, na_rep="–"),
@@ -265,15 +276,16 @@ def _render_result() -> None:
         "gleichzeitig annimmt). 'Lead-Vollverlust %' = Anteil Tage, an denen der Lead-Spread allein "
         "seinen vollen Max-Verlust erreicht (reine Info-Spalte, kein Kriterium). "
         "'Max-Verlust Oberseite' = Verlust der Gesamtposition, wenn BEIDE Basiswerte stark steigen "
-        "(jedes Bein im Extremwert); positiv = Verlust, negativ = Gewinn (z.B. Put-Credit-Spread: "
-        "Kredit = Max-Gewinn -> negativer Wert). 'Max-Gewinn Unterseite' = P&L, wenn BEIDE Basiswerte "
-        "auf 0 fallen; positiv = Gewinn, negativ = Verlust."
+        "(jedes Bein im Extremwert); 'Max-Verlust Unterseite' = Verlust, wenn BEIDE Basiswerte auf 0 "
+        "fallen. Beide mit demselben Vorzeichen: positiv = Verlust, negativ = Gewinn. Das sind "
+        "Randwerte, NICHT der Max-Verlust der Position: bei konvexen Follower-Fluegeln koennen sie "
+        "stark im Gewinn liegen, waehrend der strukturelle Max-Verlust klein bleibt."
     )
 
 
 # ── Hauptfunktion ────────────────────────────────────────────────────
 
-def render(instr: InstrumentConfig) -> None:
+def render(instr: InstrumentConfig, header_slot=None) -> None:
     st.header("Pair-Trade-Suche")
     st.caption(
         "Lead bestimmt die Analog-Tage, der Follower wird an denselben Kalendertagen mitbewertet. "
@@ -329,8 +341,6 @@ def render(instr: InstrumentConfig) -> None:
         else:
             st.warning("Kein gemeinsamer Verfall bei Lead und Follower.")
 
-        _new_tab_button(lead_key, follower_key, expiry)
-
         with st.expander("Erweiterte Einstellungen"):
             max_distance = st.number_input("Max. Distanz (Aehnlichkeit)", 0.01, 100.0, 4.0, 0.5, key="pt_maxdist")
             bandwidth = st.number_input("Kernel-Bandbreite σ", 0.01, 50.0, 1.0, 0.1, key="pt_bw")
@@ -340,6 +350,9 @@ def render(instr: InstrumentConfig) -> None:
             t_min = st.number_input("Min. t-Stat (HAC)", 0.0, 10.0, 3.0, 0.1, key="pt_tmin")
             ml_label = st.selectbox("Max-Verlust-Basis",
                                     ["Strukturell (exakt)", "Empirisch (schlechtester Analog-Tag)"], key="pt_mlbasis")
+
+    # 'In neuem Tab oeffnen' in die Kopfzeile (neben den Instrument-Auswaehler) rendern
+    _new_tab_button(lead_key, follower_key, expiry, header_slot)
 
     # URL spiegelt die aktuelle Auswahl (damit Kopieren/Neuer Tab/Reload dieselbe Ansicht liefert)
     try:

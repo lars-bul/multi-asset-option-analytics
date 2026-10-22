@@ -8,7 +8,7 @@ Analog-Tag gemeinsam bewertet (korrelationsrichtig). Kein Vola-Modell, keine
 Division durch Modellpraemien.
 
 Condor(i, j) = Short-Zeile i, Fluegel-Zeile j (groesserer Abstand):
-  credit   = (Bid Put_i + Bid Call_i) - (Ask Put_j + Ask Call_j)
+  credit   = (Bid Put_i + Bid Call_i) * (1 - safety_haircut) - (Ask Put_j + Ask Call_j)
   max_loss = max(Kp_i-Kp_j, Kc_j-Kc_i) - credit
   pnl_d    = credit - payout_d          (additiv: Put-Spread + Call-Spread)
 
@@ -29,6 +29,28 @@ Verhalten). Bei use_tail=False wird das Tail-Kriterium (Voll-Verlust-Anteil +
 5%-Quantil) NICHT mehr in 'c_base' bzw. 'passes' einbezogen; die Kennzahlen/die
 Spalte 'c_tail' werden weiterhin berechnet und angezeigt (nur Information).
 Der Reverse Condor hat ohnehin kein Tail-Kriterium und ist davon unberuehrt.
+
+NEU (Sicherheitsabschlag auf Verkaufspreise): CondorConfig.safety_haircut
+(Default 0.05 = 5 %). Alle Preise, zu denen VERKAUFT wird (Condor: innere
+Short-Optionen; Reverse Condor: verkaufte Fluegel), werden um diesen Anteil
+gekuerzt (Bid * (1 - haircut) bzw. bei Preisbasis 'mid': Mid * (1 - haircut)).
+Gekaufte Beine bleiben unveraendert beim Ask (bzw. Mid). safety_haircut=0.0
+stellt das bisherige Verhalten wieder her.
+
+NEU (Robustheit auf Abschlag-Preisbasis): Fuer Condor UND Reverse Condor werden
+die Robustheitskennzahlen der Analog-Tabelle (t-Stat gesamt, CI != 0,
+Perioden-Match, t-Stat Val, Robust Train+Val - siehe analog_robustness()) auf dem
+P&L des Trades SELBST gerechnet, also MIT Abschlag. Daraus entsteht das Flag
+'c_robust' (robust_green(); gleiche Schwellen wie die gruene Zeile in Teil B:
+t gesamt > 2, CI != 0, Perioden-Match >= 5, t Val > 2, Robust Train+Val).
+- Condor: 'c_robust' ist Teil von 'c_base' (abschaltbar: CondorConfig.use_robust
+  bzw. apply_criteria(use_robust=False)).
+- Reverse Condor: zusaetzlich muss der innere Long-Strangle (Ask-Preise) robust
+  gruen sein ('c_long' und Plateau).
+- Ist short_valid=None, wird die Short-Zeile intern mit Robust-Gruen geprueft.
+Performance: die (teuren) Robustheitskennzahlen werden nur fuer Paare gerechnet,
+die Train>0, Val>0 und t>Schwelle schon erfuellen (tail-unabhaengig, damit der
+Tail-Schalter ohne Neuberechnung funktioniert). Alle anderen: n/a bzw. False.
 """
 from __future__ import annotations
 
@@ -38,6 +60,10 @@ import numpy as np
 import pandas as pd
 
 from analog_matching import _hac_se_weighted_mean, weighted_reliability_summary
+
+# Schwellen des Robust-Gruens (identisch zu dashboard_livechain._robustness_row_state)
+ROBUST_TSTAT_MIN = 2.0
+ROBUST_MIN_PERIODS = 5
 
 
 @dataclass
@@ -50,6 +76,16 @@ class CondorConfig:
     require_plateau: bool = True
     sort_by: str = "ror"              # Ranking der Kandidaten: "ror" (Rendite/Risiko, Standard) | "mean" (E[P&L] in Punkten) | "tstat"
     use_tail: bool = True              # False = Tail-Kriterium zaehlt nicht fuer 'c_base'/'passes' (nur Anzeige)
+    safety_haircut: float = 0.05       # Abschlag auf alle VERKAUFSpreise (0.05 = 5 %); 0.0 = aus
+    use_robust: bool = True            # False = Robust-Kriterium (c_robust) zaehlt nicht fuer 'c_base'/'passes'
+
+
+def _check_haircut(cfg: "CondorConfig") -> float:
+    """Validiert den Sicherheitsabschlag und gibt den Faktor (1 - haircut) zurueck."""
+    h = float(getattr(cfg, "safety_haircut", 0.0))
+    if not np.isfinite(h) or h < 0.0 or h >= 1.0:
+        raise ValueError(f"safety_haircut muss in [0, 1) liegen (erhalten: {h!r}).")
+    return 1.0 - h
 
 
 def analog_moves(analogs: pd.DataFrame, training_table: pd.DataFrame, T_days: int,
@@ -154,20 +190,54 @@ def analog_robustness(moves: pd.DataFrame, pnl: np.ndarray) -> dict:
     }
 
 
-def apply_criteria(df: pd.DataFrame, kind: str, use_tail: bool = True, require_plateau: bool = True,
-                   sort_by: str = "ror") -> pd.DataFrame:
-    """Berechnet 'c_base', 'passes' und die Sortierung aus den BEREITS vorhandenen Kriterien-Flags
-    neu - OHNE die Analog-Bewertung zu wiederholen. Damit lassen sich Tail- und Plateau-Kriterium
-    nachtraeglich ein-/ausschalten, ohne dass etwas neu gerechnet werden muss.
+def robust_green(rb: dict | None) -> bool:
+    """Robust-Gruen auf EINEM analog_robustness()-Ergebnis: t gesamt > ROBUST_TSTAT_MIN, CI != 0,
+    Perioden-Match >= ROBUST_MIN_PERIODS, t Val > ROBUST_TSTAT_MIN und Robust (Train+Val).
+    Gleiche Definition wie die gruene Zeile der Analog-Tabelle (Teil B)."""
+    if not rb:
+        return False
 
-    kind: 'condor' (Flags c_train/c_val/c_t/c_tail + c_short + c_plateau) oder
-          'reverse' (c_train/c_val/c_t + c_long + c_plateau; kein Tail-Kriterium)."""
+    def fin(v):
+        return v is not None and bool(np.isfinite(v))
+
+    t_full, t_val, n_match = rb.get("tstat_full"), rb.get("tstat_val"), rb.get("subperiod_matching")
+    return bool(
+        fin(t_full) and t_full > ROBUST_TSTAT_MIN
+        and bool(rb.get("ci_excludes_zero_full", False))
+        and fin(n_match) and n_match >= ROBUST_MIN_PERIODS
+        and fin(t_val) and t_val > ROBUST_TSTAT_MIN
+        and bool(rb.get("robust_train_val", False))
+    )
+
+
+def robustness_columns(rb: dict | None) -> dict:
+    """Spalten fuer die Condor-/Reverse-Condor-Tabellen. rb=None (nicht berechnet) -> NaN/False."""
+    if rb is None:
+        return {"tstat_full": np.nan, "ci_excludes_zero_full": False, "subperiod_matching": np.nan,
+                "subperiod_nonempty": np.nan, "tstat_val": np.nan, "robust_train_val": False,
+                "robust_train_val_neg": False, "c_robust": False}
+    return {"tstat_full": rb["tstat_full"], "ci_excludes_zero_full": bool(rb["ci_excludes_zero_full"]),
+            "subperiod_matching": rb["subperiod_matching"], "subperiod_nonempty": rb["subperiod_nonempty"],
+            "tstat_val": rb["tstat_val"], "robust_train_val": bool(rb["robust_train_val"]),
+            "robust_train_val_neg": bool(rb["robust_train_val_neg"]), "c_robust": robust_green(rb)}
+
+
+def apply_criteria(df: pd.DataFrame, kind: str, use_tail: bool = True, require_plateau: bool = True,
+                   sort_by: str = "ror", use_robust: bool = True) -> pd.DataFrame:
+    """Berechnet 'c_base', 'passes' und die Sortierung aus den BEREITS vorhandenen Kriterien-Flags
+    neu - OHNE die Analog-Bewertung zu wiederholen. Damit lassen sich Tail-, Robust- und
+    Plateau-Kriterium nachtraeglich ein-/ausschalten, ohne dass etwas neu gerechnet werden muss.
+
+    kind: 'condor' (Flags c_train/c_val/c_t/c_tail/c_robust + c_short + c_plateau) oder
+          'reverse' (c_train/c_val/c_t/c_robust + c_long + c_plateau; kein Tail-Kriterium)."""
     if df is None or df.empty:
         return df
     if kind not in ("condor", "reverse"):
         raise ValueError(f"kind muss 'condor' oder 'reverse' sein (erhalten: {kind!r}).")
     out = df.copy()
     base_cols = ["c_train", "c_val", "c_t"] + (["c_tail"] if (use_tail and kind == "condor") else [])
+    if use_robust and "c_robust" in out.columns:
+        base_cols.append("c_robust")
     out["c_base"] = out[base_cols].all(axis=1)
     inner = "c_short" if kind == "condor" else "c_long"
     ok = out["c_base"] & out[inner].astype(bool)
@@ -181,13 +251,21 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
                          cfg: CondorConfig | None = None, short_valid: dict | None = None):
     """Bewertet ALLE Paare (Short-Zeile i, Fluegel-Zeile j>i) der Distanz-Tabelle.
     short_valid: optional {distance_pct: bool} - Gueltigkeit der Short-Zeilen
-    laut Analog-Tabelle (Short-Strangle, siehe dashboard_livechain). Ist es
-    gesetzt, ersetzt es die eigene Short-Pruefung, damit Short-Kriterium und
-    Plateau exakt mit den sichtbaren gruenen Zeilen dieser Tabelle uebereinstimmen.
+    laut Analog-Tabelle (Short-Strangle, siehe dashboard_livechain; dort bereits auf der
+    Abschlag-Preisbasis gerechnet). Ist es gesetzt, ersetzt es die eigene Short-Pruefung,
+    damit Short-Kriterium und Plateau exakt mit den sichtbaren gruenen Zeilen dieser Tabelle
+    uebereinstimmen. Ohne short_valid wird die Short-Zeile intern (mit Abschlag) auf
+    Robust-Gruen geprueft.
+
+    Verkaufspreise (innere Short-Optionen) werden um cfg.safety_haircut gekuerzt.
+    Zusaetzlich: Robustheitskennzahlen + 'c_robust' je Condor (nur fuer Paare, die
+    Train>0, Val>0 und t>Schwelle erfuellen).
+
     Rueckgabe: (condor_df, side_df, meta)
       condor_df: symmetrische Condors, mit Kriterien-Flags und 'passes'
       side_df:   Put- und Call-Spreads einzeln (zeigt, welche Seite den Edge traegt)"""
     cfg = cfg or CondorConfig()
+    sell_factor = _check_haircut(cfg)
     if moves.empty:
         return pd.DataFrame(), pd.DataFrame(), {}
 
@@ -203,6 +281,10 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
     else:
         sell_p, buy_p = num("bid_put"), num("ask_put")
         sell_c, buy_c = num("bid_call"), num("ask_call")
+
+    # Sicherheitsabschlag: nur auf die Preise, zu denen VERKAUFT wird (neue Arrays, kein Aliasing).
+    sell_p = sell_p * sell_factor
+    sell_c = sell_c * sell_factor
 
     w = moves["weight"].to_numpy(float)
     S_d = spot_today * (1.0 + moves["ret"].to_numpy(float))
@@ -230,7 +312,9 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
             trm = ctx["train"]
             e_tr = float(w[trm] @ x[trm] / w[trm].sum()) if w[trm].sum() > 0 else np.nan
             e_va = float(w[~trm] @ x[~trm] / w[~trm].sum()) if w[~trm].sum() > 0 else np.nan
-            ok_i = bool(mean_s > 0 and e_tr > 0 and e_va > 0 and t_s > cfg.t_min)
+            if short_valid is None:
+                ok_i = bool(mean_s > 0 and e_tr > 0 and e_va > 0 and t_s > cfg.t_min
+                            and robust_green(analog_robustness(moves, x)))
         if short_valid is not None:
             ok_i = bool(short_valid.get(float(dist[i]), False))
         short_ok[i] = ok_i
@@ -247,7 +331,7 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
             return None
         return credit, width, credit - pay
 
-    side_rows, cond_rows = [], []
+    side_rows, cond_rows, cond_pnls = [], [], []
     for i in range(n - 1):
         for j in range(i + 1, n):
             legs = {}
@@ -283,6 +367,7 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
                 **weighted_pnl_stats(pp + pc, w, ctx["dates"], ctx["hold"], ctx["train"],
                                       max_loss, cfg.tail_quantile),
             })
+            cond_pnls.append(pp + pc)
 
     cdf, sdf = pd.DataFrame(cond_rows), pd.DataFrame(side_rows)
     meta = {
@@ -290,6 +375,7 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
         "n_eff": float(w.sum() ** 2 / np.sum(w ** 2)),
         "n_pairs": len(cdf),
         "use_tail": bool(cfg.use_tail),
+        "safety_haircut": float(cfg.safety_haircut),
     }
     if cdf.empty:
         return cdf, sdf, {**meta, "n_pass": 0}
@@ -298,8 +384,17 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
     cdf["c_val"] = cdf["e_val"] > 0
     cdf["c_t"] = cdf["tstat"] > cfg.t_min
     cdf["c_tail"] = (cdf["full_loss_share"] <= cfg.max_full_loss_share) & (cdf["q_tail"] >= cfg.tail_floor)
-    # Basis-Kriterien des Condors selbst (Train, Val, t, und - nur falls aktiviert - Tail)
-    base_cols = ["c_train", "c_val", "c_t"] + (["c_tail"] if cfg.use_tail else [])
+
+    # Robustheitskennzahlen des Condors SELBST (mit Abschlag im Kredit). Nur fuer Paare, die
+    # Train, Val und t schon bestehen (tail-unabhaengig) - alle anderen: n/a / False.
+    elig = (cdf["c_train"] & cdf["c_val"] & cdf["c_t"]).to_numpy()
+    rob = [robustness_columns(analog_robustness(moves, cond_pnls[k]) if elig[k] else None)
+           for k in range(len(cdf))]
+    cdf = pd.concat([cdf, pd.DataFrame(rob, index=cdf.index)], axis=1)
+
+    # Basis-Kriterien des Condors selbst (Train, Val, t, und - nur falls aktiviert - Tail, Robust)
+    base_cols = (["c_train", "c_val", "c_t"] + (["c_tail"] if cfg.use_tail else [])
+                 + (["c_robust"] if cfg.use_robust else []))
     cdf["c_base"] = cdf[base_cols].all(axis=1)
     # Short-Kriterium: die Short-Zeile i (nur Short-Strangle) muss selbst gueltig sein
     cdf["c_short"] = [short_ok[int(i)] for i in cdf["i"]]
@@ -307,7 +402,7 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
     def plateau(i):
         """Plateau in der SHORT-Achse: die Short-Zeilen direkt UEBER und UNTER
         (i-1 / i+1) muessen als Short-Strangle ebenfalls gueltig sein
-        (E>0, Train>0, Val>0, t>Schwelle). Die Fluegel muessen NICHTS
+        (Robust-Gruen auf Abschlag-Preisbasis). Die Fluegel muessen NICHTS
         erfuellen. Fehlender Nachbar (Rand der Kette) = nicht erfuellt."""
         return (i - 1 >= 0 and short_ok.get(i - 1, False)) and (i + 1 < n and short_ok.get(i + 1, False))
 
@@ -329,19 +424,22 @@ def evaluate_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: f
 def evaluate_reverse_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_today: float,
                                  cfg: CondorConfig | None = None):
     """Reverse Iron Condor (Long-Condor): inneren Strangle KAUFEN (Ask), aeussere Fluegel
-    VERKAUFEN (Bid). Gleiche Analog-Tage/Gewichte wie evaluate_condor_grid().
+    VERKAUFEN (Bid, gekuerzt um cfg.safety_haircut). Gleiche Analog-Tage/Gewichte wie
+    evaluate_condor_grid().
 
-      debit    = (Ask Put_i + Ask Call_i) - (Bid Put_j + Bid Call_j)
+      debit    = (Ask Put_i + Ask Call_i) - (Bid Put_j + Bid Call_j) * (1 - safety_haircut)
       max_loss = debit
       max_gain = max(Breite_put, Breite_call) - debit
       pnl_d    = payout_d - debit
 
     Kriterien (spiegelbildlich zum Short-Condor, OHNE Tail - beim Long-Condor ist der
-    Totalverlust der Normalfall): Train>0, Val>0, t>t_min, innerer Long-Strangle
-    selbst gueltig (E>0, Train>0, Val>0, t>t_min, Ask-Preise) und Plateau (Zeile direkt
-    ueber/unter ebenfalls gueltig).
+    Totalverlust der Normalfall): Train>0, Val>0, t>t_min, Robust-Kriterium des Reverse
+    Condors selbst (c_robust, MIT Abschlag), innerer Long-Strangle selbst gueltig
+    (E>0, Train>0, Val>0, t>t_min UND Robust-Gruen, Ask-Preise - vom Abschlag nicht beruehrt)
+    und Plateau (Zeile direkt ueber/unter ebenfalls gueltig).
     Rueckgabe: (reverse_df, meta)."""
     cfg = cfg or CondorConfig()
+    sell_factor = _check_haircut(cfg)
     if moves.empty:
         return pd.DataFrame(), {}
 
@@ -358,6 +456,10 @@ def evaluate_reverse_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_
     else:
         buy_p, sell_p = num("ask_put"), num("bid_put")     # innen kaufen / Fluegel verkaufen
         buy_c, sell_c = num("ask_call"), num("bid_call")
+
+    # Sicherheitsabschlag auf die VERKAUFTEN Fluegel (neue Arrays; buy_* bleiben unveraendert).
+    sell_p = sell_p * sell_factor
+    sell_c = sell_c * sell_factor
 
     w = moves["weight"].to_numpy(float)
     W_all = w.sum()
@@ -381,6 +483,8 @@ def evaluate_reverse_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_
             e_tr = float(w[trm] @ x[trm] / w[trm].sum()) if w[trm].sum() > 0 else np.nan
             e_va = float(w[~trm] @ x[~trm] / w[~trm].sum()) if w[~trm].sum() > 0 else np.nan
             ok_i = bool(mean_s > 0 and e_tr > 0 and e_va > 0 and t_s > cfg.t_min)
+            if ok_i:   # teure Robustheitspruefung nur, wenn die einfachen Kriterien halten
+                ok_i = robust_green(analog_robustness(moves, x))
         long_ok[i] = ok_i
         long_rows.append({"i": i, "distance": dist[i], "strike_put": Kp[i], "strike_call": Kc[i],
                           "debit": cost, "mean": mean_s, "tstat": t_s,
@@ -395,7 +499,7 @@ def evaluate_reverse_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_
             return None
         return debit, width, payoff
 
-    rows = []
+    rows, rev_pnls = [], []
     for i in range(n - 1):
         for j in range(i + 1, n):
             rp, rc = spread("put", i, j), spread("call", i, j)
@@ -420,18 +524,29 @@ def evaluate_reverse_condor_grid(table: pd.DataFrame, moves: pd.DataFrame, spot_
                 "e_call_spread": float(w @ (payoff_c - dc) / W_all),
                 **st_,
             })
+            rev_pnls.append(x)
 
     rdf = pd.DataFrame(rows)
     meta = {"n_days": len(moves), "hold_max": hold,
             "n_eff": float(W_all ** 2 / np.sum(w ** 2)), "n_pairs": len(rdf),
-            "long_df": pd.DataFrame(long_rows)}
+            "long_df": pd.DataFrame(long_rows),
+            "safety_haircut": float(cfg.safety_haircut)}
     if rdf.empty:
         return rdf, {**meta, "n_pass": 0, "n_base": 0}
 
     rdf["c_train"] = rdf["e_train"] > 0
     rdf["c_val"] = rdf["e_val"] > 0
     rdf["c_t"] = rdf["tstat"] > cfg.t_min
-    rdf["c_base"] = rdf[["c_train", "c_val", "c_t"]].all(axis=1)
+
+    # Robustheitskennzahlen des Reverse Condors SELBST (Debit enthaelt den Abschlag auf die
+    # verkauften Fluegel). Nur fuer Paare, die Train, Val und t schon bestehen.
+    elig = (rdf["c_train"] & rdf["c_val"] & rdf["c_t"]).to_numpy()
+    rob = [robustness_columns(analog_robustness(moves, rev_pnls[k]) if elig[k] else None)
+           for k in range(len(rdf))]
+    rdf = pd.concat([rdf, pd.DataFrame(rob, index=rdf.index)], axis=1)
+
+    base_cols = ["c_train", "c_val", "c_t"] + (["c_robust"] if cfg.use_robust else [])
+    rdf["c_base"] = rdf[base_cols].all(axis=1)
     rdf["c_long"] = [long_ok[int(i)] for i in rdf["i"]]
 
     def plateau(i):

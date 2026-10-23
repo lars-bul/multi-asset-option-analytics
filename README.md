@@ -1,6 +1,6 @@
-# Multi-Asset Options Research Dashboard
+# Multi-Asset Options Dashboard - Decision Support for Derivative Traders
 
-A **local-only** quantitative research tool for index and commodity options, built with Python and Streamlit. It combines a model-based iron condor backtester, an "analog day" matching engine (find historically similar market regimes and replay them against *today's real option quotes*), a live option-chain scanner, a portfolio analyzer and a cross-instrument pair-trade search - all with autocorrelation-robust statistics instead of naive averages.
+A **local-only** quantitative Decision Support dashboard system for Derivative Traders, trading index and commodity options, built with Python and Streamlit. It combines a model-based iron condor backtester, an "analog day" matching engine (find historically similar market regimes and replay them against *today's real option quotes*), a live option-chain scanner, a portfolio analyzer and a cross-instrument pair-trade search - all with autocorrelation-robust statistics instead of naive averages.
 
 > **Disclaimer:** This is a research and education project. It does not place orders, does not connect to a broker for execution, and nothing here is investment advice or a promise of profitability. See [Limitations](#limitations-and-honest-caveats).
 
